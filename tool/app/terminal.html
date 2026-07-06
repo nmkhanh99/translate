@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Terminal — CFA Translate Studio</title>
+  <link rel="stylesheet" href="vendor/xterm.css" />
+  <style>
+    :root { --bg:#0a0c12; --bar:#141824; --line:#232838; --fg:#c7d0e0; --mut:#8a93a6; --acc:#4f8cff; }
+    * { box-sizing: border-box; }
+    html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+      font:13px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+    #bar { display:flex; align-items:center; gap:8px; padding:6px 10px;
+      background:var(--bar); border-bottom:1px solid var(--line); }
+    #bar .title { font-weight:600; color:var(--fg); }
+    #bar .mut { color:var(--mut); }
+    #bar .grow { flex:1; }
+    button { font:inherit; border:1px solid var(--line); background:#1b2233; color:var(--fg);
+      padding:4px 10px; border-radius:7px; cursor:pointer; font-weight:600; }
+    button:hover { border-color:var(--acc); }
+    #term { position:absolute; top:38px; left:0; right:0; bottom:0; padding:6px 8px; }
+    .xterm { height:100%; }
+  </style>
+</head>
+<body>
+  <div id="bar">
+    <span class="title">⌘ Terminal</span>
+    <span class="mut">cwd: translate</span>
+    <span class="grow"></span>
+    <span class="mut">Chèn nhanh:</span>
+    <button data-cmd="claude ">claude</button>
+    <button data-cmd="codex ">codex</button>
+    <button id="clearBtn">Clear</button>
+  </div>
+  <div id="term"></div>
+
+  <script src="vendor/xterm.js"></script>
+  <script src="vendor/addon-fit.js"></script>
+  <script>
+    (function () {
+      var Terminal = window.Terminal;
+      var FitAddon = (window.FitAddon && window.FitAddon.FitAddon) || window.FitAddon;
+      var term = new Terminal({
+        fontFamily: 'ui-monospace, Menlo, Monaco, "Courier New", monospace',
+        fontSize: 13, cursorBlink: true, scrollback: 5000,
+        theme: { background: "#0a0c12", foreground: "#c7d0e0", cursor: "#4f8cff" },
+      });
+      var fit = new FitAddon();
+      term.loadAddon(fit);
+      term.open(document.getElementById("term"));
+      fit.fit();
+
+      if (!window.ptyAPI) {
+        term.write("\r\n\x1b[31mLỗi: node-pty không khả dụng (ptyAPI thiếu).\x1b[0m\r\n");
+        return;
+      }
+
+      var ptyId = null;
+      window.ptyAPI
+        .create({ cols: term.cols, rows: term.rows })
+        .then(function (id) {
+          ptyId = id;
+          window.ptyAPI.onData(function (m) { if (m.id === ptyId) term.write(m.data); });
+          window.ptyAPI.onExit(function (m) {
+            if (m.id === ptyId)
+              term.write("\r\n\x1b[33m[shell đã thoát, code " + m.code + "]\x1b[0m\r\n");
+          });
+          term.onData(function (d) { window.ptyAPI.write(ptyId, d); });
+        })
+        .catch(function (e) {
+          term.write("\r\n\x1b[31m" + (e && e.message ? e.message : e) + "\x1b[0m\r\n");
+        });
+
+      function doFit() {
+        fit.fit();
+        if (ptyId) window.ptyAPI.resize(ptyId, term.cols, term.rows);
+      }
+      window.addEventListener("resize", doFit);
+      new ResizeObserver(doFit).observe(document.getElementById("term"));
+
+      // nút chèn nhanh: gõ lệnh vào shell (chưa Enter, để user tự thêm tham số)
+      document.querySelectorAll("button[data-cmd]").forEach(function (b) {
+        b.addEventListener("click", function () {
+          if (ptyId) window.ptyAPI.write(ptyId, b.getAttribute("data-cmd"));
+          term.focus();
+        });
+      });
+      document.getElementById("clearBtn").addEventListener("click", function () {
+        term.clear();
+        term.focus();
+      });
+      term.focus();
+    })();
+  </script>
+</body>
+</html>

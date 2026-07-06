@@ -1,0 +1,36 @@
+# === Nội dung CFA có bản quyền — TUYỆT ĐỐI không commit/đẩy lên GitHub ===
+2024 CFA L1 Curriculum/
+2024 CFA L1 Curriculum - VI/
+2024 CFA L1 Curriculum - VI (agent pilot)/
+2024 CFA L1 Curriculum - VI (agent)/
+
+# === Nhị phân / sinh ra ===
+*.pdf
+*.png
+*.jpg
+*.jpeg
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+
+# === Node / Electron ===
+node_modules/
+dist/
+
+# === Tool: cache / output / state cục bộ (sinh ra, resume được) ===
+tool/work/
+tool/agent_pilot/
+**/*.cache.json
+tool/dashboard.json
+tool/p0_agent.json
+tool/p40_agent_translations.json
+**/run.log
+**/run.json
+**/codex_state.json
+**/codex_work.pdf
+
+# === OS / editor ===
+.DS_Store
+.vscode/

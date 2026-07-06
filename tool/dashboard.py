@@ -1,0 +1,909 @@
+#!/usr/bin/env python3
+"""
+dashboard.py — Màn hình quản lý dịch CFA (web, chỉ dùng thư viện chuẩn).
+================================================================================
+Một trang web local để:
+  • XEM tiến độ mọi volume trong volumes.json (translate / verify / vision),
+    nguồn sự thật = filesystem (tái dùng agent_pipeline._status).
+  • CHẠY / DỪNG pipeline AGENT cho từng volume hoặc cả batch, chọn ENGINE:
+      - claude: spawn `claude -p` chạy Workflow translate_volume.js (4-phase).
+      - codex:  spawn `codex exec` dùng MCP cfa-pdf-translator dịch cả volume
+                theo lô trang nối chuỗi (đọc codex_work.pdf, ghi OUT).
+    Checkpoint theo file nên DỪNG rồi CHẠY lại là tự resume (cả 2 engine).
+  • Mở PDF đích, xem log chạy trực tiếp.
+
+Không cần Flask — dùng http.server của stdlib. Chạy:
+    python3 dashboard.py            # mở http://127.0.0.1:8756
+    python3 dashboard.py --port 9000
+
+QUYỀN (posture) khi spawn `claude`:
+  • "allowlist" (MẶC ĐỊNH, ít quyền nhất): --permission-mode default và chỉ cấp
+    đúng các tool pipeline cần (Bash cd/python3, Write, Read, Agent, Workflow...).
+    Không tắt cơ chế hỏi quyền; tool ngoài danh sách bị từ chối.
+  • "bypass" (TỰ CHỌN): --permission-mode bypassPermissions — bỏ MỌI cửa hỏi
+    quyền cho agent con. Tiện nhưng rủi ro hơn; chỉ bật nếu bạn hiểu và chấp nhận.
+"""
+import argparse
+import json
+import os
+import signal
+import subprocess
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+import agent_pipeline as ap  # tái dùng _status/_load (glue xác định)
+
+TOOL = os.path.dirname(os.path.abspath(__file__))
+MANIFEST = os.path.join(TOOL, "volumes.json")
+VOLUME_JS = os.path.join(TOOL, "translate_volume.js")
+TRANSLATE_ROOT = os.path.dirname(TOOL)          # .../translate (chứa PDF nguồn + đích)
+CFG_PATH = os.path.join(TOOL, "dashboard.json")
+
+# Least-privilege: đúng các tool mà translate_volume.js + agent con của nó dùng.
+ALLOWED_TOOLS = ["Bash(cd *)", "Bash(python3 *)", "Write", "Edit", "Read",
+                 "Agent", "Task", "Workflow", "Glob", "Grep"]
+
+DEFAULT_CFG = {
+    "engine": "claude",      # claude (Workflow 4-phase) | codex (MCP đơn giản)
+    "model": "sonnet",       # sonnet | opus | haiku (opus = chất lượng cao nhất)
+    "posture": "allowlist",  # allowlist (an toàn) | bypass (bỏ hỏi quyền)
+    "vision": True,          # có chạy stage review layout bằng vision không
+    "codex_batch": 25,       # số trang mỗi lô khi Codex dịch (chuỗi theo lô)
+}
+ENGINES = ["claude", "codex"]
+MODELS = ["sonnet", "opus", "haiku"]
+POSTURES = ["allowlist", "bypass"]
+
+LOCK = threading.Lock()
+# tag -> {"proc": Popen|None, "sid", "log", "started", "mode", "model"}
+RUNS = {}
+BATCH = {"active": False, "stop": False, "current": None, "queue": []}
+
+
+# ----------------------------- config ---------------------------------------
+def load_cfg():
+    cfg = dict(DEFAULT_CFG)
+    if os.path.exists(CFG_PATH):
+        try:
+            cfg.update(json.load(open(CFG_PATH, encoding="utf-8")))
+        except Exception:
+            pass
+    return cfg
+
+
+def save_cfg(cfg):
+    json.dump(cfg, open(CFG_PATH, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+
+
+CFG = load_cfg()
+
+
+def _effective_stage(raw_stage):
+    """Khi tắt Vision, pipeline dừng ở stage 'vision' (không sinh file vis) nhưng
+    translate+verify+apply đã xong -> coi như 'done' để done/batch hội tụ."""
+    if raw_stage == "vision" and not CFG.get("vision", True):
+        return "done"
+    return raw_stage
+
+
+# ----------------------------- volumes --------------------------------------
+def pretty_name(pdf_path):
+    base = os.path.splitext(os.path.basename(pdf_path))[0]
+    return base.replace("2024 CFA level I ", "").replace("2024 ", "")
+
+
+def load_volumes():
+    vols = json.load(open(MANIFEST, encoding="utf-8"))
+    for v in vols:
+        v["tag"] = os.path.basename(v["workdir"].rstrip("/"))
+        v["display"] = pretty_name(v["pdf"])
+    return vols
+
+
+def find_volume(tag):
+    for v in load_volumes():
+        if v["tag"] == tag:
+            return v
+    return None
+
+
+def codex_state(vol):
+    """Đọc <workdir>/codex_state.json do luồng Codex ghi (done_through, last).
+    Trả None nếu chưa có / hỏng."""
+    p = os.path.join(vol["workdir"], "codex_state.json")
+    if not os.path.exists(p):
+        return None
+    try:
+        d = json.load(open(p, encoding="utf-8"))
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+def codex_done(vol):
+    """Codex coi là xong khi OUT tồn tại và đã dịch tới trang cuối."""
+    s = codex_state(vol)
+    if not s or not os.path.exists(vol["out"]):
+        return False
+    last = s.get("last")
+    return isinstance(last, int) and s.get("done_through", -1) >= last >= 0
+
+
+# ----------------------------- run state ------------------------------------
+def run_meta_path(workdir):
+    return os.path.join(workdir, "run.json")
+
+
+def load_run_meta(workdir):
+    p = run_meta_path(workdir)
+    if os.path.exists(p):
+        try:
+            return json.load(open(p, encoding="utf-8"))
+        except Exception:
+            return None
+    return None
+
+
+def save_run_meta(workdir, meta):
+    os.makedirs(workdir, exist_ok=True)
+    json.dump(meta, open(run_meta_path(workdir), "w", encoding="utf-8"),
+              ensure_ascii=False, indent=1)
+
+
+def pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def is_running(vol):
+    """Đang chạy nếu tiến trình trong RUNS còn sống, hoặc pid trong run.json còn
+    sống (bền qua việc khởi động lại dashboard)."""
+    r = RUNS.get(vol["tag"])
+    if r and r.get("proc") is not None:
+        return r["proc"].poll() is None
+    meta = load_run_meta(vol["workdir"])
+    return bool(meta and meta.get("mode") == "running" and pid_alive(meta.get("pid")))
+
+
+# ----------------------------- launch / stop --------------------------------
+# Hai ENGINE dịch, cùng checkpoint-theo-file nên DỪNG rồi CHẠY lại là resume:
+#   • claude: Workflow 4-phase (translate → verify → apply → vision) — chất lượng
+#     cao nhất. Đây là script translate_volume.js chạy trong Claude Code.
+#   • codex:  luồng MCP đơn giản — `codex exec` dùng MCP cfa-pdf-translator dịch
+#     cả volume theo LÔ TRANG nối chuỗi (lô đầu đọc source→ghi OUT; lô sau đọc OUT
+#     đã dịch→ghi đè OUT). Không có verify/vision; nhanh & gọn.
+def build_prompt(vol, vision):
+    run_args = {"pdf": vol["pdf"], "workdir": vol["workdir"], "out": vol["out"],
+                "vision": bool(vision), "tool": TOOL}
+    return (
+        "Bạn đang chạy pipeline dịch 1 volume CFA sang tiếng Việt (giữ layout). "
+        f"Dùng công cụ Workflow với scriptPath \"{VOLUME_JS}\" và args (JSON) sau:\n"
+        f"{json.dumps(run_args, ensure_ascii=False)}\n\n"
+        "CHỜ workflow chạy XONG hoàn toàn rồi báo lại đúng status JSON cuối cùng "
+        "của nó. KHÔNG kết thúc lượt cho tới khi workflow hoàn tất. Không hỏi lại."
+    )
+
+
+def build_prompt_codex(vol, batch):
+    """Prompt cho `codex exec`: dịch cả volume qua MCP theo lô trang, resume được.
+
+    Cơ chế: apply_translations MỞ LẠI đúng PDF đã extract rồi lưu ra OUT. Nên lô
+    đầu extract từ SOURCE và apply ra OUT; các lô sau extract TỪ OUT (đã có lô
+    trước) và apply đè lại OUT → tích luỹ đúng, không mất bản dịch cũ."""
+    src, out, wd = vol["pdf"], vol["out"], vol["workdir"]
+    state = os.path.join(wd, "codex_state.json")
+    work = os.path.join(wd, "codex_work.pdf")
+    return (
+        "Bạn là trình dịch PDF CFA sang TIẾNG VIỆT, GIỮ NGUYÊN layout, qua MCP "
+        "server `cfa-pdf-translator` (các tool: list_pdf_info, extract_segments, "
+        "apply_translations). Làm việc TỰ ĐỘNG tới khi xong, KHÔNG hỏi lại.\n\n"
+        f"SOURCE = {src}\nOUT = {out}\nWORK = {work}\nSTATE = {state}\n"
+        f"BATCH = {int(batch)} trang mỗi lô.\n\n"
+        "LƯU Ý apply_translations MỞ LẠI đúng PDF đã extract rồi lưu ra file đích. "
+        "TUYỆT ĐỐI không để file nguồn và file đích TRÙNG đường dẫn (PyMuPDF sẽ "
+        "lỗi). Vì vậy luôn đọc từ WORK và ghi ra OUT, rồi copy OUT->WORK.\n\n"
+        "QUY TRÌNH:\n"
+        "1) list_pdf_info(SOURCE) để lấy page_count (last = page_count-1).\n"
+        "2) Đọc STATE (shell `cat` nếu có) lấy done_through (0-based, trang cuối "
+        "đã dịch); nếu chưa có STATE hoặc chưa có WORK thì done_through = -1.\n"
+        "3) LẶP tới khi done_through == last:\n"
+        "   - start = done_through+1; end = min(start+BATCH-1, last); "
+        "pages = f\"{start}-{end}\".\n"
+        "   - input_pdf = WORK nếu file WORK đã tồn tại, ngược lại = SOURCE.\n"
+        "   - extract_segments(input_pdf, pages). Dịch text từng segment sang "
+        "tiếng Việt tự nhiên, GIỮ NGUYÊN số/ký hiệu/công thức và thuật ngữ (ETF, "
+        "CAPM...). Với thuật ngữ chuyên ngành dùng dạng 'tiếng Việt (English term)' "
+        "khi hữu ích.\n"
+        "   - apply_translations(session_id, {id: bản_dịch}, OUT)  # đọc input_pdf, ghi OUT.\n"
+        "   - Sao chép OUT sang WORK bằng shell: `cp OUT WORK` (để lô sau đọc từ "
+        "WORK đã tích luỹ). Dùng đúng đường dẫn tuyệt đối ở trên.\n"
+        "   - done_through = end; ghi STATE = {\"done_through\": end, \"last\": "
+        "last} (shell, ghi đè file).\n"
+        "4) Khi xong in ĐÚNG một dòng JSON: "
+        "{\"engine\":\"codex\",\"out\":\"...\",\"pages\":<page_count>,\"done\":true}.\n"
+        "Không dịch heading/công thức/bảng số/mục lục — extract_segments đã lọc sẵn."
+    )
+
+
+def build_cmd_claude(vol, cfg, sid):
+    cmd = ["claude", "-p", build_prompt(vol, cfg["vision"]),
+           "--model", cfg["model"],
+           "--add-dir", TRANSLATE_ROOT,
+           "--output-format", "stream-json", "--verbose",
+           "--session-id", sid]
+    if cfg.get("posture") == "bypass":
+        cmd += ["--permission-mode", "bypassPermissions"]
+    else:  # allowlist: không tắt hỏi quyền, chỉ cấp đúng tool cần
+        cmd += ["--permission-mode", "default", "--allowedTools", *ALLOWED_TOOLS]
+    return cmd
+
+
+def build_cmd_codex(vol, cfg, sid):
+    prompt = build_prompt_codex(vol, cfg.get("codex_batch", 25))
+    base = ["codex", "exec", prompt, "--json", "--skip-git-repo-check",
+            "-C", TRANSLATE_ROOT]          # cwd = translate root (source + out nằm trong)
+    if cfg.get("posture") == "bypass":
+        # QUAN TRỌNG: trong `codex exec` non-interactive, mỗi MCP tool call sinh
+        # 1 elicitation "mcp_tool_call_approval" và bị TỰ HUỶ (decision:Cancel) —
+        # kể cả approval_policy=never. Chỉ cờ bypass mới auto-approve được để
+        # luồng MCP chạy không cần người bấm duyệt. Cờ này bỏ CẢ sandbox — rủi ro,
+        # nên chỉ khi user tự chọn posture=bypass.
+        return base + ["--dangerously-bypass-approvals-and-sandbox"]
+    # allowlist (an toàn): sandbox workspace-write + không hỏi duyệt. LƯU Ý: do
+    # giới hạn trên, các MCP tool call sẽ bị codex tự huỷ -> luồng KHÔNG hoàn tất.
+    # Dùng khi chỉ muốn chạy sandbox chặt; để dịch thật hãy dùng bypass hoặc chạy
+    # `codex` INTERACTIVE trong Terminal của app (duyệt MCP hoạt động bình thường).
+    return base + ["-s", "workspace-write", "-c", "approval_policy=never"]
+
+
+def build_cmd(vol, cfg, sid):
+    if cfg.get("engine") == "codex":
+        return build_cmd_codex(vol, cfg, sid)
+    return build_cmd_claude(vol, cfg, sid)
+
+
+def launch(vol, cfg):
+    """Spawn `claude -p` (nhóm tiến trình riêng để dừng sạch). Gắn reaper cập nhật
+    run.json khi kết thúc. Trả (proc, sid) hoặc (None, reason)."""
+    tag = vol["tag"]
+    # Đặt chỗ NGUYÊN TỬ (check + reserve trong cùng 1 LOCK): chống 2 request cùng
+    # tag spawn 2 tiến trình trên 1 workdir (double-click / batch đua với Chạy tay).
+    with LOCK:
+        held = RUNS.get(tag)
+        if held and held.get("mode") == "starting":
+            return None, "đang khởi động"
+        if is_running(vol):
+            return None, "đang chạy"
+        RUNS[tag] = {"proc": None, "mode": "starting"}
+    sid = str(uuid.uuid4())
+    wd = vol["workdir"]
+    try:
+        os.makedirs(wd, exist_ok=True)
+        log_path = os.path.join(wd, "run.log")
+        logf = open(log_path, "ab", buffering=0)
+        logf.write(f"\n===== RUN {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                   f"engine={cfg.get('engine', 'claude')} model={cfg['model']} "
+                   f"posture={cfg['posture']} vision={cfg['vision']} "
+                   f"sid={sid} =====\n".encode())
+        proc = subprocess.Popen(
+            build_cmd(vol, cfg, sid), cwd=TOOL,
+            stdin=subprocess.DEVNULL,  # codex exec chờ đọc stdin -> sẽ treo nếu để inherit
+            stdout=logf, stderr=subprocess.STDOUT,
+            start_new_session=True,  # pgid == pid -> killpg dừng cả cây
+        )
+        logf.close()  # child giữ bản dup riêng
+    except Exception:
+        with LOCK:  # spawn lỗi -> nhả chỗ đã đặt để lần sau chạy lại được
+            if (RUNS.get(tag) or {}).get("mode") == "starting":
+                RUNS.pop(tag, None)
+        raise
+    meta = {"pid": proc.pid, "sid": sid, "log": log_path, "started": time.time(),
+            "mode": "running", "model": cfg["model"],
+            "engine": cfg.get("engine", "claude")}
+    with LOCK:
+        RUNS[tag] = {"proc": proc, **meta}
+    save_run_meta(wd, meta)
+    threading.Thread(target=_reap, args=(tag, wd, proc), daemon=True).start()
+    return proc, sid
+
+
+def _reap(tag, workdir, proc):
+    rc = proc.wait()
+    meta = load_run_meta(workdir) or {}
+    meta.update({"mode": "exited", "rc": rc, "ended": time.time()})
+    save_run_meta(workdir, meta)
+    with LOCK:
+        r = RUNS.get(tag)
+        if r and r.get("proc") is proc:
+            r["proc"] = None
+            r["mode"] = "exited"
+
+
+def _pid_of(vol):
+    r = RUNS.get(vol["tag"])
+    if r and r.get("proc") is not None and r["proc"].poll() is None:
+        return r["proc"].pid
+    # Chỉ tin pid trong run.json khi run được cho là CÒN chạy — tránh SIGTERM nhầm
+    # một tiến trình khác được cấp lại pid cũ sau khi run đã thoát.
+    meta = load_run_meta(vol["workdir"])
+    return meta.get("pid") if meta and meta.get("mode") == "running" else None
+
+
+def stop(vol):
+    pid = _pid_of(vol)
+    if not pid_alive(pid):
+        return False
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        return True
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            return True
+        except Exception:
+            return False
+
+
+# ----------------------------- batch ----------------------------------------
+def _pending_tags():
+    tags = []
+    for v in load_volumes():
+        if v.get("skip"):
+            continue
+        try:
+            st = ap._status(v["workdir"])
+        except Exception:
+            st = {"stage": "translate"}
+        if _effective_stage(st.get("stage")) != "done" and not codex_done(v):
+            tags.append(v["tag"])
+    return tags
+
+
+def _batch_worker(cfg):
+    try:
+        for tag in list(BATCH["queue"]):
+            if BATCH["stop"]:
+                break
+            vol = find_volume(tag)
+            if not vol or is_running(vol):
+                continue
+            BATCH["current"] = tag
+            proc, _ = launch(vol, cfg)
+            if proc is None:
+                continue
+            while proc.poll() is None:      # chờ volume này xong, còn phản ứng Dừng
+                if BATCH["stop"]:
+                    stop(vol)
+                    break
+                time.sleep(2)
+    finally:
+        BATCH.update({"active": False, "current": None})
+
+
+def batch_start(cfg):
+    with LOCK:
+        if BATCH["active"]:
+            return False
+        BATCH.update({"active": True, "stop": False, "current": None,
+                      "queue": _pending_tags()})
+    threading.Thread(target=_batch_worker, args=(dict(cfg),), daemon=True).start()
+    return True
+
+
+def batch_stop():
+    BATCH["stop"] = True
+    cur = BATCH.get("current")
+    if cur:
+        vol = find_volume(cur)
+        if vol:
+            stop(vol)
+
+
+# ----------------------------- status snapshot ------------------------------
+def vol_status(vol):
+    try:
+        st = ap._status(vol["workdir"])
+    except Exception as e:
+        st = {"stage": "error", "translate": [0, 0], "verify": [0, 0],
+              "vision": [0, None], "pairs": 0, "error": str(e)}
+    st["stage"] = _effective_stage(st.get("stage"))
+    st["tag"] = vol["tag"]
+    st["display"] = vol["display"]
+    st["skip"] = bool(vol.get("skip"))
+    st["running"] = is_running(vol)
+    st["out_exists"] = os.path.exists(vol["out"])
+    meta = load_run_meta(vol["workdir"]) or {}
+    st["started"] = meta.get("started")
+    st["mode"] = meta.get("mode")
+    st["rc"] = meta.get("rc")
+    st["sid"] = (meta.get("sid") or "")[:8]
+    st["engine"] = meta.get("engine", CFG.get("engine", "claude"))
+    # Luồng Codex không sinh file translate/verify/vision của Workflow; suy stage
+    # + thanh tiến độ từ codex_state.json (dịch theo lô trang).
+    cs = codex_state(vol)
+    if cs is not None and st["stage"] != "done":
+        last = cs.get("last")
+        dt = cs.get("done_through", -1)
+        if isinstance(last, int) and last >= 0:
+            st["translate"] = [max(0, dt + 1), last + 1]
+        if codex_done(vol):
+            st["stage"] = "done"
+        elif st["stage"] not in ("error",):
+            st["stage"] = "translate"
+    return st
+
+
+# snapshot() gọi vol_status cho từng volume; vol_status -> ap._status mở PDF
+# (fitz) để lấy page_count nên tốn ~vài trăm ms/volume. Parallel hoá qua thread
+# (IO-bound) + cache TTL ngắn để nhiều request refresh trùng nhau tái dùng kết
+# quả (client tự refresh mỗi vài giây).
+_SNAP = {"t": 0.0, "data": None}
+_SNAP_TTL = 4.0
+_SNAP_LOCK = threading.Lock()
+
+
+def _compute_snapshot():
+    vols = load_volumes()
+    with ThreadPoolExecutor(max_workers=min(8, len(vols) or 1)) as ex:
+        items = list(ex.map(vol_status, vols))
+    real = [i for i in items if not i["skip"]]
+    done = sum(1 for i in real if i["stage"] == "done")
+    return {
+        "volumes": items,
+        "done": done, "total": len(real),
+        "running": sum(1 for i in items if i["running"]),
+        "batch": {"active": BATCH["active"], "current": BATCH["current"]},
+        "config": CFG, "engines": ENGINES, "models": MODELS, "postures": POSTURES,
+    }
+
+
+def snapshot():
+    if _SNAP["data"] is not None and time.time() - _SNAP["t"] < _SNAP_TTL:
+        return _SNAP["data"]
+    # 1 request tính lại tại một thời điểm; các request trùng chờ rồi tái dùng.
+    with _SNAP_LOCK:
+        if _SNAP["data"] is not None and time.time() - _SNAP["t"] < _SNAP_TTL:
+            return _SNAP["data"]
+        data = _compute_snapshot()
+        _SNAP["data"] = data
+        _SNAP["t"] = time.time()  # tính TTL từ lúc XONG (compute có thể vài giây)
+        return data
+
+
+# ----------------------------- log parsing ----------------------------------
+def _tool_hint(name, inp):
+    if name == "Bash":
+        return "⚙ Bash: " + str(inp.get("command", ""))[:90]
+    if name in ("Write", "Edit", "Read"):
+        return f"⚙ {name}: " + os.path.basename(str(inp.get("file_path", "")))
+    if name == "Workflow":
+        return "⚙ Workflow: " + os.path.basename(str(inp.get("scriptPath", "")))
+    if name in ("Task", "Agent"):
+        return "⚙ Agent: " + str(inp.get("description", ""))[:70]
+    return "⚙ " + str(name)
+
+
+def _summarize(obj):
+    t = obj.get("type")
+    if t == "assistant":
+        parts = []
+        for c in (obj.get("message", {}).get("content") or []):
+            if c.get("type") == "text" and c.get("text", "").strip():
+                parts.append("💬 " + c["text"].strip().replace("\n", " ")[:220])
+            elif c.get("type") == "tool_use":
+                parts.append(_tool_hint(c.get("name"), c.get("input", {})))
+        return " | ".join(p for p in parts if p) or None
+    if t == "result":
+        return "✅ " + str(obj.get("result", ""))[:220]
+    if t == "system" and obj.get("subtype") == "init":
+        return "▶ session " + str(obj.get("session_id", ""))[:8]
+    return _summarize_codex(obj, t)
+
+
+def _summarize_codex(obj, t):
+    """Tóm tắt 1 event JSONL của `codex exec --json` (khác schema Claude)."""
+    if t in ("thread.started", "session.created"):
+        return "▶ codex session"
+    if t == "turn.completed":
+        return None
+    it = obj.get("item") or obj.get("msg") or {}
+    itype = it.get("type") or it.get("item_type")
+    if itype in ("agent_message", "assistant_message"):
+        txt = str(it.get("text") or it.get("message") or "").strip()
+        return "💬 " + txt.replace("\n", " ")[:220] if txt else None
+    if itype in ("command_execution", "exec_command", "command"):
+        return "⚙ Bash: " + str(it.get("command", ""))[:90]
+    if itype in ("mcp_tool_call", "tool_call", "function_call"):
+        tool = it.get("tool") or it.get("name") or ""
+        return "⚙ MCP: " + str(tool)[:70]
+    if itype in ("error",):
+        return "⚠ " + str(it.get("message") or obj.get("message") or "")[:180]
+    return None
+
+
+def tail_log(vol, n=60):
+    log_path = os.path.join(vol["workdir"], "run.log")
+    if not os.path.exists(log_path):
+        return []
+    with open(log_path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - 200_000))
+        data = f.read().decode("utf-8", "replace")
+    out = []
+    for line in data.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("====="):
+            out.append(line)
+            continue
+        try:
+            s = _summarize(json.loads(line))
+        except Exception:
+            s = line[:220]
+        if s:
+            out.append(s)
+    return out[-n:]
+
+
+# ----------------------------- HTTP handler ---------------------------------
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass  # tắt log request ồn ào
+
+    def _send(self, code, body, ctype="application/json"):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body, ensure_ascii=False).encode()
+        elif isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_body(self):
+        # Yêu cầu application/json: request cross-origin dạng "simple" (text/plain)
+        # không đặt được header này nếu không preflight -> chặn thêm 1 lớp CSRF.
+        ctype = self.headers.get("Content-Type", "")
+        if ctype and ctype.split(";")[0].strip() != "application/json":
+            return {}
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        if not n:
+            return {}
+        try:
+            d = json.loads(self.rfile.read(n).decode())
+        except Exception:
+            return {}
+        return d if isinstance(d, dict) else {}  # non-object -> {} (khỏi crash handler)
+
+    def _origin_ok(self):
+        """Chặn CSRF: nếu có Origin (request từ trình duyệt), host phải là localhost.
+        Không có Origin (curl/same-origin) -> cho qua (không phải vector CSRF)."""
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        try:
+            host = urlparse(origin).hostname
+        except Exception:
+            return False
+        return host in ("127.0.0.1", "localhost", "::1")
+
+    def do_GET(self):
+        try:
+            self._route_get()
+        except Exception as e:
+            self._safe_500(e)
+
+    def _route_get(self):
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+        if u.path == "/":
+            return self._send(200, PAGE, "text/html; charset=utf-8")
+        if u.path == "/api/ping":  # nhẹ, để app kiểm tra backend sẵn sàng
+            return self._send(200, {"ok": True})
+        if u.path == "/api/status":
+            return self._send(200, snapshot())
+        if u.path == "/api/log":
+            vol = find_volume((q.get("tag") or [""])[0])
+            if not vol:
+                return self._send(404, {"error": "tag không tồn tại"})
+            return self._send(200, {"tag": vol["tag"], "lines": tail_log(vol)})
+        if u.path == "/api/file":
+            return self._serve_file(q)
+        return self._send(404, {"error": "not found"})
+
+    def _safe_500(self, e):
+        try:
+            self._send(500, {"error": str(e)})
+        except Exception:
+            pass  # header có thể đã gửi (vd đang stream file) -> bỏ qua
+
+    def _serve_file(self, q):
+        vol = find_volume((q.get("tag") or [""])[0])
+        kind = (q.get("kind") or ["out"])[0]
+        if not vol:
+            return self._send(404, {"error": "tag không tồn tại"})
+        path = vol["out"] if kind == "out" else vol["pdf"]  # chỉ 2 path hợp lệ
+        if not os.path.exists(path):
+            return self._send(404, {"error": "file chưa có"})
+        with open(path, "rb") as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/pdf")
+        self.send_header("Content-Disposition",
+                         f'inline; filename="{os.path.basename(path)}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_POST(self):
+        try:
+            if not self._origin_ok():
+                return self._send(403, {"error": "cross-origin bị chặn"})
+            u = urlparse(self.path)
+            body = self._read_body()
+            if u.path == "/api/run":
+                return self._run(body)
+            if u.path == "/api/stop":
+                return self._stop(body)
+            if u.path == "/api/batch":
+                return self._batch(body)
+            if u.path == "/api/config":
+                return self._config(body)
+            return self._send(404, {"error": "not found"})
+        except Exception as e:
+            self._safe_500(e)
+
+    def _run(self, body):
+        vol = find_volume(body.get("tag", ""))
+        if not vol:
+            return self._send(404, {"error": "tag không tồn tại"})
+        if vol.get("skip"):
+            return self._send(400, {"error": "volume này đánh skip"})
+        proc, info = launch(vol, CFG)
+        if proc is None:
+            return self._send(409, {"error": info})
+        return self._send(200, {"ok": True, "sid": info})
+
+    def _stop(self, body):
+        vol = find_volume(body.get("tag", ""))
+        if not vol:
+            return self._send(404, {"error": "tag không tồn tại"})
+        return self._send(200, {"ok": stop(vol)})
+
+    def _batch(self, body):
+        action = body.get("action")
+        if action == "start":
+            return self._send(200, {"ok": batch_start(CFG), "queue": BATCH["queue"]})
+        if action == "stop":
+            batch_stop()
+            return self._send(200, {"ok": True})
+        return self._send(400, {"error": "action không hợp lệ"})
+
+    def _config(self, body):
+        if body.get("engine") in ENGINES:
+            CFG["engine"] = body["engine"]
+        if body.get("model") in MODELS:
+            CFG["model"] = body["model"]
+        if body.get("posture") in POSTURES:
+            CFG["posture"] = body["posture"]
+        if "vision" in body:
+            CFG["vision"] = bool(body["vision"])
+        if isinstance(body.get("codex_batch"), int) and 5 <= body["codex_batch"] <= 200:
+            CFG["codex_batch"] = body["codex_batch"]
+        save_cfg(CFG)
+        return self._send(200, {"ok": True, "config": CFG})
+
+
+# ----------------------------- HTML page ------------------------------------
+PAGE = r"""<!doctype html><html lang="vi"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CFA Translate Manager</title>
+<style>
+:root{--bg:#0f1117;--panel:#171a23;--line:#262a36;--fg:#e6e8ee;--mut:#9aa3b2;
+--acc:#4f8cff;--ok:#33c481;--warn:#e0b341;--run:#7c5cff;--bar:#222735}
+@media(prefers-color-scheme:light){:root{--bg:#f5f6f9;--panel:#fff;--line:#e3e6ee;
+--fg:#1b1f2a;--mut:#5b6472;--bar:#eef0f6}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
+font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{display:flex;align-items:center;gap:16px;padding:14px 22px;flex-wrap:wrap;
+border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:5}
+h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.2px}
+.grow{flex:1}.mut{color:var(--mut)}
+.pill{padding:2px 9px;border-radius:20px;font-size:12px;font-weight:600;
+border:1px solid var(--line)}
+.stage-translate{color:var(--acc)}.stage-verify{color:var(--warn)}
+.stage-vision{color:var(--run)}.stage-done{color:var(--ok)}.stage-error{color:#ff5d5d}
+main{padding:18px 22px;max-width:1180px;margin:0 auto}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.6px;
+color:var(--mut);padding:8px 10px;border-bottom:1px solid var(--line)}
+td{padding:11px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
+tr.skip{opacity:.45}
+.name{font-weight:600}.sub{font-size:12px;color:var(--mut)}
+.bars{display:flex;gap:10px;min-width:330px}
+.b{flex:1}.b .lab{font-size:10px;color:var(--mut);display:flex;justify-content:space-between}
+.track{height:7px;background:var(--bar);border-radius:6px;overflow:hidden;margin-top:3px}
+.fill{height:100%;border-radius:6px;transition:width .4s}
+.fill.tr{background:var(--acc)}.fill.vr{background:var(--warn)}.fill.vs{background:var(--run)}
+button{font:inherit;border:1px solid var(--line);background:var(--panel);color:var(--fg);
+padding:6px 13px;border-radius:8px;cursor:pointer;font-weight:600}
+button:hover{border-color:var(--acc)}button:disabled{opacity:.4;cursor:not-allowed}
+button.run{background:var(--acc);border-color:var(--acc);color:#fff}
+button.stop{background:#e0483f;border-color:#e0483f;color:#fff}
+button.ghost{background:transparent}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+.dot.live{background:var(--run);animation:pulse 1.4s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(124,92,255,.6)}
+70%{box-shadow:0 0 0 7px rgba(124,92,255,0)}100%{box-shadow:0 0 0 0 rgba(124,92,255,0)}}
+select{font:inherit;background:var(--panel);color:var(--fg);border:1px solid var(--line);
+border-radius:8px;padding:5px 8px}
+label.ck{display:inline-flex;align-items:center;gap:5px;color:var(--mut)}
+.log{background:#0a0c12;color:#c7d0e0;border:1px solid var(--line);border-radius:10px;
+padding:12px 14px;margin-top:8px;font:12px/1.55 ui-monospace,Menlo,monospace;
+max-height:340px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+.actions{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}
+a.link{color:var(--acc);text-decoration:none;font-weight:600;font-size:12px}
+.tools{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.warnbypass{color:var(--warn);font-size:12px}
+</style></head><body>
+<header>
+  <h1>📘 CFA Translate Manager</h1>
+  <span id="summary" class="mut" style="font-size:13px"></span>
+  <span class="grow"></span>
+  <div class="tools">
+    <label class="mut">Engine <select id="engine"></select></label>
+    <label class="mut" id="wrapModel">Model <select id="model"></select></label>
+    <label class="mut" id="wrapBatch" style="display:none">Lô trang
+      <input id="codex_batch" type="number" min="5" max="200" step="5"
+             style="width:60px;font:inherit;background:var(--panel);color:var(--fg);
+             border:1px solid var(--line);border-radius:8px;padding:5px 7px"></label>
+    <label class="mut">Quyền <select id="posture"></select></label>
+    <label class="ck" id="wrapVision"><input type="checkbox" id="vision"> Vision</label>
+    <button id="batchBtn" class="run">▶ Chạy cả batch</button>
+    <span class="pill mut">⟳ auto 3s</span>
+  </div>
+</header>
+<main>
+  <div id="bypassWarn" class="warnbypass" style="display:none">
+    ⚠ Đang bật <b>bypass</b>: agent con chạy Bash/Write không hỏi quyền. Chỉ dùng nếu bạn chấp nhận rủi ro.
+  </div>
+  <table>
+    <thead><tr><th>Volume</th><th>Trạng thái</th><th>Tiến độ</th><th></th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div id="logwrap" style="display:none">
+    <h3 style="margin:22px 0 0">Log <span id="logtag" class="mut"></span>
+      <button class="ghost" onclick="closeLog()" style="float:right">✕ đóng</button></h3>
+    <div id="log" class="log"></div>
+  </div>
+</main>
+<script>
+const $=s=>document.querySelector(s);
+const PLABEL={allowlist:"An toàn (allowlist)",bypass:"Bypass (bỏ hỏi quyền)"};
+const ELABEL={claude:"Claude (Workflow 4-phase)",codex:"Codex (MCP đơn giản)"};
+let CFG=null, openTag=null;
+function applyEngineUI(){
+  const codex=$('#engine').value==='codex';
+  $('#wrapModel').style.display=codex?'none':'';
+  $('#wrapVision').style.display=codex?'none':'';
+  $('#wrapBatch').style.display=codex?'':'none';
+}
+
+function bar(cls,pair){
+  const[d,t]=pair||[0,0]; const pct=t?Math.round(100*d/t):0;
+  const lab=cls==='vs'?'vision':cls==='vr'?'verify':'translate';
+  return `<div class="b"><div class="lab"><span>${lab}</span><span>${t?d+'/'+t:'–'}</span></div>
+   <div class="track"><div class="fill ${cls}" style="width:${pct}%"></div></div></div>`;
+}
+function row(v){
+  const skip=v.skip?' class="skip"':'';
+  const live=v.running?'<span class="dot live"></span>':'';
+  const stage=`<span class="pill stage-${v.stage}">${live}${v.stage}</span>`;
+  const bars=`<div class="bars">${bar('tr',v.translate)}${bar('vr',v.verify)}${bar('vs',v.vision)}</div>`;
+  let act='';
+  if(v.skip){act='<span class="mut">skip</span>';}
+  else if(v.running){act=`<button class="stop" onclick="act('stop','${v.tag}')">■ Dừng</button>`;}
+  else if(v.stage==='done'){act=`<button class="run" onclick="act('run','${v.tag}')">↻ Chạy lại</button>`;}
+  else{act=`<button class="run" onclick="act('run','${v.tag}')">▶ Chạy</button>`;}
+  const links=[];
+  if(v.out_exists)links.push(`<a class="link" href="/api/file?tag=${v.tag}&kind=out" target="_blank">PDF↗</a>`);
+  links.push(`<a class="link" href="#" onclick="showLog('${v.tag}');return false">log</a>`);
+  const eng=v.engine?(v.engine==='codex'?'🤖 codex':'✳ claude'):'';
+  const sub=[eng, v.sid?('sid '+v.sid):'', (v.mode==='exited'&&v.rc!=null)?('rc '+v.rc):''].filter(Boolean).join(' · ');
+  return `<tr${skip}>
+    <td><div class="name">${v.display}</div><div class="sub">${v.tag}${sub?' · '+sub:''}</div></td>
+    <td>${stage}</td><td>${bars}</td>
+    <td><div class="actions">${links.join('')}${act}</div></td></tr>`;
+}
+function fillSelect(sel,opts,val,labels){
+  sel.innerHTML=opts.map(o=>`<option value="${o}" ${o===val?'selected':''}>${labels?labels[o]:o}</option>`).join('');
+}
+async function refresh(){
+  const s=await (await fetch('/api/status')).json();
+  if(!CFG){
+    CFG=s.config;
+    fillSelect($('#engine'),s.engines,CFG.engine,ELABEL);
+    fillSelect($('#model'),s.models,CFG.model);
+    fillSelect($('#posture'),s.postures,CFG.posture,PLABEL);
+    $('#vision').checked=CFG.vision;
+    $('#codex_batch').value=CFG.codex_batch||25;
+    applyEngineUI();
+    $('#engine').onchange=()=>{applyEngineUI();saveCfg();};
+    $('#model').onchange=$('#posture').onchange=$('#vision').onchange=$('#codex_batch').onchange=saveCfg;
+  }
+  $('#bypassWarn').style.display=($('#posture').value==='bypass')?'block':'none';
+  $('#rows').innerHTML=s.volumes.map(row).join('');
+  $('#summary').textContent=`xong ${s.done}/${s.total} · ${s.running} đang chạy`
+    +(s.batch.active?` · batch ▶ ${s.batch.current||'...'}`:'');
+  const bb=$('#batchBtn');
+  bb.textContent=s.batch.active?'■ Dừng batch':'▶ Chạy cả batch';
+  bb.className=s.batch.active?'stop':'run';
+  bb.onclick=()=>fetch('/api/batch',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({action:s.batch.active?'stop':'start'})}).then(refresh);
+  if(openTag)loadLog();
+}
+async function saveCfg(){
+  CFG={engine:$('#engine').value,model:$('#model').value,posture:$('#posture').value,
+    vision:$('#vision').checked,codex_batch:parseInt($('#codex_batch').value)||25};
+  $('#bypassWarn').style.display=(CFG.posture==='bypass')?'block':'none';
+  await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(CFG)});
+}
+async function act(kind,tag){
+  const r=await fetch('/api/'+kind,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({tag})});
+  if(!r.ok){const e=await r.json().catch(()=>({}));alert(e.error||'lỗi');}
+  refresh();
+}
+function showLog(tag){openTag=tag;$('#logwrap').style.display='block';
+  $('#logtag').textContent='· '+tag;loadLog();
+  $('#logwrap').scrollIntoView({behavior:'smooth'});}
+function closeLog(){openTag=null;$('#logwrap').style.display='none';}
+async function loadLog(){
+  const d=await (await fetch('/api/log?tag='+openTag)).json();
+  $('#log').textContent=(d.lines||[]).join('\n')||'(chưa có log)';
+}
+refresh();setInterval(refresh,3000);
+</script></body></html>"""
+
+
+# ----------------------------- main -----------------------------------------
+def reconcile_on_start():
+    """Đồng bộ run.json cũ: pid không còn sống -> đánh dấu exited."""
+    for v in load_volumes():
+        meta = load_run_meta(v["workdir"])
+        if meta and meta.get("mode") == "running" and not pid_alive(meta.get("pid")):
+            meta["mode"] = "exited"
+            save_run_meta(v["workdir"], meta)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Màn hình quản lý dịch CFA")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8756)
+    a = parser.parse_args()
+    reconcile_on_start()
+    srv = ThreadingHTTPServer((a.host, a.port), Handler)
+    print(f"▶ CFA Translate Manager: http://{a.host}:{a.port}")
+    print(f"  tool={TOOL}  model={CFG['model']}  posture={CFG['posture']}")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nĐã dừng.")
+
+
+if __name__ == "__main__":
+    main()

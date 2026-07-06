@@ -1,0 +1,64 @@
+[
+ {
+  "pdf": "/Users/khanhnm/Desktop/translate/2024 CFA L1 Curriculum/2024 CFA level I Topic Outlines.pdf",
+  "workdir": "/Users/khanhnm/Desktop/translate/tool/work/topic_outlines",
+  "out": "/Users/khanhnm/Desktop/translate/2024 CFA L1 Curriculum - VI (agent)/2024 CFA level I Topic Outlines.pdf",
+  "vision": true
+ },
+ {
+  "pdf": "/Users/khanhnm/Desktop/translate/2024 CFA L1 Curriculum/2024 L1V1-Prerequisite Quant.pdf",
+  "workdir": "/Users/khanhnm/Desktop/translate/tool/work/quant_pre",
+  "out": "/Users/khanhnm/Desktop/translate/2024 CFA L1 Curriculum - VI (agent)/2024 L1V1-Prerequisite Quant.pdf",
+  "vision": true,
+  "skip": true,
+  "note": "đã dịch qua agent pilot (agent_pilot/)"
+ },
+ {
+  "pdf": "/Users/khanhnm/Desktop/translate/2024 CFA L1 Curriculum/2024 L1V1.pdf",
+  "workdir": "/Users/khanhnm/Desktop/translate/tool/work/v1",
+  "out": "/Users/khanhnm/Desktop/translate/2024 CFA L1 Curriculum - VI (agent)/2024 L1V1.pdf",
+  "vision": true
+ },
+ {
+  "pdf": "/Users/khanhnm/Desktop/translate/2024 CFA L1 Curriculum/2024 L1V2-Prerequisite Economics.pdf",
+  "workdir": "/Users/khanhnm/Desktop/translate/tool/work/econ_pre",
+  "out": "/Users/khanhnm/Desktop/translate/2024 CFA L1 Curriculum - VI (agent)/2024 L1V2-Prerequisite Economics.pdf",
+  "vision": true
+ },
+ {
+  "pdf": "/Users/khanhnm/Desktop/translate/2024 CFA L1 Curriculum/2024 L1V2.pdf",
+  "workdir": "/Users/khanhnm/Desktop/translate/tool/work/v2",
+  "out": "/Users/khanhnm/Desktop/translate/2024 CFA L1 Curriculum - VI (agent)/2024 L1V2.pdf",
+  "vision": true
+ },
+ {
+  "pdf": "/Users/khanhnm/Desktop/translate/2024 CFA L1 Curriculum/2024 L1V3-Prequisite FSA.pdf",
+  "workdir": "/Users/khanhnm/Desktop/translate/tool/work/fsa_pre",
+  "out": "/Users/khanhnm/Desktop/translate/2024 CFA L1 Curriculum - VI (agent)/2024 L1V3-Prequisite FSA.pdf",
+  "vision": true
+ },
+ {
+  "pdf": "/Users/khanhnm/Desktop/translate/2024 CFA L1 Curriculum/2024 L1V3.pdf",
+  "workdir": "/Users/khanhnm/Desktop/translate/tool/work/v3",
+  "out": "/Users/khanhnm/Desktop/translate/2024 CFA L1 Curriculum - VI (agent)/2024 L1V3.pdf",
+  "vision": true
+ },
+ {
+  "pdf": "/Users/khanhnm/Desktop/translate/2024 CFA L1 Curriculum/2024 L1V4.pdf",
+  "workdir": "/Users/khanhnm/Desktop/translate/tool/work/v4",
+  "out": "/Users/khanhnm/Desktop/translate/2024 CFA L1 Curriculum - VI (agent)/2024 L1V4.pdf",
+  "vision": true
+ },
+ {
+  "pdf": "/Users/khanhnm/Desktop/translate/2024 CFA L1 Curriculum/2024 L1V5.pdf",
+  "workdir": "/Users/khanhnm/Desktop/translate/tool/work/v5",
+  "out": "/Users/khanhnm/Desktop/translate/2024 CFA L1 Curriculum - VI (agent)/2024 L1V5.pdf",
+  "vision": true
+ },
+ {
+  "pdf": "/Users/khanhnm/Desktop/translate/2024 CFA L1 Curriculum/2024 L1V6.pdf",
+  "workdir": "/Users/khanhnm/Desktop/translate/tool/work/v6",
+  "out": "/Users/khanhnm/Desktop/translate/2024 CFA L1 Curriculum - VI (agent)/2024 L1V6.pdf",
+  "vision": true
+ }
+]
