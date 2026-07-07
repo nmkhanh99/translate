@@ -26,6 +26,7 @@ QUYỀN (posture) khi spawn `claude`:
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -42,6 +43,14 @@ MANIFEST = os.path.join(TOOL, "volumes.json")
 VOLUME_JS = os.path.join(TOOL, "translate_volume.js")
 TRANSLATE_ROOT = os.path.dirname(TOOL)          # .../translate (chứa PDF nguồn + đích)
 CFG_PATH = os.path.join(TOOL, "dashboard.json")
+
+# Thư mục cho tài liệu tự thêm: thả PDF vào input/ -> tự thành mục dịch,
+# bản dịch xuất ra output/<tên>_vi.pdf, workdir ở tool/work/user_<tên>/.
+INPUT_DIR = os.path.join(TRANSLATE_ROOT, "input")
+OUTPUT_DIR = os.path.join(TRANSLATE_ROOT, "output")
+USER_WORK = os.path.join(TOOL, "work")
+for _d in (INPUT_DIR, OUTPUT_DIR):
+    os.makedirs(_d, exist_ok=True)
 
 # Least-privilege: đúng các tool mà translate_volume.js + agent con của nó dùng.
 ALLOWED_TOOLS = ["Bash(cd *)", "Bash(python3 *)", "Write", "Edit", "Read",
@@ -96,8 +105,28 @@ def pretty_name(pdf_path):
     return base.replace("2024 CFA level I ", "").replace("2024 ", "")
 
 
+def _discover_user_volumes():
+    """Quét input/*.pdf -> mỗi PDF thành 1 volume tự thêm (user=True)."""
+    out = []
+    if not os.path.isdir(INPUT_DIR):
+        return out
+    for fn in sorted(os.listdir(INPUT_DIR)):
+        if not fn.lower().endswith(".pdf"):
+            continue
+        name = os.path.splitext(fn)[0]
+        slug = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower()[:40] or "doc"
+        out.append({
+            "pdf": os.path.join(INPUT_DIR, fn),
+            "workdir": os.path.join(USER_WORK, "user_" + slug),
+            "out": os.path.join(OUTPUT_DIR, name + "_vi.pdf"),
+            "user": True,
+        })
+    return out
+
+
 def load_volumes():
     vols = json.load(open(MANIFEST, encoding="utf-8"))
+    vols += _discover_user_volumes()  # + tài liệu tự thêm trong input/
     for v in vols:
         v["tag"] = os.path.basename(v["workdir"].rstrip("/"))
         v["display"] = pretty_name(v["pdf"])
@@ -193,29 +222,62 @@ def build_prompt(vol, vision):
     )
 
 
-def build_prompt_codex(vol, batch):
-    """Prompt cho `codex exec`: dịch cả volume qua MCP theo lô trang, resume được.
+def _parse_pages(pages):
+    """'40-80' -> (40, 80) (0-based, đã kẹp a<=b). 'all'/rỗng/không hợp lệ -> None."""
+    if not pages or str(pages).strip().lower() == "all":
+        return None
+    s = str(pages).strip()
+    if "-" not in s:
+        return None
+    lo, _, hi = s.partition("-")
+    if not (lo.strip().isdigit() and hi.strip().isdigit()):
+        return None
+    a, b = int(lo), int(hi)
+    return (min(a, b), max(a, b))
+
+
+def build_prompt_codex(vol, batch, pages="all"):
+    """Prompt cho `codex exec`: dịch volume (hoặc KHOẢNG TRANG) qua MCP theo lô
+    trang, resume được.
+
+    pages: "all" = cả volume; hoặc "a-b" (0-based) = chỉ dịch trang a..b.
 
     Cơ chế: apply_translations MỞ LẠI đúng PDF đã extract rồi lưu ra OUT. Nên lô
     đầu extract từ SOURCE và apply ra OUT; các lô sau extract TỪ OUT (đã có lô
     trước) và apply đè lại OUT → tích luỹ đúng, không mất bản dịch cũ."""
     src, out, wd = vol["pdf"], vol["out"], vol["workdir"]
-    state = os.path.join(wd, "codex_state.json")
-    work = os.path.join(wd, "codex_work.pdf")
+    rng = _parse_pages(pages)  # (a,b) hoặc None
+    # Partial dùng file state/work RIÊNG để không lệch trạng thái "done" cả volume.
+    tag = f"_{rng[0]}_{rng[1]}" if rng else ""
+    state = os.path.join(wd, f"codex_state{tag}.json")
+    work = os.path.join(wd, f"codex_work{tag}.pdf")
+    if rng:
+        a, b = rng
+        scope = (f"CHỈ dịch KHOẢNG TRANG {a}..{b} (0-based). first_page = {a}; "
+                 f"last = {b}.\n")
+        last_line = f"1) last = {b}; first_page = {a}.\n"
+        init_line = ("2) Đọc STATE (shell `cat`) lấy done_through; nếu chưa có "
+                     f"STATE/WORK thì done_through = first_page-1 = {a - 1}.\n")
+    else:
+        scope = "Dịch CẢ volume.\n"
+        last_line = ("1) list_pdf_info(SOURCE) để lấy page_count "
+                     "(last = page_count-1; first_page = 0).\n")
+        init_line = ("2) Đọc STATE (shell `cat` nếu có) lấy done_through (0-based, "
+                     "trang cuối đã dịch); nếu chưa có STATE hoặc chưa có WORK thì "
+                     "done_through = -1.\n")
     return (
         "Bạn là trình dịch PDF CFA sang TIẾNG VIỆT, GIỮ NGUYÊN layout, qua MCP "
         "server `cfa-pdf-translator` (các tool: list_pdf_info, extract_segments, "
         "apply_translations). Làm việc TỰ ĐỘNG tới khi xong, KHÔNG hỏi lại.\n\n"
         f"SOURCE = {src}\nOUT = {out}\nWORK = {work}\nSTATE = {state}\n"
-        f"BATCH = {int(batch)} trang mỗi lô.\n\n"
+        f"BATCH = {int(batch)} trang mỗi lô. {scope}\n"
         "LƯU Ý apply_translations MỞ LẠI đúng PDF đã extract rồi lưu ra file đích. "
         "TUYỆT ĐỐI không để file nguồn và file đích TRÙNG đường dẫn (PyMuPDF sẽ "
         "lỗi). Vì vậy luôn đọc từ WORK và ghi ra OUT, rồi copy OUT->WORK.\n\n"
         "QUY TRÌNH:\n"
-        "1) list_pdf_info(SOURCE) để lấy page_count (last = page_count-1).\n"
-        "2) Đọc STATE (shell `cat` nếu có) lấy done_through (0-based, trang cuối "
-        "đã dịch); nếu chưa có STATE hoặc chưa có WORK thì done_through = -1.\n"
-        "3) LẶP tới khi done_through == last:\n"
+        + last_line
+        + init_line
+        + "3) LẶP tới khi done_through == last:\n"
         "   - start = done_through+1; end = min(start+BATCH-1, last); "
         "pages = f\"{start}-{end}\".\n"
         "   - input_pdf = WORK nếu file WORK đã tồn tại, ngược lại = SOURCE.\n"
@@ -269,6 +331,45 @@ def build_cmd(vol, cfg, sid):
     if cfg.get("engine") == "codex":
         return build_cmd_codex(vol, cfg, sid)
     return build_cmd_claude(vol, cfg, sid)
+
+
+def _shq(s):
+    """Bọc single-quote an toàn cho shell."""
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+
+def build_shell_cmd(vol, cfg, pages="all"):
+    """Lệnh 1 dòng để CHẠY TRONG TERMINAL (xem live) và `tee` lưu log.
+
+    - Prompt dài (nhiều dòng, có tiếng Việt) được ghi ra file rồi nạp bằng
+      "$(cat file)" để tránh lỗi quoting.
+    - Terminal-run dùng BYPASS (user tự bấm chạy + xem): Codex qua được rào duyệt
+      MCP (headless không tự duyệt được); Claude chạy không kẹt hỏi quyền.
+    - Codex nhận `pages` (khoảng trang) để CHẠY 1 PHẦN. Claude chạy cả volume
+      (Workflow chunk cả doc; Dừng/Chạy lại để làm dần)."""
+    wd = vol["workdir"]
+    os.makedirs(wd, exist_ok=True)
+    root = TRANSLATE_ROOT
+    engine = cfg.get("engine", "claude")
+    if engine == "codex":
+        prompt = build_prompt_codex(vol, cfg.get("codex_batch", 25), pages)
+        pf = os.path.join(wd, "codex.termprompt.txt")
+        log = os.path.join(wd, "codex.terminal.log")
+        open(pf, "w", encoding="utf-8").write(prompt)
+        cmd = (f"cd {_shq(root)} && codex exec \"$(cat {_shq(pf)})\" "
+               f"--skip-git-repo-check -C {_shq(root)} "
+               f"--dangerously-bypass-approvals-and-sandbox 2>&1 | tee -a {_shq(log)}")
+    else:
+        prompt = build_prompt(vol, cfg.get("vision", True))
+        pf = os.path.join(wd, "claude.termprompt.txt")
+        log = os.path.join(wd, "claude.terminal.log")
+        open(pf, "w", encoding="utf-8").write(prompt)
+        cmd = (f"cd {_shq(root)} && claude -p \"$(cat {_shq(pf)})\" "
+               f"--model {cfg.get('model', 'sonnet')} --add-dir {_shq(root)} "
+               f"--permission-mode bypassPermissions 2>&1 | tee -a {_shq(log)}")
+    rng = _parse_pages(pages)
+    return {"cmd": cmd, "log": log, "engine": engine,
+            "pages": f"{rng[0]}-{rng[1]}" if rng else "all"}
 
 
 def launch(vol, cfg):
@@ -427,6 +528,8 @@ def vol_status(vol):
     st["rc"] = meta.get("rc")
     st["sid"] = (meta.get("sid") or "")[:8]
     st["engine"] = meta.get("engine", CFG.get("engine", "claude"))
+    st["logpath"] = os.path.join(vol["workdir"], "run.log")
+    st["user"] = bool(vol.get("user"))
     # Luồng Codex không sinh file translate/verify/vision của Workflow; suy stage
     # + thanh tiến độ từ codex_state.json (dịch theo lô trang).
     cs = codex_state(vol)
@@ -619,6 +722,14 @@ class Handler(BaseHTTPRequestHandler):
             if not vol:
                 return self._send(404, {"error": "tag không tồn tại"})
             return self._send(200, {"tag": vol["tag"], "lines": tail_log(vol)})
+        if u.path == "/api/command":
+            vol = find_volume((q.get("tag") or [""])[0])
+            if not vol:
+                return self._send(404, {"error": "tag không tồn tại"})
+            if vol.get("skip"):
+                return self._send(400, {"error": "volume này đánh skip"})
+            pages = (q.get("pages") or ["all"])[0]
+            return self._send(200, build_shell_cmd(vol, CFG, pages))
         if u.path == "/api/file":
             return self._serve_file(q)
         return self._send(404, {"error": "not found"})
@@ -771,6 +882,10 @@ a.link{color:var(--acc);text-decoration:none;font-weight:600;font-size:12px}
              border:1px solid var(--line);border-radius:8px;padding:5px 7px"></label>
     <label class="mut">Quyền <select id="posture"></select></label>
     <label class="ck" id="wrapVision"><input type="checkbox" id="vision"> Vision</label>
+    <label class="mut" id="wrapPages" title="Chỉ Codex: chạy 1 phần theo khoảng trang (0-based)">Trang
+      <input id="pages" placeholder="vd 40-80" style="width:82px;font:inherit;
+      background:var(--panel);color:var(--fg);border:1px solid var(--line);
+      border-radius:8px;padding:5px 7px"></label>
     <button id="batchBtn" class="run">▶ Chạy cả batch</button>
     <span class="pill mut">⟳ auto 3s</span>
   </div>
@@ -800,6 +915,22 @@ function applyEngineUI(){
   $('#wrapVision').style.display=codex?'none':'';
   $('#wrapBatch').style.display=codex?'':'none';
 }
+let LAST={};  // tag -> volume status (cho runTerm/tailLog)
+async function runTerm(tag){
+  if(!window.appBridge) return;
+  const pages=($('#pages').value||'all').trim()||'all';
+  try{
+    const r=await fetch('/api/command?tag='+encodeURIComponent(tag)+'&pages='+encodeURIComponent(pages));
+    const d=await r.json();
+    if(!r.ok){alert(d.error||'lỗi');return;}
+    await window.appBridge.runInTerminal(d.cmd);
+  }catch(e){alert('Không chạy được ở terminal: '+e);}
+}
+async function tailLog(tag){
+  if(!window.appBridge) return;
+  const v=LAST[tag]; if(!v||!v.logpath){alert('chưa có log');return;}
+  await window.appBridge.tailLog(v.logpath);
+}
 
 function bar(cls,pair){
   const[d,t]=pair||[0,0]; const pct=t?Math.round(100*d/t):0;
@@ -820,10 +951,14 @@ function row(v){
   const links=[];
   if(v.out_exists)links.push(`<a class="link" href="/api/file?tag=${v.tag}&kind=out" target="_blank">PDF↗</a>`);
   links.push(`<a class="link" href="#" onclick="showLog('${v.tag}');return false">log</a>`);
+  if(window.appBridge){
+    links.push(`<a class="link" href="#" title="Chạy ở Terminal bên cạnh (xem live + lưu log)" onclick="runTerm('${v.tag}');return false">▶ Term</a>`);
+    links.push(`<a class="link" href="#" title="Xem run.log ở Terminal (tail -f)" onclick="tailLog('${v.tag}');return false">📺 Log</a>`);
+  }
   const eng=v.engine?(v.engine==='codex'?'🤖 codex':'✳ claude'):'';
   const sub=[eng, v.sid?('sid '+v.sid):'', (v.mode==='exited'&&v.rc!=null)?('rc '+v.rc):''].filter(Boolean).join(' · ');
   return `<tr${skip}>
-    <td><div class="name">${v.display}</div><div class="sub">${v.tag}${sub?' · '+sub:''}</div></td>
+    <td><div class="name">${v.user?'📄 ':''}${v.display}</div><div class="sub">${v.tag}${sub?' · '+sub:''}</div></td>
     <td>${stage}</td><td>${bars}</td>
     <td><div class="actions">${links.join('')}${act}</div></td></tr>`;
 }
@@ -832,6 +967,7 @@ function fillSelect(sel,opts,val,labels){
 }
 async function refresh(){
   const s=await (await fetch('/api/status')).json();
+  LAST={}; s.volumes.forEach(v=>LAST[v.tag]=v);
   if(!CFG){
     CFG=s.config;
     fillSelect($('#engine'),s.engines,CFG.engine,ELABEL);

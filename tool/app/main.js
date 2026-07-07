@@ -1,23 +1,29 @@
 // CFA Translate Studio — vỏ macOS (Electron) cho dashboard.py.
 // ---------------------------------------------------------------------------
-// App này KHÔNG tự chứa agent. Đúng tinh thần open-design (agent-native): nó
-// khởi động backend Python `dashboard.py` (đã có sẵn trong tool/) trên một cổng
-// local, rồi hiển thị UI đó trong cửa sổ native. Backend spawn `claude` hoặc
-// `codex` như tiến trình con để dịch — user chọn engine ngay trong app.
+// Cửa sổ chia ĐÔI: TRÁI = dashboard (dashboard.py, remote) · PHẢI = Terminal
+// thật (xterm + node-pty). Terminal bên cạnh để CHẠY 1 phần và XEM tiến trình
+// live; dashboard có nút gửi lệnh/tail-log sang terminal (cầu nối qua preload).
 //
-// Vòng đời: app mở -> tìm cổng trống -> spawn `python3 dashboard.py --port N`
-// -> chờ /api/status trả 200 -> nạp http://127.0.0.1:N. App đóng -> tắt backend
-// (các tiến trình claude/codex đang chạy được checkpoint theo file nên mở lại
-// bấm Chạy là tự resume).
+// App KHÔNG tự chứa agent (agent-native như open-design): backend dashboard.py
+// spawn `claude`/`codex`; terminal cho phép chạy interactive/scoped + lưu log.
 
-const { app, BrowserWindow, shell, Menu, dialog, ipcMain } = require("electron");
+const {
+  app,
+  BaseWindow,
+  WebContentsView,
+  BrowserWindow,
+  shell,
+  Menu,
+  dialog,
+  ipcMain,
+} = require("electron");
 const { spawn } = require("child_process");
 const http = require("http");
 const net = require("net");
 const path = require("path");
 
 // node-pty là native module (đã electron-rebuild). Nạp mềm để app vẫn chạy nếu
-// thiếu — chỉ tính năng Terminal bị vô hiệu.
+// thiếu — chỉ Terminal bị vô hiệu.
 let pty = null;
 let ptyErr = null;
 try {
@@ -28,16 +34,23 @@ try {
 
 const TOOL_DIR = path.join(__dirname, ".."); // .../translate/tool
 const TRANSLATE_ROOT = path.join(TOOL_DIR, ".."); // .../translate
+const PRELOAD = path.join(__dirname, "preload.js");
+
 let py = null; // tiến trình dashboard.py
 let baseURL = null;
-let win = null;
 
-// ---- chọn python3 khả dụng ------------------------------------------------
+// split window state
+let baseWin = null;
+let dashView = null;
+let termView = null;
+let termVisible = true;
+let termFrac = 0.42; // bề rộng pane terminal theo tỉ lệ
+
+// ---- python + cổng --------------------------------------------------------
 function pythonBin() {
   return process.env.CFA_PYTHON || "python3";
 }
 
-// ---- xin 1 cổng TCP trống -------------------------------------------------
 function freePort() {
   return new Promise((resolve, reject) => {
     const srv = net.createServer();
@@ -49,7 +62,6 @@ function freePort() {
   });
 }
 
-// ---- chờ backend sẵn sàng (poll /api/status) ------------------------------
 function waitReady(port, tries = 60) {
   return new Promise((resolve, reject) => {
     const tick = (n) => {
@@ -75,7 +87,6 @@ function waitReady(port, tries = 60) {
   });
 }
 
-// ---- khởi động dashboard.py ----------------------------------------------
 async function startBackend() {
   const port = await freePort();
   console.log("[backend] spawning dashboard.py on port", port);
@@ -90,8 +101,7 @@ async function startBackend() {
   });
   py.on("exit", (code) => {
     py = null;
-    // Backend chết bất ngờ khi app còn mở -> báo lỗi (thường do thiếu pymupdf).
-    if (!app.isQuitting && win) {
+    if (!app.isQuitting && baseWin) {
       dialog.showErrorBox(
         "Backend dừng đột ngột",
         `dashboard.py thoát (code ${code}).\n\n${stderr || "(không có stderr)"}`
@@ -103,22 +113,41 @@ async function startBackend() {
   return baseURL;
 }
 
-// ---- cửa sổ chính ---------------------------------------------------------
+// ---- bố cục 2 pane --------------------------------------------------------
+function layout() {
+  if (!baseWin) return;
+  const { width, height } = baseWin.getContentBounds();
+  if (termVisible && termView) {
+    const tw = Math.max(320, Math.round(width * termFrac));
+    dashView.setBounds({ x: 0, y: 0, width: width - tw, height });
+    termView.setBounds({ x: width - tw, y: 0, width: tw, height });
+    termView.setVisible(true);
+  } else {
+    dashView.setBounds({ x: 0, y: 0, width, height });
+    if (termView) termView.setVisible(false);
+  }
+}
+
+function toggleTerminal(force) {
+  termVisible = typeof force === "boolean" ? force : !termVisible;
+  layout();
+}
+
 function createWindow(url) {
-  win = new BrowserWindow({
-    width: 1220,
-    height: 820,
-    minWidth: 900,
+  baseWin = new BaseWindow({
+    width: 1440,
+    height: 880,
+    minWidth: 1000,
     minHeight: 600,
     title: "CFA Translate Studio",
     backgroundColor: "#0f1117",
-    webPreferences: { contextIsolation: true, nodeIntegration: false },
   });
-  win.loadURL(url);
 
-  // Link "PDF↗" mở target=_blank -> mở cửa sổ mới trong app (Chromium xem PDF
-  // được); link ngoài localhost -> mở bằng trình duyệt hệ thống.
-  win.webContents.setWindowOpenHandler(({ url: u }) => {
+  dashView = new WebContentsView({
+    webPreferences: { preload: PRELOAD, contextIsolation: true, nodeIntegration: false },
+  });
+  dashView.webContents.loadURL(url);
+  dashView.webContents.setWindowOpenHandler(({ url: u }) => {
     if (u.startsWith("http://127.0.0.1")) {
       return {
         action: "allow",
@@ -128,22 +157,33 @@ function createWindow(url) {
     shell.openExternal(u);
     return { action: "deny" };
   });
-  win.on("closed", () => (win = null));
+
+  termView = new WebContentsView({
+    webPreferences: { preload: PRELOAD, contextIsolation: true, nodeIntegration: false },
+  });
+  termView.webContents.loadFile(path.join(__dirname, "terminal.html"));
+
+  baseWin.contentView.addChildView(dashView);
+  baseWin.contentView.addChildView(termView);
+  baseWin.on("resize", layout);
+  baseWin.on("closed", () => {
+    baseWin = null;
+    dashView = null;
+    termView = null;
+  });
+  layout();
 }
 
-// ---- Terminal nhúng (xterm ↔ node-pty) ------------------------------------
-// Cửa sổ Terminal thật (PTY) mở trong app để chạy `claude`/`codex` INTERACTIVE
-// — tận dụng đủ harness (Claude) và duyệt MCP tương tác (Codex), điều mà luồng
-// headless không làm được. node-pty giữ ở main process; renderer chỉ nói chuyện
-// qua preload/IPC.
+// ---- Terminal (xterm ↔ node-pty) + cầu nối dashboard→terminal --------------
 let ptySeq = 0;
 const ptys = new Map(); // id -> pty process
+let sideTermPtyId = null; // pty của pane terminal (nhận lệnh từ dashboard)
 
 ipcMain.handle("pty:create", (e, opts = {}) => {
   if (!pty) throw new Error("node-pty không nạp được: " + (ptyErr && ptyErr.message));
   const id = String(++ptySeq);
-  const shell = process.env.SHELL || "/bin/zsh";
-  const p = pty.spawn(shell, ["-l"], {
+  const shellBin = process.env.SHELL || "/bin/zsh";
+  const p = pty.spawn(shellBin, ["-l"], {
     name: "xterm-256color",
     cols: opts.cols || 100,
     rows: opts.rows || 30,
@@ -157,8 +197,11 @@ ipcMain.handle("pty:create", (e, opts = {}) => {
   p.onExit(({ exitCode }) => {
     if (!wc.isDestroyed()) wc.send("pty:exit", { id, code: exitCode });
     ptys.delete(id);
+    if (sideTermPtyId === id) sideTermPtyId = null;
   });
   ptys.set(id, p);
+  // pty của pane terminal chính = nơi nhận lệnh "chạy ở terminal".
+  if (termView && e.sender === termView.webContents) sideTermPtyId = id;
   return id;
 });
 ipcMain.on("pty:write", (_e, { id, data }) => {
@@ -183,17 +226,37 @@ ipcMain.on("pty:kill", (_e, { id }) => {
   }
 });
 
-function openTerminal() {
+// Cầu nối: dashboard (dashView) gửi lệnh/tail sang pane terminal.
+function writeToSideTerm(text) {
+  const p = sideTermPtyId && ptys.get(sideTermPtyId);
+  if (!p) return false;
+  toggleTerminal(true); // hiện pane để user thấy tiến trình
+  p.write(text);
+  if (termView) termView.webContents.focus();
+  return true;
+}
+ipcMain.handle("term:run", (_e, { cmd }) => {
+  if (!cmd) return false;
+  return writeToSideTerm(cmd.trim() + "\n");
+});
+ipcMain.handle("term:tail", (_e, { path: logPath }) => {
+  if (!logPath) return false;
+  // Ctrl-C ngắt tail trước đó (nếu có) rồi tail file mới.
+  return writeToSideTerm('tail -n 40 -f "' + logPath + '"\n');
+});
+ipcMain.handle("term:toggle", () => {
+  toggleTerminal();
+  return termVisible;
+});
+
+// Cửa sổ Terminal RỜI (tuỳ chọn) — ngoài pane cạnh dashboard.
+function openTerminalWindow() {
   const t = new BrowserWindow({
     width: 940,
     height: 580,
     title: "Terminal",
     backgroundColor: "#0a0c12",
-    webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
-      contextIsolation: true,
-      nodeIntegration: false,
-    },
+    webPreferences: { preload: PRELOAD, contextIsolation: true, nodeIntegration: false },
   });
   t.loadFile(path.join(__dirname, "terminal.html"));
   return t;
@@ -221,10 +284,28 @@ function buildMenu() {
       label: "Terminal",
       submenu: [
         {
-          label: "Terminal mới",
+          label: "Ẩn/hiện Terminal bên cạnh",
           accelerator: "CmdOrCtrl+T",
-          click: () => openTerminal(),
+          click: () => toggleTerminal(),
         },
+        {
+          label: "Terminal rộng hơn",
+          accelerator: "CmdOrCtrl+Shift+.",
+          click: () => {
+            termFrac = Math.min(0.7, termFrac + 0.07);
+            toggleTerminal(true);
+          },
+        },
+        {
+          label: "Terminal hẹp hơn",
+          accelerator: "CmdOrCtrl+Shift+,",
+          click: () => {
+            termFrac = Math.max(0.25, termFrac - 0.07);
+            toggleTerminal(true);
+          },
+        },
+        { type: "separator" },
+        { label: "Terminal cửa sổ rời", click: () => openTerminalWindow() },
       ],
     },
     { role: "windowMenu" },
@@ -252,7 +333,7 @@ app.whenReady().then(async () => {
   }
 
   app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0 && baseURL) createWindow(baseURL);
+    if (!baseWin && baseURL) createWindow(baseURL);
   });
 });
 

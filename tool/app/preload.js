@@ -20,3 +20,12 @@ contextBridge.exposeInMainWorld("ptyAPI", {
     return () => ipcRenderer.removeListener("pty:exit", h);
   },
 });
+
+// Cầu nối cho trang dashboard (chạy trong dashView): gửi lệnh / tail-log sang
+// pane Terminal bên cạnh. Có mặt = đang chạy trong app Electron (trình duyệt
+// thường sẽ KHÔNG có window.appBridge -> nút ẩn đi).
+contextBridge.exposeInMainWorld("appBridge", {
+  runInTerminal: (cmd) => ipcRenderer.invoke("term:run", { cmd }),
+  tailLog: (p) => ipcRenderer.invoke("term:tail", { path: p }),
+  toggleTerminal: () => ipcRenderer.invoke("term:toggle"),
+});

@@ -16,7 +16,9 @@ phối dịch qua **Claude** và **Codex**.
 | `tool/agent_pipeline.py`, `tool/translate_volume.js` | Pipeline agent 4-phase resume được (translate → verify → apply → vision). |
 | `tool/dashboard.py` | Web dashboard: theo dõi tiến độ + Chạy/Dừng, chọn engine **Claude/Codex**. |
 | `tool/translate_pdf.py`, `tool/translate_all.py` | Dịch tự động (Google) 1 file / cả thư mục, có cache. |
-| **`tool/app/`** | **App macOS (Electron)**: bọc dashboard + **Terminal nhúng** (xterm + node-pty) để chạy `claude`/`codex` interactive. |
+| **`tool/app/`** | **App macOS (Electron)**: dashboard + **Terminal bên cạnh** (xterm + node-pty) để chạy `claude`/`codex` interactive/scoped. |
+| **`input/`** | Thả **PDF bất kỳ** vào đây → tự thành mục để dịch (app/dashboard tự phát hiện). |
+| **`output/`** | Bản dịch xuất ra `output/<tên>_vi.pdf`. |
 | `.claude/` | CLAUDE.md + rules + skills (meta-engineer setup). |
 
 ## Bắt đầu

@@ -20,6 +20,12 @@
     button:hover { border-color:var(--acc); }
     #term { position:absolute; top:38px; left:0; right:0; bottom:0; padding:6px 8px; }
     .xterm { height:100%; }
+    /* scrollbar CỐ ĐỊNH (luôn hiện) -> không bật/tắt gây nháy */
+    .xterm .xterm-viewport { overflow-y:scroll; scrollbar-gutter:stable; }
+    .xterm-viewport::-webkit-scrollbar { width:10px; }
+    .xterm-viewport::-webkit-scrollbar-track { background:transparent; }
+    .xterm-viewport::-webkit-scrollbar-thumb { background:#2a3140; border-radius:5px; }
+    .xterm-viewport::-webkit-scrollbar-thumb:hover { background:#3a4356; }
   </style>
 </head>
 <body>
@@ -71,9 +77,20 @@
           term.write("\r\n\x1b[31m" + (e && e.message ? e.message : e) + "\x1b[0m\r\n");
         });
 
+      // Debounce fit bằng requestAnimationFrame + chỉ resize pty khi cols/rows
+      // ĐỔI THẬT -> tránh vòng lặp ResizeObserver làm scrollbar nháy liên tục.
+      var lastC = 0, lastR = 0, fitPending = false;
       function doFit() {
-        fit.fit();
-        if (ptyId) window.ptyAPI.resize(ptyId, term.cols, term.rows);
+        if (fitPending) return;
+        fitPending = true;
+        requestAnimationFrame(function () {
+          fitPending = false;
+          try { fit.fit(); } catch (_) {}
+          if (ptyId && (term.cols !== lastC || term.rows !== lastR)) {
+            lastC = term.cols; lastR = term.rows;
+            window.ptyAPI.resize(ptyId, term.cols, term.rows);
+          }
+        });
       }
       window.addEventListener("resize", doFit);
       new ResizeObserver(doFit).observe(document.getElementById("term"));

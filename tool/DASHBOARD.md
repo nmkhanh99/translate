@@ -73,6 +73,22 @@ theo file**, nên:
 - Tiến độ hiển thị lấy từ **filesystem** (không phụ thuộc tiến trình `claude` còn
   sống hay không), nên luôn phản ánh đúng thực tế.
 
+## Chạy 1 phần + Terminal bên cạnh (chỉ trong app macOS)
+
+Khi mở qua **app** (`tool/app`, xem `app/README.md`), dashboard nằm cạnh một
+**Terminal** thật và mỗi volume có thêm:
+
+- **▶ Term**: gọi `GET /api/command?tag=&pages=` để lấy lệnh shell (đã kèm `tee`
+  lưu `work/<tag>/<engine>.terminal.log`) rồi chạy trong Terminal bên cạnh — xem
+  tiến trình LIVE. Ô **Trang** (vd `40-80`, 0-based) cho **chạy 1 phần** (Codex;
+  Claude chạy cả volume). Lệnh terminal dùng **bypass** để Codex qua rào duyệt MCP.
+- **📺 Log**: `tail -f work/<tag>/run.log` trong Terminal (theo dõi lần chạy
+  headless của nút **Chạy**).
+
+Endpoint `/api/command` chỉ trả chuỗi lệnh; việc chạy do Terminal của app thực
+hiện (cầu nối qua preload `appBridge`). Mở bằng trình duyệt thường sẽ không thấy
+2 nút này.
+
 ## Quyền (posture) — lưu ý bảo mật
 
 Khi spawn `claude` không tương tác, cần cấp quyền để agent không kẹt chờ duyệt:

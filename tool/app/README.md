@@ -32,11 +32,27 @@ Yêu cầu: `python3` + phụ thuộc của tool (`pip3 install -r ../requiremen
 - Checkpoint theo file: **Dừng** giữa chừng rồi **Chạy** lại là **tự resume**
   (Claude theo unit file; Codex theo `codex_state.json` + `codex_work.pdf`).
 
-## Terminal nhúng (menu **Terminal → Terminal mới**, ⌘T)
+## Bố cục chia đôi + Terminal bên cạnh
 
-App có **terminal thật** (xterm.js + node-pty) mở ngay trong app, shell đăng nhập
-tại thư mục `translate`. Dùng để chạy **`claude` / `codex` INTERACTIVE** — tận
-dụng đầy đủ harness của Claude Code và **duyệt MCP tương tác** của Codex.
+Cửa sổ chính chia **2 pane**: TRÁI = dashboard, PHẢI = **Terminal thật** (xterm.js
++ node-pty), shell đăng nhập tại thư mục `translate`.
+
+- **⌘T**: ẩn/hiện pane Terminal. **⌘⇧.** / **⌘⇧,**: rộng/hẹp pane. Menu
+  *Terminal → Terminal cửa sổ rời* mở terminal ở cửa sổ riêng.
+- Dùng để chạy **`claude` / `codex` INTERACTIVE** — tận dụng đầy đủ harness của
+  Claude Code và **duyệt MCP tương tác** của Codex.
+
+### Chạy 1 phần + xem live + lưu log (nút trên mỗi volume)
+
+Mỗi dòng volume có thêm 2 nút (chỉ hiện trong app):
+
+- **▶ Term** — chạy volume đó **trong Terminal bên cạnh** để xem tiến trình LIVE,
+  và `tee` **lưu log** vào `work/<tag>/<engine>.terminal.log`. Ô **Trang** ở đầu
+  trang (vd `40-80`, 0-based) giới hạn **chạy 1 phần** (chỉ Codex; Claude chạy cả
+  volume). Terminal-run dùng **bypass** (bạn tự bấm chạy + xem) nên Codex qua
+  được rào duyệt MCP.
+- **📺 Log** — `tail -f work/<tag>/run.log` trong Terminal để theo dõi một lần
+  chạy **headless** (nút Chạy) đang diễn ra.
 
 Vì sao cần: `codex exec` **headless không tự duyệt được MCP tool call** (mỗi call
 sinh 1 elicitation `mcp_tool_call_approval` và bị tự huỷ trong chế độ không tương
