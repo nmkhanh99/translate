@@ -42,6 +42,12 @@ Cửa sổ chính chia **2 pane**: TRÁI = dashboard, PHẢI = **Terminal thật
 - Dùng để chạy **`claude` / `codex` INTERACTIVE** — tận dụng đầy đủ harness của
   Claude Code và **duyệt MCP tương tác** của Codex.
 
+### Thêm tài liệu để dịch (nút **➕ Thêm PDF**)
+
+Bấm **➕ Thêm PDF** trên đầu trang → chọn 1 hay nhiều file PDF → app **copy vào
+`input/`** (qua `POST /api/upload`) và tự **phát hiện** thành mục dịch (nhãn 📄),
+bản dịch xuất ra `output/<tên>_vi.pdf`. (Hoặc thả file trực tiếp vào `input/`.)
+
 ### Chạy 1 phần + xem live + lưu log (nút trên mỗi volume)
 
 Mỗi dòng volume có thêm 2 nút (chỉ hiện trong app):

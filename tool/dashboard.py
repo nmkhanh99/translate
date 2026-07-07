@@ -763,6 +763,8 @@ class Handler(BaseHTTPRequestHandler):
             if not self._origin_ok():
                 return self._send(403, {"error": "cross-origin bị chặn"})
             u = urlparse(self.path)
+            if u.path == "/api/upload":  # đọc RAW bytes, không phải JSON
+                return self._upload(u)
             body = self._read_body()
             if u.path == "/api/run":
                 return self._run(body)
@@ -815,6 +817,24 @@ class Handler(BaseHTTPRequestHandler):
             CFG["codex_batch"] = body["codex_batch"]
         save_cfg(CFG)
         return self._send(200, {"ok": True, "config": CFG})
+
+    def _upload(self, u):
+        """Nhận 1 file PDF (raw bytes) và lưu vào input/ -> tự thành mục dịch.
+        Tên file lấy từ ?name=; chỉ giữ basename (chống path traversal)."""
+        q = parse_qs(u.query)
+        name = os.path.basename((q.get("name") or [""])[0]).strip()
+        if not name.lower().endswith(".pdf"):
+            return self._send(400, {"error": "chỉ nhận file .pdf"})
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        if n <= 0:
+            return self._send(400, {"error": "file rỗng"})
+        if n > 400 * 1024 * 1024:
+            return self._send(400, {"error": "file quá lớn (>400MB)"})
+        data = self.rfile.read(n)
+        os.makedirs(INPUT_DIR, exist_ok=True)
+        with open(os.path.join(INPUT_DIR, name), "wb") as f:
+            f.write(data)
+        return self._send(200, {"ok": True, "name": name})
 
 
 # ----------------------------- HTML page ------------------------------------
@@ -886,6 +906,8 @@ a.link{color:var(--acc);text-decoration:none;font-weight:600;font-size:12px}
       <input id="pages" placeholder="vd 40-80" style="width:82px;font:inherit;
       background:var(--panel);color:var(--fg);border:1px solid var(--line);
       border-radius:8px;padding:5px 7px"></label>
+    <button id="addPdfBtn" title="Chọn PDF -> copy vào input/ để dịch">➕ Thêm PDF</button>
+    <input id="pdfInput" type="file" accept="application/pdf,.pdf" multiple style="display:none">
     <button id="batchBtn" class="run">▶ Chạy cả batch</button>
     <span class="pill mut">⟳ auto 3s</span>
   </div>
@@ -930,6 +952,20 @@ async function tailLog(tag){
   if(!window.appBridge) return;
   const v=LAST[tag]; if(!v||!v.logpath){alert('chưa có log');return;}
   await window.appBridge.tailLog(v.logpath);
+}
+async function addPdf(files){
+  if(!files.length) return;
+  const btn=$('#addPdfBtn'); const old=btn.textContent; btn.textContent='⏳ Đang copy…'; btn.disabled=true;
+  let ok=0;
+  for(const f of files){
+    try{
+      const r=await fetch('/api/upload?name='+encodeURIComponent(f.name),
+        {method:'POST',headers:{'Content-Type':'application/pdf'},body:f});
+      if(r.ok)ok++; else{const d=await r.json().catch(()=>({}));alert('Lỗi thêm '+f.name+': '+(d.error||''));}
+    }catch(e){alert('Lỗi thêm '+f.name+': '+e);}
+  }
+  btn.textContent=old; btn.disabled=false;
+  if(ok)await refresh();
 }
 
 function bar(cls,pair){
@@ -978,6 +1014,8 @@ async function refresh(){
     applyEngineUI();
     $('#engine').onchange=()=>{applyEngineUI();saveCfg();};
     $('#model').onchange=$('#posture').onchange=$('#vision').onchange=$('#codex_batch').onchange=saveCfg;
+    $('#addPdfBtn').onclick=()=>$('#pdfInput').click();
+    $('#pdfInput').onchange=e=>{const fs=[...e.target.files];e.target.value='';addPdf(fs);};
   }
   $('#bypassWarn').style.display=($('#posture').value==='bypass')?'block':'none';
   $('#rows').innerHTML=s.volumes.map(row).join('');
