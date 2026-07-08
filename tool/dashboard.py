@@ -36,6 +36,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+import fitz  # PyMuPDF: render trang PDF cho màn đọc song song
 import agent_pipeline as ap  # tái dùng _status/_load (glue xác định)
 
 TOOL = os.path.dirname(os.path.abspath(__file__))
@@ -52,6 +53,17 @@ USER_WORK = os.path.join(TOOL, "work")
 for _d in (INPUT_DIR, OUTPUT_DIR):
     os.makedirs(_d, exist_ok=True)
 
+# UI tĩnh: ưu tiên bản Next.js đã build (tool/web/out); nếu chưa build thì lùi
+# về bộ HTML tĩnh cũ (tool/ui) để dev vẫn chạy được.
+WEB_OUT = os.path.join(TOOL, "web", "out")
+UI_DIR = WEB_OUT if os.path.isdir(WEB_OUT) else os.path.join(TOOL, "ui")
+CTYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
+          ".js": "application/javascript; charset=utf-8", ".mjs": "application/javascript; charset=utf-8",
+          ".json": "application/json", ".txt": "text/plain; charset=utf-8",
+          ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon",
+          ".map": "application/json", ".webp": "image/webp",
+          ".woff2": "font/woff2", ".woff": "font/woff"}
+
 # Least-privilege: đúng các tool mà translate_volume.js + agent con của nó dùng.
 ALLOWED_TOOLS = ["Bash(cd *)", "Bash(python3 *)", "Write", "Edit", "Read",
                  "Agent", "Task", "Workflow", "Glob", "Grep"]
@@ -62,8 +74,10 @@ DEFAULT_CFG = {
     "posture": "allowlist",  # allowlist (an toàn) | bypass (bỏ hỏi quyền)
     "vision": True,          # có chạy stage review layout bằng vision không
     "codex_batch": 25,       # số trang mỗi lô khi Codex dịch (chuỗi theo lô)
+    "budget": 100,           # ngân sách tháng (USD) — hiển thị ở sidebar/settings
+    "budget_warn": 90,       # cảnh báo khi dùng tới (% ngân sách)
 }
-ENGINES = ["claude", "codex"]
+ENGINES = ["claude", "codex", "grok"]
 MODELS = ["sonnet", "opus", "haiku"]
 POSTURES = ["allowlist", "bypass"]
 
@@ -327,9 +341,21 @@ def build_cmd_codex(vol, cfg, sid):
     return base + ["-s", "workspace-write", "-c", "approval_policy=never"]
 
 
+def build_cmd_grok(vol, cfg, sid):
+    """Grok dịch qua CÙNG MCP `cfa-pdf-translator` như Codex (đã đăng ký ở
+    ~/.grok/config.toml). Khác Codex: cờ `--always-approve` auto-duyệt MỌI tool
+    call (kể cả MCP) nên chạy headless KHÔNG bị huỷ elicitation như codex exec."""
+    prompt = build_prompt_codex(vol, cfg.get("codex_batch", 25))
+    return ["grok", "-p", prompt, "--output-format", "plain",
+            "--cwd", TRANSLATE_ROOT, "--always-approve"]
+
+
 def build_cmd(vol, cfg, sid):
-    if cfg.get("engine") == "codex":
+    engine = cfg.get("engine")
+    if engine == "codex":
         return build_cmd_codex(vol, cfg, sid)
+    if engine == "grok":
+        return build_cmd_grok(vol, cfg, sid)
     return build_cmd_claude(vol, cfg, sid)
 
 
@@ -530,6 +556,7 @@ def vol_status(vol):
     st["engine"] = meta.get("engine", CFG.get("engine", "claude"))
     st["logpath"] = os.path.join(vol["workdir"], "run.log")
     st["user"] = bool(vol.get("user"))
+    st["pages"] = (st.get("vision") or [0, None])[1]  # số trang (None nếu chưa biết)
     # Luồng Codex không sinh file translate/verify/vision của Workflow; suy stage
     # + thanh tiến độ từ codex_state.json (dịch theo lô trang).
     cs = codex_state(vol)
@@ -659,6 +686,127 @@ def tail_log(vol, n=60):
     return out[-n:]
 
 
+# ----------------------------- chat (per-document) --------------------------
+# Khung chat theo TÀI LIỆU: spawn CLI (Claude/Codex/Grok) ở chế độ headless,
+# streaming từng token về trình duyệt qua SSE (/api/chat). Mỗi cuốn giữ session
+# riêng để nhớ ngữ cảnh giữa các lượt (resume theo session id của từng engine).
+CHAT_ENGINES = ("claude", "codex", "grok")
+CHAT_TIMEOUT = 300  # giây: watchdog cắt tiến trình nếu một lượt chạy quá lâu.
+# Least-privilege cho agent chat (headless an toàn; tool ngoài danh sách bị TỪ
+# CHỐI chứ không treo chờ duyệt). Đủ để đọc/tra nguồn, đề xuất & ghi bản dịch.
+CHAT_TOOLS = ["Read", "Grep", "Glob", "Bash(cd *)", "Bash(python3 *)", "Write", "Edit"]
+
+
+def chat_context(vol):
+    """Preamble cấp cho agent biết 'cuốn này' là gì (đường dẫn nguồn/đích). Chỉ
+    gửi ở LƯỢT ĐẦU (mở session mới); các lượt sau resume nên không lặp lại."""
+    src, out, wd = vol["pdf"], vol["out"], vol["workdir"]
+    return (
+        "Bạn là trợ lý dịch thuật của app CFA Translate Studio, đang hỗ trợ người "
+        "dùng về MỘT tài liệu cụ thể. Trả lời bằng tiếng Việt, ngắn gọn, đúng "
+        "trọng tâm.\n"
+        f"- Tên tài liệu: {vol['display']}\n"
+        f"- PDF nguồn (tiếng Anh): {src}\n"
+        f"- PDF bản dịch (tiếng Việt): {out} "
+        f"({'đã có' if os.path.exists(out) else 'chưa có'})\n"
+        f"- Thư mục làm việc: {wd}\n"
+        "Bạn đang chạy trong thư mục 'translate'. Có thể đọc file nguồn để giải "
+        "thích thuật ngữ, đề xuất bản dịch, hoặc soát lỗi trình bày. KHÔNG tự chạy "
+        "pipeline dịch cả cuốn trừ khi người dùng yêu cầu rõ."
+    )
+
+
+def build_chat_cmd(engine, vol, message, session):
+    """Trả (cmd, session, parser) cho 1 lượt chat headless streaming.
+    session=None nghĩa là mở hội thoại mới; với claude ta tự sinh uuid, với
+    grok/codex để CLI tự cấp rồi bắt lại từ stream (session event)."""
+    root = TRANSLATE_ROOT
+    first = not session
+    text = message if not first else (chat_context(vol) + "\n\nNGƯỜI DÙNG: " + message)
+
+    if engine == "grok":
+        cmd = ["grok", "-p", text, "--output-format", "streaming-json",
+               "--cwd", root, "--permission-mode", "auto"]
+        if session:
+            cmd += ["--resume", session]
+        return cmd, session, "grok"
+
+    if engine == "codex":
+        # KHÔNG dùng --skip-git-repo-check để codex lưu session (resume được).
+        # `codex exec resume` KHÔNG nhận -C/-s (kế thừa cwd + sandbox của phiên
+        # gốc); cấu hình phải truyền qua -c và đặt TRƯỚC positional args.
+        if session:
+            cmd = ["codex", "exec", "resume", "--json",
+                   "-c", "approval_policy=never", "-c", "sandbox_mode=workspace-write",
+                   session, text]
+        else:
+            cmd = ["codex", "exec", text, "--json", "-C", root,
+                   "-s", "workspace-write", "-c", "approval_policy=never"]
+        return cmd, session, "codex"
+
+    # claude (mặc định) — stream token thật + tool events, tool allowlist an toàn.
+    base = ["claude", "-p", text, "--output-format", "stream-json", "--verbose",
+            "--include-partial-messages", "--add-dir", root,
+            "--permission-mode", "default", "--allowedTools", *CHAT_TOOLS]
+    if session:
+        cmd = base + ["--resume", session]
+    else:
+        session = str(uuid.uuid4())
+        cmd = base + ["--session-id", session]
+    return cmd, session, "claude"
+
+
+def parse_chat_line(parser, line):
+    """Chuyển 1 dòng stdout của CLI thành các sự kiện chuẩn hoá:
+    ('delta', text) | ('tool', label) | ('session', id). Bỏ qua reasoning."""
+    line = line.rstrip("\n")
+    if not line.strip():
+        return
+    try:
+        obj = json.loads(line)
+    except Exception:
+        return
+
+    if parser == "claude":
+        t = obj.get("type")
+        if t == "stream_event":
+            ev = obj.get("event", {})
+            if ev.get("type") == "content_block_delta":
+                d = ev.get("delta", {})
+                if d.get("type") == "text_delta" and d.get("text"):
+                    yield ("delta", d["text"])
+        elif t == "assistant":
+            for c in obj.get("message", {}).get("content", []):
+                if c.get("type") == "tool_use":
+                    yield ("tool", "🔧 " + (c.get("name") or "tool"))
+        elif t == "result" and obj.get("session_id"):
+            yield ("session", obj["session_id"])
+        elif t == "system" and obj.get("subtype") == "init" and obj.get("session_id"):
+            yield ("session", obj["session_id"])
+
+    elif parser == "grok":
+        t = obj.get("type")
+        if t == "text" and obj.get("data"):
+            yield ("delta", obj["data"])
+        elif t and "tool" in t:
+            yield ("tool", "🔧 " + str(obj.get("name") or obj.get("data") or t))
+        elif t == "end" and obj.get("sessionId"):
+            yield ("session", obj["sessionId"])
+        # 'thought' -> ẩn reasoning cho gọn
+
+    elif parser == "codex":
+        t = obj.get("type")
+        if t == "thread.started" and obj.get("thread_id"):
+            yield ("session", obj["thread_id"])
+        elif t == "item.completed":
+            item = obj.get("item", {})
+            it = item.get("type")
+            if it == "agent_message" and item.get("text"):
+                yield ("delta", item["text"])
+            elif it in ("command_execution", "mcp_tool_call", "file_change"):
+                yield ("tool", "🔧 " + str(item.get("command") or item.get("tool") or it))
+
+
 # ----------------------------- HTTP handler ---------------------------------
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -711,8 +859,6 @@ class Handler(BaseHTTPRequestHandler):
     def _route_get(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
-        if u.path == "/":
-            return self._send(200, PAGE, "text/html; charset=utf-8")
         if u.path == "/api/ping":  # nhẹ, để app kiểm tra backend sẵn sàng
             return self._send(200, {"ok": True})
         if u.path == "/api/status":
@@ -732,7 +878,74 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, build_shell_cmd(vol, CFG, pages))
         if u.path == "/api/file":
             return self._serve_file(q)
-        return self._send(404, {"error": "not found"})
+        if u.path == "/api/pageinfo":
+            return self._pageinfo(q)
+        if u.path == "/api/page":
+            return self._render_page(q)
+        # còn lại: phục vụ UI tĩnh (multi-page) từ tool/ui/
+        return self._serve_static(u.path)
+
+    def _serve_static(self, path):
+        rel = path.lstrip("/") or "index.html"
+        full = os.path.normpath(os.path.join(UI_DIR, rel))
+        # chặn path traversal: phải nằm trong UI_DIR
+        if not full.startswith(UI_DIR + os.sep) and full != UI_DIR:
+            return self._send(403, {"error": "forbidden"})
+        if os.path.isdir(full):
+            full = os.path.join(full, "index.html")
+        if not os.path.isfile(full):
+            # fallback: dashboard cũ (nếu UI chưa dựng) hoặc 404
+            if rel in ("index.html", ""):
+                return self._send(200, PAGE, "text/html; charset=utf-8")
+            return self._send(404, {"error": "not found"})
+        ctype = CTYPES.get(os.path.splitext(full)[1].lower(), "application/octet-stream")
+        with open(full, "rb") as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _pageinfo(self, q):
+        vol = find_volume((q.get("tag") or [""])[0])
+        if not vol:
+            return self._send(404, {"error": "tag không tồn tại"})
+        try:
+            src = fitz.open(vol["pdf"]) if os.path.exists(vol["pdf"]) else None
+            pages = src.page_count if src else 0
+        except Exception:
+            pages = 0
+        return self._send(200, {"tag": vol["tag"], "display": vol["display"],
+                                "pages": pages, "out_exists": os.path.exists(vol["out"])})
+
+    def _render_page(self, q):
+        """Render 1 trang PDF (source hoặc bản dịch) ra PNG cho màn đọc song song."""
+        vol = find_volume((q.get("tag") or [""])[0])
+        if not vol:
+            return self._send(404, {"error": "tag không tồn tại"})
+        which = (q.get("which") or ["source"])[0]
+        path = vol["out"] if which == "out" else vol["pdf"]
+        if not os.path.exists(path):
+            return self._send(404, {"error": "file chưa có"})
+        try:
+            page = int((q.get("page") or ["0"])[0])
+            dpi = max(60, min(220, int((q.get("dpi") or ["150"])[0])))
+        except Exception:
+            return self._send(400, {"error": "tham số không hợp lệ"})
+        try:
+            doc = fitz.open(path)
+            if not (0 <= page < doc.page_count):
+                return self._send(404, {"error": "page ngoài phạm vi"})
+            png = doc[page].get_pixmap(dpi=dpi).tobytes("png")
+        except Exception as e:
+            return self._send(500, {"error": str(e)})
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Content-Length", str(len(png)))
+        self.end_headers()
+        self.wfile.write(png)
 
     def _safe_500(self, e):
         try:
@@ -774,6 +987,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._batch(body)
             if u.path == "/api/config":
                 return self._config(body)
+            if u.path == "/api/chat":
+                return self._chat(body)
             return self._send(404, {"error": "not found"})
         except Exception as e:
             self._safe_500(e)
@@ -815,8 +1030,128 @@ class Handler(BaseHTTPRequestHandler):
             CFG["vision"] = bool(body["vision"])
         if isinstance(body.get("codex_batch"), int) and 5 <= body["codex_batch"] <= 200:
             CFG["codex_batch"] = body["codex_batch"]
+        if isinstance(body.get("budget"), (int, float)) and body["budget"] >= 0:
+            CFG["budget"] = body["budget"]
+        if isinstance(body.get("budget_warn"), (int, float)):
+            CFG["budget_warn"] = body["budget_warn"]
         save_cfg(CFG)
         return self._send(200, {"ok": True, "config": CFG})
+
+    def _chat(self, body):
+        """Chat theo tài liệu: spawn CLI headless, stream token về qua SSE.
+        body = {tag, engine, message, session?}. Trả các frame `data: {...}`:
+        {type:delta|tool|done|error, text?, session?}."""
+        tag = (body.get("tag") or "").strip()
+        engine = body.get("engine") if body.get("engine") in CHAT_ENGINES else "claude"
+        message = (body.get("message") or "").strip()
+        session = body.get("session") or None
+        vol = find_volume(tag)
+        if not vol:
+            return self._send(404, {"error": "tag không tồn tại"})
+        if not message:
+            return self._send(400, {"error": "message rỗng"})
+
+        cmd, session, parser = build_chat_cmd(engine, vol, message, session)
+
+        # Header SSE (HTTP/1.0 + Connection: close -> client đọc tới khi đóng).
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        def sse(obj):
+            try:
+                self.wfile.write(
+                    ("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode()
+                )
+                self.wfile.flush()
+                return True
+            except Exception:
+                return False
+
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=TRANSLATE_ROOT, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"}, bufsize=1, text=True,
+                start_new_session=True,  # pgid == pid -> killpg dừng CẢ CÂY (CLI + MCP con)
+            )
+        except FileNotFoundError:
+            sse({"type": "error", "text": f"Không tìm thấy CLI '{engine}' trên máy."})
+            return
+        except Exception as e:
+            sse({"type": "error", "text": str(e)})
+            return
+
+        def _terminate():
+            """Dừng cả process group (CLI có thể spawn MCP server/tool con) rồi
+            REAP — tránh để lại tiến trình mồ côi / zombie khi timeout hay client
+            ngắt kết nối."""
+            if proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+
+        # Drain stderr ở luồng riêng (tránh deadlock khi pipe stderr đầy).
+        err_buf = []
+        def _drain():
+            try:
+                for l in proc.stderr:
+                    err_buf.append(l)
+                    if len(err_buf) > 200:
+                        del err_buf[:100]
+            except Exception:
+                pass
+        threading.Thread(target=_drain, daemon=True).start()
+
+        # Watchdog: cắt tiến trình nếu chạy quá lâu.
+        killed = {"v": False}
+        def _kill():
+            if proc.poll() is None:
+                killed["v"] = True
+                _terminate()
+        timer = threading.Timer(CHAT_TIMEOUT, _kill)
+        timer.daemon = True
+        timer.start()
+
+        got_session = session
+        try:
+            for line in proc.stdout:
+                for kind, val in parse_chat_line(parser, line):
+                    if kind == "session":
+                        got_session = val
+                    elif kind == "delta":
+                        if not sse({"type": "delta", "text": val}):
+                            raise BrokenPipeError()  # client ngắt
+                    elif kind == "tool":
+                        if not sse({"type": "tool", "text": val}):
+                            raise BrokenPipeError()  # client ngắt (cả frame tool)
+            proc.wait()
+            if killed["v"]:
+                sse({"type": "error", "text": f"Quá thời gian ({CHAT_TIMEOUT}s) — đã dừng."})
+            elif proc.returncode not in (0, None):
+                err = ("".join(err_buf)).strip()[-600:]
+                sse({"type": "error", "text": err or f"{engine} thoát mã {proc.returncode}"})
+            sse({"type": "done", "session": got_session})
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client ngắt -> dọn ở finally
+        finally:
+            timer.cancel()
+            _terminate()  # luôn dừng cả cây tiến trình + reap
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
 
     def _upload(self, u):
         """Nhận 1 file PDF (raw bytes) và lưu vào input/ -> tự thành mục dịch.

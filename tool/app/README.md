@@ -3,97 +3,70 @@
 Vỏ **macOS native** cho pipeline dịch PDF CFA. Tham khảo kiến trúc của
 [nexu-io/open-design](https://github.com/nexu-io/open-design): **agent-native,
 model-agnostic** — app KHÔNG tự chứa agent, mà **spawn các CLI có sẵn trên máy**
-(hiện làm **Claude Code** và **Codex**) để dịch. UI tái dùng backend
-`dashboard.py` (Python stdlib) đã có trong `tool/`.
+(**Claude Code**, **Codex**, **Grok**) để dịch và để **trò chuyện theo tài liệu**.
+
+Giao diện là một app **Next.js 16 + React + TypeScript** (thư mục `tool/web`,
+build tĩnh) do backend `dashboard.py` (Python stdlib) phục vụ tại cùng origin với
+`/api/*`. Cửa sổ Electron chỉ nạp URL đó.
 
 ## Cách chạy (dev)
 
 ```bash
-cd tool/app
-npm install          # cài Electron (1 lần)
-npm start            # mở app; app tự khởi động dashboard.py trên cổng local
+# 1) Build giao diện Next.js (một lần, hoặc mỗi khi sửa tool/web)
+cd tool/web
+npm install
+npm run build            # xuất ra tool/web/out (static export)
+
+# 2) Mở app
+cd ../app
+npm install              # cài Electron (1 lần)
+npm start                # app tự khởi động dashboard.py và nạp giao diện
 ```
 
-Yêu cầu: `python3` + phụ thuộc của tool (`pip3 install -r ../requirements.txt`),
-`claude` và/hoặc `codex` CLI đã đăng nhập. Nếu `python3` không nằm trong PATH,
-đặt biến `CFA_PYTHON=/đường/dẫn/python3`.
+Yêu cầu: `python3` + phụ thuộc tool (`pip3 install -r ../requirements.txt`); các
+CLI đã đăng nhập tuỳ nhu cầu (`claude`, `codex`, `grok`). Nếu `python3` không nằm
+trong PATH, đặt biến `CFA_PYTHON=/đường/dẫn/python3`.
+
+> Nếu chưa build `tool/web/out`, app hiện cảnh báo và `dashboard.py` tạm lùi về
+> bộ HTML tĩnh cũ trong `tool/ui/`.
 
 ## App làm gì
 
-- Mở cửa sổ hiển thị **CFA Translate Manager** (bảng tiến độ mọi volume trong
-  `../volumes.json`), nút **Chạy / Dừng / Chạy cả batch**, xem **log** trực tiếp,
-  mở **PDF** đích ngay trong app.
-- Chọn **Engine** ở đầu trang:
+- **Trang chủ / Thư viện / Hàng đợi / Dịch tài liệu / Cài đặt / Đọc song song** —
+  bảng tiến độ mọi volume trong `../volumes.json`, chạy/dừng pipeline (headless),
+  upload PDF (nút/kéo-thả), đọc bản dịch song song với bản gốc.
+- **Chọn CLI dịch** ngay trên thanh đầu trang **Dịch tài liệu** và **Thư viện**
+  (segmented Claude / Codex / Grok) — lựa chọn lưu vào config và dùng cho mọi nút
+  **Dịch**. (Cũng đổi được ở **Cài đặt**.)
   - **Claude** — Workflow 4-phase (translate → verify → apply → vision), chất
     lượng cao nhất. Chạy `claude -p` với `translate_volume.js`.
-  - **Codex** — luồng **MCP đơn giản** (`codex exec` + MCP `cfa-pdf-translator`),
-    dịch cả volume theo **lô trang** nối chuỗi. Không có verify/vision; nhanh,
-    gọn. Ô **Lô trang** chỉnh số trang mỗi lô.
-- Checkpoint theo file: **Dừng** giữa chừng rồi **Chạy** lại là **tự resume**
-  (Claude theo unit file; Codex theo `codex_state.json` + `codex_work.pdf`).
+  - **Codex** — MCP `cfa-pdf-translator` (`codex exec`), dịch cả volume theo lô
+    trang. Headless cần posture **bypass** (codex tự huỷ MCP elicitation).
+  - **Grok** — CÙNG MCP `cfa-pdf-translator`, chạy `grok -p --always-approve`
+    (auto-duyệt tool call nên headless không bị huỷ như codex). Cần đăng ký MCP:
+    `grok mcp add cfa-pdf-translator <python3> -- <tool/server.py>` (đã cấu hình).
+- Checkpoint theo file: **Dừng** giữa chừng rồi **Chạy** lại là **tự resume**.
 
-## Bố cục chia đôi + Terminal bên cạnh
+## Khung chat theo tài liệu (thay cho Terminal cũ)
 
-Cửa sổ chính chia **2 pane**: TRÁI = dashboard, PHẢI = **Terminal thật** (xterm.js
-+ node-pty), shell đăng nhập tại thư mục `translate`.
+Terminal nhúng (xterm + node-pty) đã được **bỏ**. Thay vào đó, mỗi tài liệu có một
+**khung chat AI** trượt ra từ bên phải:
 
-- **⌘T**: ẩn/hiện pane Terminal. **⌘⇧.** / **⌘⇧,**: rộng/hẹp pane. Menu
-  *Terminal → Terminal cửa sổ rời* mở terminal ở cửa sổ riêng.
-- Dùng để chạy **`claude` / `codex` INTERACTIVE** — tận dụng đầy đủ harness của
-  Claude Code và **duyệt MCP tương tác** của Codex.
+- Mở bằng nút **💬 Chat** trên thẻ tài liệu ở **Thư viện**, nút **Mở chat** sau khi
+  upload ở **Dịch tài liệu**, hoặc **Hỏi AI** trong màn **Đọc song song**.
+- **Chọn engine** ngay trong khung chat: **Claude / Codex / Grok**.
+- AI chạy **headless** trong thư mục `translate` và được cấp ngữ cảnh của đúng cuốn
+  đó (đường dẫn PDF nguồn/bản dịch) để dịch, giải thích thuật ngữ, hoặc soát lỗi.
+- **Mỗi cuốn giữ hội thoại riêng** và nhớ ngữ cảnh giữa các lượt (resume theo
+  session id của từng engine).
+- Kết quả **stream token** về trình duyệt qua SSE (`POST /api/chat`).
 
-### Thêm tài liệu để dịch (nút **➕ Thêm PDF**)
-
-Bấm **➕ Thêm PDF** trên đầu trang → chọn 1 hay nhiều file PDF → app **copy vào
-`input/`** (qua `POST /api/upload`) và tự **phát hiện** thành mục dịch (nhãn 📄),
-bản dịch xuất ra `output/<tên>_vi.pdf`. (Hoặc thả file trực tiếp vào `input/`.)
-
-### Chạy 1 phần + xem live + lưu log (nút trên mỗi volume)
-
-Mỗi dòng volume có thêm 2 nút (chỉ hiện trong app):
-
-- **▶ Term** — chạy volume đó **trong Terminal bên cạnh** để xem tiến trình LIVE,
-  và `tee` **lưu log** vào `work/<tag>/<engine>.terminal.log`. Ô **Trang** ở đầu
-  trang (vd `40-80`, 0-based) giới hạn **chạy 1 phần** (chỉ Codex; Claude chạy cả
-  volume). Terminal-run dùng **bypass** (bạn tự bấm chạy + xem) nên Codex qua
-  được rào duyệt MCP.
-- **📺 Log** — `tail -f work/<tag>/run.log` trong Terminal để theo dõi một lần
-  chạy **headless** (nút Chạy) đang diễn ra.
-
-Vì sao cần: `codex exec` **headless không tự duyệt được MCP tool call** (mỗi call
-sinh 1 elicitation `mcp_tool_call_approval` và bị tự huỷ trong chế độ không tương
-tác — đã xác minh qua trace; chỉ cờ `--dangerously-bypass-approvals-and-sandbox`
-mới qua). Chạy `codex` trong Terminal thì bạn **duyệt bình thường** nên MCP
-`cfa-pdf-translator` hoạt động đầy đủ. Nút "claude"/"codex" trên thanh terminal
-chèn nhanh tên lệnh.
-
-> node-pty là native module: sau `npm install` phải **rebuild theo ABI Electron**
-> `npx electron-rebuild -f -w node-pty` (đã chạy). Nếu đổi phiên bản Electron thì
-> rebuild lại. Thiếu node-pty → app vẫn chạy, chỉ Terminal báo lỗi.
-
-## Điều kiện cho engine Codex
-
-MCP server phải được đăng ký cho Codex (`~/.codex/config.toml`):
-
-```toml
-[mcp_servers.cfa-pdf-translator]
-command = "python3"
-args = ["/Users/khanhnm/Desktop/translate/tool/server.py"]
-```
-
-và thư mục `translate` nên được `trust_level = "trusted"`. (Đã cấu hình trong máy
-này; `command` trỏ tuyệt đối tới python 3.11 có sẵn `mcp`+`pymupdf`.)
-
-**Lưu ý luồng Codex headless:** với **Quyền = allowlist**, MCP tool call sẽ bị
-`codex exec` tự huỷ (không hoàn tất) — xem mục Terminal ở trên. Muốn Codex dịch
-tự động headless phải chọn **Quyền = bypass** (dùng
-`--dangerously-bypass-approvals-and-sandbox`, bỏ cả sandbox — rủi ro, tự cân
-nhắc). Khuyến nghị: chạy **Claude** cho headless, và dùng **Terminal** cho Codex
-interactive.
+Chi tiết endpoint chat và cách parse stream của từng engine: xem `../DASHBOARD.md`.
 
 ## Đóng gói .app / DMG (sau)
 
-`package.json` đã có config `electron-builder`. Khi muốn build bản phân phối:
+`package.json` đã có config `electron-builder` (đóng gói kèm `tool/web/out`). Khi
+muốn build bản phân phối:
 
 ```bash
 npm i -D electron-builder
@@ -105,10 +78,12 @@ Icon, code-sign / notarize để sau (MVP chưa làm).
 ## Kiến trúc (ngắn)
 
 ```
-Electron main.js
+Electron main.js  (cửa sổ ĐƠN, không còn pane Terminal)
   ├─ freePort() → spawn `python3 dashboard.py --port N`  (cwd = tool/)
   ├─ chờ /api/ping = 200  → BrowserWindow.loadURL(http://127.0.0.1:N)
-  └─ before-quit → SIGTERM backend (agent con đang chạy vẫn resume được)
-dashboard.py  (đã có sẵn, nay hỗ trợ engine claude|codex)
-  └─ spawn `claude -p …`  hoặc  `codex exec …`
+  └─ before-quit → SIGTERM backend
+dashboard.py
+  ├─ phục vụ giao diện Next.js tĩnh (tool/web/out) + /api/*
+  ├─ /api/run|stop|batch → spawn `claude -p` / `codex exec`
+  └─ /api/chat (SSE)     → spawn `claude|codex|grok` headless, stream token
 ```

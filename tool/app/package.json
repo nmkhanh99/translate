@@ -1,7 +1,7 @@
 {
   "name": "cfa-translate-studio",
-  "version": "0.1.0",
-  "description": "App macOS quản lý dịch PDF CFA (giữ layout) qua Claude & Codex",
+  "version": "0.2.0",
+  "description": "App macOS quản lý dịch PDF CFA (giữ layout) qua Claude, Codex & Grok — UI Next.js + chat theo tài liệu",
   "author": "CFA Translate",
   "license": "MIT",
   "main": "main.js",
@@ -10,23 +10,12 @@
     "dist": "electron-builder --mac"
   },
   "devDependencies": {
-    "@electron/rebuild": "^4.1.0",
     "electron": "^33.2.0"
   },
   "build": {
     "appId": "io.cfa.translate.studio",
     "productName": "CFA Translate Studio",
-    "files": [
-      "main.js",
-      "preload.js",
-      "terminal.html",
-      "vendor/**/*",
-      "package.json",
-      "assets/**/*"
-    ],
-    "asarUnpack": [
-      "**/node_modules/node-pty/**"
-    ],
+    "files": ["main.js", "package.json", "assets/**/*"],
     "extraResources": [
       {
         "from": "../",
@@ -35,20 +24,14 @@
           "**/*.py",
           "*.js",
           "*.json",
-          "requirements.txt"
+          "requirements.txt",
+          "web/out/**/*"
         ]
       }
     ],
     "mac": {
       "category": "public.app-category.productivity",
-      "target": [
-        "dir"
-      ]
+      "target": ["dir"]
     }
-  },
-  "dependencies": {
-    "@xterm/addon-fit": "^0.11.0",
-    "@xterm/xterm": "^6.0.0",
-    "node-pty": "^1.1.0"
   }
 }

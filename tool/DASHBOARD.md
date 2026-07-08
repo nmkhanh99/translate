@@ -3,6 +3,14 @@
 Web dashboard (local) để **theo dõi tiến độ** và **chạy/dừng** pipeline dịch CFA
 cho từng volume hoặc cả batch — thay cho việc gõ lệnh `Workflow` bằng tay trong Claude.
 
+> **Giao diện Next.js 16 + React + TS:** `dashboard.py` phục vụ **build tĩnh** của
+> `tool/web` (export ra `tool/web/out`) tại cùng origin với `/api/*`. Các trang:
+> **Trang chủ**, **Dịch tài liệu** (upload PDF), **Thư viện** (mọi volume + lọc/tìm
+> + nút 💬 Chat), **Hàng đợi**, **Cài đặt** (engine Claude/Codex/Grok, model, ngân
+> sách), **Đọc song song** (ảnh trang gốc | bản dịch qua `/api/page`). Muốn sửa
+> giao diện thì sửa `tool/web` rồi `npm run build`. Nếu chưa build, dashboard lùi
+> về bộ HTML tĩnh cũ `tool/ui/` (và bảng đơn trang `PAGE`) làm fallback.
+
 Chỉ dùng **thư viện chuẩn Python** (`http.server`) + `agent_pipeline.py` có sẵn.
 Không cần Flask.
 
@@ -50,8 +58,7 @@ trùng path (tránh lỗi PyMuPDF "save to original must be incremental").
   (elicitation `mcp_tool_call_approval` bị Cancel), kể cả `approval_policy=never`.
   Nên **Quyền = allowlist** (`-s workspace-write`) sẽ KHÔNG hoàn tất. Chỉ **Quyền
   = bypass** (`--dangerously-bypass-approvals-and-sandbox`, bỏ cả sandbox) mới
-  auto-approve để luồng chạy. **Khuyến nghị:** dùng **Claude** cho headless, và
-  chạy **`codex` interactive trong Terminal của app** (duyệt MCP bình thường).
+  auto-approve để luồng chạy. **Khuyến nghị:** dùng **Claude** cho headless.
 
 ## "Chạy" hoạt động thế nào
 
@@ -73,21 +80,33 @@ theo file**, nên:
 - Tiến độ hiển thị lấy từ **filesystem** (không phụ thuộc tiến trình `claude` còn
   sống hay không), nên luôn phản ánh đúng thực tế.
 
-## Chạy 1 phần + Terminal bên cạnh (chỉ trong app macOS)
+## Chat theo tài liệu — `/api/chat` (SSE)
 
-Khi mở qua **app** (`tool/app`, xem `app/README.md`), dashboard nằm cạnh một
-**Terminal** thật và mỗi volume có thêm:
+Terminal nhúng cũ (xterm + node-pty) đã được **bỏ**. Thay vào đó, mỗi tài liệu có
+một **khung chat AI** (mở bằng nút 💬 ở Thư viện / Đọc song song / sau khi upload):
 
-- **▶ Term**: gọi `GET /api/command?tag=&pages=` để lấy lệnh shell (đã kèm `tee`
-  lưu `work/<tag>/<engine>.terminal.log`) rồi chạy trong Terminal bên cạnh — xem
-  tiến trình LIVE. Ô **Trang** (vd `40-80`, 0-based) cho **chạy 1 phần** (Codex;
-  Claude chạy cả volume). Lệnh terminal dùng **bypass** để Codex qua rào duyệt MCP.
-- **📺 Log**: `tail -f work/<tag>/run.log` trong Terminal (theo dõi lần chạy
-  headless của nút **Chạy**).
+```
+POST /api/chat   { tag, engine, message, session? }
+→ stream SSE:  data: {"type":"delta","text":"..."}   (token)
+               data: {"type":"tool","text":"🔧 ..."}  (tool đang chạy)
+               data: {"type":"done","session":"<id>"} (kết thúc + session để resume)
+               data: {"type":"error","text":"..."}
+```
 
-Endpoint `/api/command` chỉ trả chuỗi lệnh; việc chạy do Terminal của app thực
-hiện (cầu nối qua preload `appBridge`). Mở bằng trình duyệt thường sẽ không thấy
-2 nút này.
+`dashboard.py` spawn CLI **headless streaming** theo engine rồi parse stdout:
+
+| Engine | Lệnh (rút gọn) | Nguồn text | Session |
+|--------|----------------|------------|---------|
+| **claude** | `claude -p … --output-format stream-json --include-partial-messages --allowedTools …` | `content_block_delta` → `text_delta` | tự sinh uuid (`--session-id`), resume `--resume` |
+| **grok** | `grok -p … --output-format streaming-json --permission-mode auto` | event `{"type":"text","data":…}` (bỏ `thought`) | `end.sessionId`, resume `--resume` |
+| **codex** | `codex exec … --json -s workspace-write -c approval_policy=never` | `item.completed`/`agent_message.text` | `thread.started.thread_id`, resume `codex exec resume <id>` |
+
+- Agent chạy trong thư mục `translate`, được cấp ngữ cảnh của đúng cuốn (đường dẫn
+  PDF nguồn/bản dịch) ở **lượt đầu**; các lượt sau **resume** nên nhớ hội thoại.
+- Tool ngoài `allowlist` (Claude) bị từ chối chứ không treo; watchdog cắt tiến
+  trình nếu một lượt chạy quá `CHAT_TIMEOUT` (300s).
+- Endpoint `/api/command` (trả chuỗi lệnh cho Terminal cũ) vẫn còn cho tương thích
+  nhưng UI mới không dùng nữa.
 
 **Thêm tài liệu:** nút **➕ Thêm PDF** (đầu trang) mở hộp chọn file → `POST
 /api/upload?name=<tên>` (raw bytes) lưu vào `input/`. Mỗi `input/*.pdf` tự thành

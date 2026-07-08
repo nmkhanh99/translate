@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Đọc song song — CFA Translate Studio</title>
+<link rel="stylesheet" href="css/app.css" />
+<style>
+  .segmented { display:inline-flex; border:1px solid var(--border); border-radius:var(--radius-sm);
+    background:var(--surface); padding:2px; }
+  .segmented [data-view] { border:none; background:transparent; font-size:var(--text-sm); font-weight:500;
+    padding:6px var(--space-3); border-radius:6px; cursor:pointer; color:var(--muted); }
+  .segmented [data-view].active { background:var(--accent-wash); color:var(--accent); }
+  .reader.single { grid-template-columns:1fr; }
+  .sheet-cap { font-family:var(--font-mono); font-size:var(--text-xs); color:var(--muted);
+    text-transform:uppercase; letter-spacing:.06em; margin-bottom:var(--space-3); }
+  .doc-h { font-family:var(--font-display); font-weight:600; }
+  .formula { font-family:var(--font-mono); font-size:var(--text-sm); background:var(--row-hover);
+    border-radius:var(--radius-sm); padding:var(--space-3); margin:var(--space-3) 0; }
+  .mini-table { width:100%; border-collapse:collapse; font-size:var(--text-sm); margin-top:var(--space-3); }
+  .mini-table td { padding:6px var(--space-2); border-bottom:1px solid var(--border-soft); }
+  .mini-table td:last-child { text-align:right; font-family:var(--font-mono); }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <header class="titlebar" data-od-id="titlebar">
+    <div class="traffic"><i class="r"></i><i class="y"></i><i class="g"></i></div>
+    <div class="doc-title">2024 L1V1 — Quantitative Methods <span>· Đọc song song</span></div>
+    <div class="win-meta">EN → VI</div>
+  </header>
+
+  <aside class="sidebar" data-od-id="sidebar">
+    <div class="brand">
+      <div class="mark">CF</div>
+      <div><b>Translate Studio</b><small>CFA curriculum · VI</small></div>
+    </div>
+    <nav class="nav">
+      <div class="nav-label">Làm việc</div>
+      <a class="nav-item" data-nav="index.html" href="index.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 4l9 6.5"/><path d="M5 9.5V20h14V9.5"/></svg><span>Trang chủ</span></a>
+      <a class="nav-item" data-nav="translate.html" href="translate.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h7"/><path d="M7 5v2c0 3-1.5 5-4 6"/><path d="M5 9c0 2 2 3.5 5 4.5"/><path d="M12 20l4-9 4 9"/><path d="M13.5 17h5"/></svg><span>Dịch tài liệu</span></a>
+      <a class="nav-item" data-nav="library.html" href="library.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><path d="M4 5.5A1.5 1.5 0 0 1 5.5 4H10v16H5.5A1.5 1.5 0 0 1 4 18.5z"/><path d="M14 4h4.5A1.5 1.5 0 0 1 20 5.5v13a1.5 1.5 0 0 1-1.5 1.5H14z"/></svg><span>Thư viện</span></a>
+      <a class="nav-item" data-nav="queue.html" href="queue.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="7" r="2"/><path d="M10 7h10"/><circle cx="6" cy="17" r="2"/><path d="M10 17h10"/><path d="M6 9v6"/></svg><span>Hàng đợi</span><span class="count">2</span></a>
+    </nav>
+    <nav class="nav">
+      <div class="nav-label">Hệ thống</div>
+      <a class="nav-item" data-nav="settings.html" href="settings.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2.5v2.5M12 19v2.5M4 12H1.5M22.5 12H20M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M18.4 5.6l-1.8 1.8M7.4 16.6l-1.8 1.8"/></svg><span>Cài đặt</span></a>
+    </nav>
+    <div class="side-foot">
+      <div class="usage">
+        <div class="row-between"><small>Chi phí tháng này</small><b class="num">$41.20</b></div>
+        <div class="progress warn"><i style="width:41%"></i></div>
+        <small>Ngân sách $100 · còn $58.80</small>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="topbar">
+      <a class="btn btn-icon" href="library.html" aria-label="Về thư viện"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg></a>
+      <div><h1 style="font-size:var(--text-lg)">Learning Module 1 · Rates and Returns</h1><div class="sub">2024 L1V1 — Quantitative Methods</div></div>
+      <div class="spacer"></div>
+
+      <div class="segmented" role="tablist" aria-label="Chế độ xem">
+        <button data-view="both" class="active">Song song</button>
+        <button data-view="translated">Bản dịch</button>
+        <button data-view="original">Gốc</button>
+      </div>
+
+      <div class="row" style="gap:var(--space-2);margin-left:var(--space-3)">
+        <button class="btn btn-icon" data-page-prev aria-label="Trang trước"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg></button>
+        <span class="num" data-pagelabel style="font-size:var(--text-sm);min-width:56px;text-align:center">12 / 238</span>
+        <button class="btn btn-icon" data-page-next aria-label="Trang sau"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg></button>
+      </div>
+      <button class="btn btn-secondary" style="margin-left:var(--space-3)">Xuất PDF</button>
+    </div>
+
+    <div class="page">
+      <div class="reader" data-reader data-total="238">
+
+        <!-- Original -->
+        <article class="page-sheet" data-col="original" data-od-id="page-original">
+          <div class="sheet-cap">English · trang 12</div>
+          <h2 class="doc-h">The Time Value of Money</h2>
+          <p style="margin-top:var(--space-3)">An interest rate <em>r</em> represents the return an investor requires to postpone consumption. It can be interpreted three ways: as a required rate of return, as a discount rate, or as an opportunity cost.</p>
+          <p style="margin-top:var(--space-3)">The nominal interest rate on a default-free security decomposes into a real risk-free rate and an inflation premium. Risky securities add further premiums:</p>
+          <div class="formula">r = r<sub>real</sub> + π + DRP + LP + MRP</div>
+          <table class="mini-table">
+            <tr><td>Real risk-free rate</td><td>1.2%</td></tr>
+            <tr><td>Inflation premium (π)</td><td>2.4%</td></tr>
+            <tr><td>Default risk premium (DRP)</td><td>0.9%</td></tr>
+            <tr><td>Nominal required return</td><td>4.5%</td></tr>
+          </table>
+        </article>
+
+        <!-- Translated -->
+        <article class="page-sheet" data-col="translated" data-od-id="page-translated">
+          <div class="sheet-cap" style="color:var(--accent)">Tiếng Việt · trang 12</div>
+          <h2 class="doc-h">Giá trị thời gian của tiền</h2>
+          <p style="margin-top:var(--space-3)">Lãi suất <em>r</em> thể hiện mức sinh lợi mà nhà đầu tư yêu cầu để trì hoãn tiêu dùng. Có thể hiểu theo ba cách: là tỷ suất sinh lợi yêu cầu, là tỷ lệ chiết khấu, hoặc là chi phí cơ hội.</p>
+          <p style="margin-top:var(--space-3)">Lãi suất danh nghĩa của một chứng khoán phi rủi ro vỡ nợ được tách thành lãi suất thực phi rủi ro và phần bù lạm phát. Chứng khoán rủi ro cộng thêm các phần bù khác:</p>
+          <div class="formula">r = r<sub>thực</sub> + π + DRP + LP + MRP</div>
+          <table class="mini-table">
+            <tr><td>Lãi suất thực phi rủi ro</td><td>1.2%</td></tr>
+            <tr><td>Phần bù lạm phát (π)</td><td>2.4%</td></tr>
+            <tr><td>Phần bù rủi ro vỡ nợ (DRP)</td><td>0.9%</td></tr>
+            <tr><td>Lợi suất yêu cầu danh nghĩa</td><td>4.5%</td></tr>
+          </table>
+        </article>
+
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="js/app.js"></script>
+</body>
+</html>

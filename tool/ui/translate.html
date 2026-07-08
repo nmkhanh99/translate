@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Dịch tài liệu — CFA Translate Studio</title>
+<link rel="stylesheet" href="css/app.css" />
+</head>
+<body>
+<div class="app">
+
+  <!-- Title bar -->
+  <header class="titlebar" data-od-id="titlebar">
+    <div class="traffic"><i class="r"></i><i class="y"></i><i class="g"></i></div>
+    <div class="doc-title">CFA Translate Studio <span>· Dịch tài liệu</span></div>
+    <div class="win-meta">EN → VI · giữ nguyên layout</div>
+  </header>
+
+  <!-- Sidebar -->
+  <aside class="sidebar" data-od-id="sidebar">
+    <div class="brand">
+      <div class="mark">CF</div>
+      <div><b>Translate Studio</b><small>CFA curriculum · VI</small></div>
+    </div>
+    <nav class="nav">
+      <div class="nav-label">Làm việc</div>
+      <a class="nav-item" data-nav="index.html" href="index.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 4l9 6.5"/><path d="M5 9.5V20h14V9.5"/></svg><span>Trang chủ</span></a>
+      <a class="nav-item" data-nav="translate.html" href="translate.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h7"/><path d="M7 5v2c0 3-1.5 5-4 6"/><path d="M5 9c0 2 2 3.5 5 4.5"/><path d="M12 20l4-9 4 9"/><path d="M13.5 17h5"/></svg><span>Dịch tài liệu</span></a>
+      <a class="nav-item" data-nav="library.html" href="library.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><path d="M4 5.5A1.5 1.5 0 0 1 5.5 4H10v16H5.5A1.5 1.5 0 0 1 4 18.5z"/><path d="M14 4h4.5A1.5 1.5 0 0 1 20 5.5v13a1.5 1.5 0 0 1-1.5 1.5H14z"/></svg><span>Thư viện</span></a>
+      <a class="nav-item" data-nav="queue.html" href="queue.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="7" r="2"/><path d="M10 7h10"/><circle cx="6" cy="17" r="2"/><path d="M10 17h10"/><path d="M6 9v6"/></svg><span>Hàng đợi</span><span class="count">2</span></a>
+    </nav>
+    <nav class="nav">
+      <div class="nav-label">Hệ thống</div>
+      <a class="nav-item" data-nav="settings.html" href="settings.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2.5v2.5M12 19v2.5M4 12H1.5M22.5 12H20M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M18.4 5.6l-1.8 1.8M7.4 16.6l-1.8 1.8"/></svg><span>Cài đặt</span></a>
+    </nav>
+    <div class="side-foot">
+      <div class="usage">
+        <div class="row-between"><small>Chi phí tháng này</small><b class="num">$41.20</b></div>
+        <div class="progress warn"><i style="width:41%"></i></div>
+        <small>Ngân sách $100 · còn $58.80</small>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Main -->
+  <main class="main">
+    <div class="topbar">
+      <div>
+        <h1>Dịch tài liệu</h1>
+        <div class="sub">Tải cả cuốn PDF lên — bản dịch giữ nguyên bố cục, bảng và công thức của sách gốc.</div>
+      </div>
+      <div class="spacer"></div>
+      <a class="btn btn-secondary" href="library.html">Chọn từ thư viện</a>
+    </div>
+
+    <div class="page stack-4">
+
+      <!-- Upload -->
+      <section data-od-id="upload">
+        <div class="dropzone" data-dropzone role="button" tabindex="0" aria-label="Tải PDF lên">
+          <div class="dz-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4"/><path d="M8 8l4-4 4 4"/><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg></div>
+          <h3>Kéo thả PDF vào đây hoặc bấm để chọn</h3>
+          <p class="muted" style="margin-top:6px">Hỗ trợ trọn cuốn curriculum, ví dụ <span class="num">2024 L1V1.pdf</span> · tối đa 800 trang</p>
+        </div>
+        <input id="file-input" type="file" accept="application/pdf" hidden />
+      </section>
+
+      <!-- Active document control bar -->
+      <section class="card" data-od-id="active-doc">
+        <div class="row-between wrap" style="gap:var(--space-4)">
+          <div class="row" style="gap:var(--space-4)">
+            <div class="thumb" style="width:52px;flex:none"></div>
+            <div>
+              <div class="row" style="gap:var(--space-2)"><h3 style="font-size:var(--text-base)">2024 L1V1 — Quantitative Methods</h3><span class="badge badge-accent"><span class="dot"></span>Sẵn sàng</span></div>
+              <div class="sub muted" style="font-size:var(--text-sm)"><span class="num">238</span> trang · 6 learning modules · PDF gốc</div>
+            </div>
+          </div>
+          <div class="row wrap" style="gap:var(--space-3)">
+            <div class="lang-bar" aria-label="Cặp ngôn ngữ">
+              <span class="lang">🇬🇧 English</span>
+              <button class="swap" data-swap aria-label="Đổi chiều dịch"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 8h13l-3-3"/><path d="M17 16H4l3 3"/></svg></button>
+              <span class="lang">🇻🇳 Tiếng Việt</span>
+            </div>
+            <div class="field" style="min-width:150px">
+              <select class="input" aria-label="Phạm vi trang">
+                <option>Cả cuốn (238 trang)</option>
+                <option>Chỉ LM1 · Rates &amp; Returns</option>
+                <option>Trang tuỳ chọn…</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div class="row-between wrap" style="margin-top:var(--space-5);gap:var(--space-4)">
+          <div class="row" style="gap:var(--space-3);flex:1;min-width:220px">
+            <div class="progress" style="flex:1"><i data-progress style="width:0%"></i></div>
+            <span class="num muted" data-progress-pct style="font-size:var(--text-sm);min-width:38px;text-align:right">0%</span>
+          </div>
+          <button class="btn btn-primary" data-start>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3l14 9-14 9z"/></svg>
+            Bắt đầu dịch
+          </button>
+        </div>
+      </section>
+
+      <!-- Two-pane preview -->
+      <section data-od-id="panes">
+        <div class="panes">
+          <div class="pane source">
+            <div class="pane-head">🇬🇧 Nguồn · English</div>
+            <div class="pane-body">
+              <h4>Learning Module 1 — Rates and Returns</h4>
+              <p>An interest rate can be viewed as the required rate of return, the discount rate, or the opportunity cost of consuming now rather than saving and investing.</p>
+              <p>The real risk-free interest rate reflects the time preferences of individuals for current versus future consumption. Nominal rates add an inflation premium and, for risky assets, default, liquidity, and maturity premiums.</p>
+              <p>r = Real risk-free rate + Inflation premium + Default risk premium + Liquidity premium + Maturity premium.</p>
+            </div>
+          </div>
+          <div class="pane target">
+            <div class="pane-head">🇻🇳 Bản dịch · Tiếng Việt</div>
+            <div class="pane-body muted" data-target-body>
+              <h4>Learning Module 1 — Lãi suất và Lợi suất</h4>
+              <p>Lãi suất có thể được hiểu là tỷ suất sinh lợi yêu cầu, tỷ lệ chiết khấu, hoặc chi phí cơ hội của việc tiêu dùng ngay thay vì tiết kiệm và đầu tư.</p>
+              <p>Lãi suất thực phi rủi ro phản ánh sở thích thời gian của cá nhân đối với tiêu dùng hiện tại so với tương lai. Lãi suất danh nghĩa cộng thêm phần bù lạm phát và — với tài sản rủi ro — phần bù vỡ nợ, thanh khoản và kỳ hạn.</p>
+              <p>r = Lãi suất thực phi rủi ro + Phần bù lạm phát + Phần bù rủi ro vỡ nợ + Phần bù thanh khoản + Phần bù kỳ hạn.</p>
+            </div>
+          </div>
+        </div>
+        <p class="muted" style="font-size:var(--text-xs);margin-top:var(--space-3)">Xem trước Section đầu tiên. Bản dịch đầy đủ giữ nguyên bố cục sẽ mở ở màn <a href="document.html">Đọc song song</a> khi dịch xong.</p>
+      </section>
+
+    </div>
+  </main>
+</div>
+
+<nav class="mobile-tabbar" aria-label="Điều hướng">
+  <a data-nav="index.html" href="index.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 4l9 6.5"/><path d="M5 9.5V20h14V9.5"/></svg>Trang chủ</a>
+  <a data-nav="translate.html" href="translate.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h7"/><path d="M7 5v2c0 3-1.5 5-4 6"/><path d="M5 9c0 2 2 3.5 5 4.5"/><path d="M12 20l4-9 4 9"/><path d="M13.5 17h5"/></svg>Dịch</a>
+  <a data-nav="library.html" href="library.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><path d="M4 5.5A1.5 1.5 0 0 1 5.5 4H10v16H5.5A1.5 1.5 0 0 1 4 18.5z"/><path d="M14 4h4.5A1.5 1.5 0 0 1 20 5.5v13a1.5 1.5 0 0 1-1.5 1.5H14z"/></svg>Thư viện</a>
+  <a data-nav="queue.html" href="queue.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="7" r="2"/><path d="M10 7h10"/><circle cx="6" cy="17" r="2"/><path d="M10 17h10"/><path d="M6 9v6"/></svg>Hàng đợi</a>
+  <a data-nav="settings.html" href="settings.html"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2.5v2.5M12 19v2.5M4 12H1.5M22.5 12H20M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M18.4 5.6l-1.8 1.8M7.4 16.6l-1.8 1.8"/></svg>Cài đặt</a>
+</nav>
+
+<script src="js/app.js"></script>
+</body>
+</html>
