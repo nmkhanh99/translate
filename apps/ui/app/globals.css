@@ -586,8 +586,11 @@ select.input { appearance: none; cursor: pointer;
 .msg.error .bubble { background: color-mix(in oklab, var(--danger), transparent 90%);
   border: 1px solid color-mix(in oklab, var(--danger), transparent 70%); color: var(--danger); }
 .msg.info { align-self: center; max-width: 95%; }
-.msg.info .bubble { background: transparent; border: none; color: var(--muted);
-  font-size: var(--text-xs); text-align: center; padding: 4px 8px; }
+.msg.info .bubble { font-size: var(--text-xs); text-align: center;
+  padding: 4px 12px; border-radius: 999px; line-height: 1.4;
+  background: color-mix(in oklab, var(--warn), transparent 88%);
+  border: 1px solid color-mix(in oklab, var(--warn), transparent 68%);
+  color: color-mix(in oklab, var(--warn), var(--fg) 40%); }
 .msg .cursor { display: inline-block; width: 7px; height: 14px; vertical-align: -2px;
   background: var(--accent); border-radius: 1px; animation: blink 1s steps(2) infinite; }
 @keyframes blink { 0%,50% { opacity: 1; } 50.01%,100% { opacity: 0; } }

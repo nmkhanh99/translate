@@ -171,11 +171,23 @@ export function ChatDrawer({
             arr = [...arr.slice(0, bi), toolMsg, ...arr.slice(bi)];
             persist(arr, sendTag);
           } else if (ev.type === "info" && ev.text) {
-            setStatusLine(ev.text);
             // Resume-retry clears the CLI session on the server; drop local handle
             // so the next turn uses the new session id from `done`.
             if (ev.text.toLowerCase().includes("phiên")) {
               delete conv.sessions[engine];
+              // Persist a visible chip in the transcript (statusLine is transient
+              // and vanishes on `done`, so the reset would otherwise leave no
+              // trace once the fresh answer streams in).
+              const resetMsg: ChatMessage = {
+                id: nextId(),
+                role: "info",
+                text: "🔄 Đã reset phiên CLI — mở phiên mới & gửi lại ngữ cảnh tài liệu",
+              };
+              const bi = arr.findIndex((m) => m.id === botId);
+              arr = [...arr.slice(0, bi), resetMsg, ...arr.slice(bi)];
+              persist(arr, sendTag);
+            } else {
+              setStatusLine(ev.text);
             }
           } else if (ev.type === "done") {
             if (ev.session) conv.sessions[engine] = ev.session;
@@ -367,7 +379,9 @@ function Bubble({ m }: { m: ChatMessage }) {
       : m.engine || "assistant";
   return (
     <div className={"msg " + m.role}>
-      {m.role !== "tool" && <span className="who">{who}</span>}
+      {m.role !== "tool" && m.role !== "info" && (
+        <span className="who">{who}</span>
+      )}
       <div className="bubble">
         {m.text}
         {m.streaming && <span className="cursor" />}

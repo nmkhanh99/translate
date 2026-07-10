@@ -12,7 +12,7 @@ export type {
 
 export type Engine = import("@cfa-translate/shared").EngineId;
 
-export type ChatRole = "user" | "assistant" | "tool" | "error";
+export type ChatRole = "user" | "assistant" | "tool" | "error" | "info";
 
 export interface ChatMessage {
   id: string;

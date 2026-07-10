@@ -1,4 +1,5 @@
 import type { AgentEvent } from "@cfa-translate/shared";
+import { isCodexResumeFailure } from "../resume-fail.js";
 
 /**
  * Codex surfaces a failure reason on `error` / `turn.failed`, and the message is
@@ -90,7 +91,15 @@ export function createCodexLineParser(): (line: string) => AgentEvent[] {
       const message = extractCodexError(obj);
       if (message && message !== lastError) {
         lastError = message;
-        out.push({ type: "error", error: message });
+        // A dead `--resume` target reports on stderr in current builds, but if a
+        // build ever surfaces it as a structured turn.failed on stdout, tag it
+        // resume_failed here so the daemon still auto-retries with a fresh
+        // session. Safe: we match the FAILURE message, never assistant text.
+        out.push(
+          isCodexResumeFailure(message)
+            ? { type: "error", error: message, code: "resume_failed" }
+            : { type: "error", error: message }
+        );
       }
     }
     return out;

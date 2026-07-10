@@ -209,6 +209,29 @@ describe("parseCodexLine", () => {
     );
     expect(ev).toEqual([{ type: "error", error: "Model not supported." }]);
   });
+
+  it("tags a resume-failure turn.failed as resume_failed (auto-retry)", () => {
+    const ev = parseCodexLine(
+      JSON.stringify({
+        type: "turn.failed",
+        error: {
+          message:
+            "thread/resume failed: no rollout found for thread id abc",
+        },
+      })
+    );
+    expect(ev[0]).toMatchObject({ type: "error", code: "resume_failed" });
+  });
+
+  it("does not tag a normal failure as resume_failed", () => {
+    const ev = parseCodexLine(
+      JSON.stringify({
+        type: "turn.failed",
+        error: { message: "You've hit your usage limit." },
+      })
+    );
+    expect(ev[0]).not.toHaveProperty("code");
+  });
 });
 
 describe("parseGrokLine", () => {
