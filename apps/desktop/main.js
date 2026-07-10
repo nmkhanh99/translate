@@ -36,6 +36,18 @@ let win = null;
 let baseURL = null;
 let starting = null;
 
+/** All installed nvm node bin dirs. npm-global CLIs (e.g. codex) live under a
+ *  versioned nvm dir that a GUI PATH — or a slow login shell that times out —
+ *  usually misses; add them explicitly so detection + spawn find them. */
+function nvmNodeBins() {
+  try {
+    const base = path.join(os.homedir(), ".nvm/versions/node");
+    return fs.readdirSync(base).map((v) => path.join(base, v, "bin"));
+  } catch {
+    return [];
+  }
+}
+
 /**
  * GUI apps launched from Finder/Explorer often get a minimal PATH (no
  * nvm/homebrew). On macOS/Linux, merge the login-shell PATH + common CLI dirs
@@ -48,11 +60,15 @@ function buildEnv() {
   if (process.platform === "win32") return env;
 
   const sep = path.delimiter; // ":" on POSIX
+  const home = os.homedir();
   const extras = [
-    path.join(os.homedir(), ".local/bin"),
-    path.join(os.homedir(), ".grok/bin"),
+    path.join(home, ".local/bin"),
+    path.join(home, ".grok/bin"),
     "/opt/homebrew/bin",
     "/usr/local/bin",
+    path.join(home, ".volta/bin"),
+    path.join(home, ".bun/bin"),
+    ...nvmNodeBins(), // npm-global CLIs (e.g. codex) installed under nvm
   ];
   let loginPath = "";
   try {
