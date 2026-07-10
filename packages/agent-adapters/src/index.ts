@@ -6,7 +6,7 @@ import type { AgentDetection } from "@cfa-translate/shared";
 
 export * from "./types.js";
 export { parseClaudeLine, createClaudeLineParser } from "./claude/stream.js";
-export { parseCodexLine } from "./codex/stream.js";
+export { parseCodexLine, createCodexLineParser } from "./codex/stream.js";
 export { parseGrokLine } from "./grok/stream.js";
 export { cancelRun } from "./spawn-stream.js";
 export {

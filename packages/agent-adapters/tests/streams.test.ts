@@ -3,7 +3,7 @@ import {
   parseClaudeLine,
   createClaudeLineParser,
 } from "../src/claude/stream.js";
-import { parseCodexLine } from "../src/codex/stream.js";
+import { parseCodexLine, createCodexLineParser } from "../src/codex/stream.js";
 import { parseGrokLine } from "../src/grok/stream.js";
 import {
   isClaudeResumeFailure,
@@ -124,6 +124,90 @@ describe("parseCodexLine", () => {
       })
     );
     expect(ev[0].type).toBe("tool_call");
+  });
+
+  it("surfaces a plain-text failure reason (usage limit)", () => {
+    const ev = parseCodexLine(
+      JSON.stringify({
+        type: "turn.failed",
+        error: { message: "You've hit your usage limit." },
+      })
+    );
+    expect(ev).toEqual([
+      { type: "error", error: "You've hit your usage limit." },
+    ]);
+  });
+
+  it("unwraps a nested JSON error envelope", () => {
+    const ev = parseCodexLine(
+      JSON.stringify({
+        type: "error",
+        message: JSON.stringify({
+          type: "error",
+          status: 400,
+          error: { type: "invalid_request_error", message: "Model not supported." },
+        }),
+      })
+    );
+    expect(ev).toEqual([{ type: "error", error: "Model not supported." }]);
+  });
+
+  it("dedupes error + turn.failed to a single error event", () => {
+    const parse = createCodexLineParser();
+    const first = parse(
+      JSON.stringify({ type: "error", message: "You've hit your usage limit." })
+    );
+    const second = parse(
+      JSON.stringify({
+        type: "turn.failed",
+        error: { message: "You've hit your usage limit." },
+      })
+    );
+    expect(first).toEqual([
+      { type: "error", error: "You've hit your usage limit." },
+    ]);
+    expect(second).toEqual([]);
+  });
+
+  it("still surfaces a different, more definitive turn.failed reason", () => {
+    const parse = createCodexLineParser();
+    parse(JSON.stringify({ type: "error", message: "stream error" }));
+    const term = parse(
+      JSON.stringify({
+        type: "turn.failed",
+        error: { message: "You've hit your usage limit." },
+      })
+    );
+    expect(term).toEqual([
+      { type: "error", error: "You've hit your usage limit." },
+    ]);
+  });
+
+  it("ignores a whitespace-only error message", () => {
+    expect(
+      parseCodexLine(JSON.stringify({ type: "error", message: "   " }))
+    ).toEqual([]);
+  });
+
+  it("unwraps a doubly-nested JSON envelope", () => {
+    const inner = JSON.stringify({
+      error: { message: "Deep reason." },
+    });
+    const ev = parseCodexLine(
+      JSON.stringify({ type: "turn.failed", error: { message: inner } })
+    );
+    expect(ev).toEqual([{ type: "error", error: "Deep reason." }]);
+  });
+
+  it("falls back to top-level message when nested is blank", () => {
+    const ev = parseCodexLine(
+      JSON.stringify({
+        type: "turn.failed",
+        error: { message: "   " },
+        message: "Model not supported.",
+      })
+    );
+    expect(ev).toEqual([{ type: "error", error: "Model not supported." }]);
   });
 });
 

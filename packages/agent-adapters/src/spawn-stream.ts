@@ -98,6 +98,7 @@ export async function* spawnLineStream(opts: {
       yield { type: "done", reason: "error" };
       return;
     }
+    let sawError = false;
     const rl = createInterface({ input: proc.stdout, crlfDelay: Infinity });
     for await (const line of rl) {
       // Keep a rolling stdout window for structured resume-failure detection
@@ -105,6 +106,7 @@ export async function* spawnLineStream(opts: {
       outBuf.push(line);
       if (outBuf.length > 80) outBuf.splice(0, 40);
       for (const ev of opts.parseLine(line)) {
+        if (ev.type === "error") sawError = true;
         yield ev;
       }
     }
@@ -171,11 +173,20 @@ export async function* spawnLineStream(opts: {
         yield { type: "done", reason: "error" };
         return;
       }
-      const err = stderr.slice(-600);
-      yield {
-        type: "error",
-        error: err || `${bin} thoát mã ${code}`,
-      };
+      // If the CLI already streamed a structured error (e.g. Codex `turn.failed`
+      // with the real reason), don't pile on the raw stderr tail — for Codex
+      // that tail is just the benign "Reading additional input from stdin..."
+      // notice and would bury the actual failure message. This flag is shared
+      // across engines, but only Codex and Claude ever set it, and both route
+      // their real failure reason through stdout (Codex events / Claude
+      // stream-json `result`), not stderr — so nothing actionable is lost.
+      if (!sawError) {
+        const err = stderr.slice(-600);
+        yield {
+          type: "error",
+          error: err || `${bin} thoát mã ${code}`,
+        };
+      }
       yield { type: "done", reason: "error" };
       return;
     }

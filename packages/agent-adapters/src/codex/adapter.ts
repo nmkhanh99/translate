@@ -6,7 +6,7 @@ import type {
 } from "../types.js";
 import { baseDetect } from "../detect.js";
 import { cancelRun, spawnLineStream } from "../spawn-stream.js";
-import { parseCodexLine } from "./stream.js";
+import { createCodexLineParser } from "./stream.js";
 import { isCodexResumeFailure } from "../resume-fail.js";
 
 export const codexAdapter: AgentAdapter = {
@@ -71,7 +71,7 @@ export const codexAdapter: AgentAdapter = {
       runId: params.runId,
       cmd,
       cwd: params.cwd,
-      parseLine: parseCodexLine,
+      parseLine: createCodexLineParser(),
       timeoutMs: params.timeoutMs,
       signal: params.signal,
       isResumeFailure: (stderr) => isCodexResumeFailure(stderr),
