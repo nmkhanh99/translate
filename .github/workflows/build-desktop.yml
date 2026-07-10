@@ -1,0 +1,51 @@
+name: Build desktop
+
+# Cross-platform packaging the open-design way: each OS is built on its own
+# native runner (no wine cross-build). macOS runner → universal .dmg/.zip
+# (Intel + Apple Silicon); Windows runner → NSIS .exe.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            artifact: mac
+          - os: windows-latest
+            artifact: win
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # Builds apps/ui (static) + apps/daemon (single-file ESM bundle) and then
+      # electron-builder for the host OS (targets come from apps/desktop
+      # package.json build config). Python isn't needed at build time.
+      - run: pnpm dist
+        env:
+          # No signing certs in CI → don't try to code-sign / notarize.
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cfa-translate-${{ matrix.artifact }}
+          if-no-files-found: warn
+          path: |
+            apps/desktop/dist/*.dmg
+            apps/desktop/dist/*.zip
+            apps/desktop/dist/*.exe

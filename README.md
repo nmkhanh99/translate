@@ -1,4 +1,4 @@
-# CFA Translate Studio — **macOS app**
+# CFA Translate Studio — **desktop app (macOS + Windows)**
 
 App **desktop (Electron)** dịch PDF CFA sang tiếng Việt **giữ layout**, điều phối qua **CLI local** trên máy: **Claude Code · Codex · Grok**.
 
@@ -67,8 +67,12 @@ Trong app: **Cài đặt → Quét lại CLI**.
 pnpm daemon         # chỉ backend (debug API), không phải luồng chính
 pnpm test           # unit test stream parsers
 pnpm build          # UI + daemon (daemon gộp 1 file ESM bằng esbuild)
-pnpm dist           # đóng gói .app macOS — xem apps/desktop/README.md
+pnpm dist           # đóng gói cho HĐH hiện tại: macOS universal (.dmg/.zip) HOẶC Windows (.exe)
 ```
+
+Build cả **macOS (Intel + Apple Silicon) + Windows** qua CI:
+`.github/workflows/build-desktop.yml` (matrix `macos` + `windows`, push tag `v*`
+hoặc chạy tay). Chi tiết đóng gói: `apps/desktop/README.md`.
 
 ## Tài liệu
 

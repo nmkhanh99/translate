@@ -123,9 +123,14 @@ export async function* spawnLineStream(opts: {
 }
 
 export function killTree(proc: ChildProcess | undefined) {
-  if (!proc || proc.killed) return;
+  if (!proc || proc.killed || !proc.pid) return;
   try {
-    if (proc.pid) process.kill(-proc.pid, "SIGKILL");
+    if (process.platform === "win32") {
+      // Windows has no process groups; taskkill /T kills the whole tree.
+      spawn("taskkill", ["/pid", String(proc.pid), "/T", "/F"]);
+    } else {
+      process.kill(-proc.pid, "SIGKILL"); // negative pid = process group (detached)
+    }
   } catch {
     try {
       proc.kill("SIGKILL");

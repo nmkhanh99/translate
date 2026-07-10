@@ -185,7 +185,11 @@ export function stopVolume(vol: VolumeRec): boolean {
   }
   if (!pid || !pidAlive(pid)) return false;
   try {
-    process.kill(-pid, "SIGTERM");
+    if (process.platform === "win32") {
+      spawn("taskkill", ["/pid", String(pid), "/T", "/F"]);
+    } else {
+      process.kill(-pid, "SIGTERM"); // negative pid = process group (detached)
+    }
     return true;
   } catch {
     try {

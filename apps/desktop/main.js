@@ -30,9 +30,18 @@ let win = null;
 let baseURL = null;
 let starting = null;
 
-/** GUI apps often get a minimal PATH (no nvm/homebrew). Merge login-shell PATH. */
+/**
+ * GUI apps launched from Finder/Explorer often get a minimal PATH (no
+ * nvm/homebrew). On macOS/Linux, merge the login-shell PATH + common CLI dirs
+ * so claude/codex/grok/python are found. On Windows the process already
+ * inherits the user PATH, so leave it as-is.
+ */
 function buildEnv() {
   const env = { ...process.env };
+  env.PYTHONUNBUFFERED = "1";
+  if (process.platform === "win32") return env;
+
+  const sep = path.delimiter; // ":" on POSIX
   const extras = [
     path.join(os.homedir(), ".local/bin"),
     path.join(os.homedir(), ".grok/bin"),
@@ -50,12 +59,11 @@ function buildEnv() {
     /* ignore */
   }
   const parts = [
-    ...(loginPath ? loginPath.split(":") : []),
-    ...(env.PATH || "").split(":"),
+    ...(loginPath ? loginPath.split(sep) : []),
+    ...(env.PATH || "").split(sep),
     ...extras,
   ].filter(Boolean);
-  env.PATH = [...new Set(parts)].join(":");
-  env.PYTHONUNBUFFERED = "1";
+  env.PATH = [...new Set(parts)].join(sep);
   return env;
 }
 

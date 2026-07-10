@@ -40,5 +40,8 @@ export function resolveUiRoot(): string | null {
 }
 
 export function pythonBin(): string {
-  return process.env.CFA_PYTHON || "python3";
+  return (
+    process.env.CFA_PYTHON ||
+    (process.platform === "win32" ? "python" : "python3")
+  );
 }
