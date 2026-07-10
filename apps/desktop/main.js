@@ -9,6 +9,12 @@ const path = require("path");
 const fs = require("fs");
 const os = require("os");
 
+// Use the product name for the app name so userData lands at a clean path
+// (~/Library/Application Support/CFA Translate Studio, %APPDATA%\CFA Translate
+// Studio) and the menu/About show it — not the scoped package "@cfa-translate/desktop".
+// Must run before any app.getPath("userData").
+app.setName("CFA Translate Studio");
+
 const REPO_ROOT = path.resolve(__dirname, "../..");
 // A packaged .app ships the prebuilt renderer + python engine under Resources/
 // (see electron-builder extraResources); dev runs straight from the repo.
