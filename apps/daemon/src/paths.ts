@@ -4,8 +4,12 @@ import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-/** Repo root (…/translate). */
-export const REPO_ROOT = resolve(here, "../../..");
+/**
+ * Repo root (…/translate). A packaged Electron app has no source tree, so
+ * CFA_ROOT_DIR relocates every writable dir derived below (input/output/
+ * tool/work, config) to a writable location such as userData.
+ */
+export const REPO_ROOT = process.env.CFA_ROOT_DIR || resolve(here, "../../..");
 
 /** Python domain engine. Override via CFA_PYTHON_DIR (packaged app → Resources/python). */
 export const PYTHON_DIR = process.env.CFA_PYTHON_DIR || join(REPO_ROOT, "python");
@@ -20,8 +24,9 @@ export const OUTPUT_DIR = join(REPO_ROOT, "output");
 export const USER_WORK = join(TOOL_DIR, "work");
 export const CFG_PATH = join(TOOL_DIR, "dashboard.json");
 
-/** In-app UI static export (built from apps/ui, served inside Electron). */
-export const UI_OUT = join(REPO_ROOT, "apps/ui/out");
+/** In-app UI static export, served by the daemon. Override via CFA_UI_OUT
+ *  (packaged → Resources/ui-out). */
+export const UI_OUT = process.env.CFA_UI_OUT || join(REPO_ROOT, "apps/ui/out");
 
 export function ensureDirs() {
   for (const d of [INPUT_DIR, OUTPUT_DIR, USER_WORK]) {

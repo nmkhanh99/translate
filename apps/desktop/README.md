@@ -31,7 +31,21 @@ Electron (apps/desktop/main.js)
 
 ## Đóng gói
 
+Từ root repo:
+
 ```bash
-cd apps/desktop
-pnpm dist        # electron-builder → .app (cần approve electron build scripts)
+pnpm dist        # build:ui + bundle daemon (esbuild) + electron-builder --mac
 ```
+
+Ra `apps/desktop/dist/mac/CFA Translate Studio.app`. Bản đóng gói bundle vào
+`Contents/Resources/`:
+
+- `ui-out/` — renderer tĩnh (từ apps/ui)
+- `daemon/cli.mjs` — daemon gộp 1 file ESM (esbuild), chạy bằng Node của Electron
+  (`ELECTRON_RUN_AS_NODE=1`)
+- `python/` — engine PDF + MCP
+
+Khi đóng gói, các thư mục cần ghi (input/output/tool/work, config) chuyển sang
+`app.getPath('userData')`; `main.js` truyền `CFA_ROOT_DIR` (writable) +
+`CFA_PYTHON_DIR` / `CFA_UI_OUT` (Resources) cho daemon. Dev thì daemon chạy
+thẳng TS bằng `tsx`.

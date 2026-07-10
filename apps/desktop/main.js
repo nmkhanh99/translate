@@ -13,17 +13,16 @@ const REPO_ROOT = path.resolve(__dirname, "../..");
 // A packaged .app ships the prebuilt renderer + python engine under Resources/
 // (see electron-builder extraResources); dev runs straight from the repo.
 const PACKAGED = app.isPackaged;
-const RES_DIR = PACKAGED ? process.resourcesPath : REPO_ROOT;
 const UI_OUT = PACKAGED
   ? path.join(process.resourcesPath, "ui-out")
   : path.join(REPO_ROOT, "apps/ui/out");
 const PYTHON_DIR = PACKAGED
   ? path.join(process.resourcesPath, "python")
   : path.join(REPO_ROOT, "python");
-// Dev: run the daemon TS source via tsx. Packaged: run the bundled compiled
-// daemon (Resources/daemon/cli.js) with Electron's built-in Node.
+// Dev: run the daemon TS source via tsx. Packaged: run the bundled single-file
+// ESM daemon (Resources/daemon/cli.mjs) with Electron's built-in Node.
 const DAEMON_ENTRY = PACKAGED
-  ? path.join(process.resourcesPath, "daemon", "cli.js")
+  ? path.join(process.resourcesPath, "daemon", "cli.mjs")
   : path.join(REPO_ROOT, "apps/daemon/src/cli.ts");
 
 let daemon = null;
@@ -138,28 +137,34 @@ async function startDaemon() {
 
     const env = buildEnv();
     env.CFA_PORT = String(port);
-    env.CFA_PYTHON_DIR = PYTHON_DIR;
 
     let bin;
+    let daemonCwd;
     if (PACKAGED) {
-      // Bundled daemon is plain JS → run it with Electron's own Node runtime.
+      // Bundled daemon is a single ESM file → run it with Electron's own Node.
       if (!fs.existsSync(DAEMON_ENTRY)) {
         throw new Error(
-          "Bản đóng gói thiếu daemon (Resources/daemon). Cần bundle apps/daemon khi build."
+          "Bản đóng gói thiếu daemon (Resources/daemon/cli.mjs). Chạy: pnpm dist."
         );
       }
+      const userData = app.getPath("userData");
       env.ELECTRON_RUN_AS_NODE = "1";
+      env.CFA_ROOT_DIR = userData; // writable dirs: input/output/tool/work/config
+      env.CFA_PYTHON_DIR = PYTHON_DIR; // read-only Resources/python
+      env.CFA_UI_OUT = UI_OUT; // read-only Resources/ui-out
       bin = process.execPath;
+      daemonCwd = userData;
     } else {
       const tsxBin = resolveTsx();
       if (!tsxBin) {
         throw new Error("Không tìm thấy tsx. Chạy: pnpm install");
       }
       bin = tsxBin;
+      daemonCwd = REPO_ROOT;
     }
 
     daemon = spawn(bin, [DAEMON_ENTRY, "--port", String(port), "--no-open"], {
-      cwd: RES_DIR,
+      cwd: daemonCwd,
       env,
       stdio: ["ignore", "pipe", "pipe"],
     });

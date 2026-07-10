@@ -23,6 +23,10 @@
         "to": "ui-out"
       },
       {
+        "from": "../daemon/dist/cli.mjs",
+        "to": "daemon/cli.mjs"
+      },
+      {
         "from": "../../python",
         "to": "python",
         "filter": ["**/*", "!**/__pycache__/**"]

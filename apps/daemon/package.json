@@ -4,12 +4,12 @@
   "private": true,
   "type": "module",
   "bin": {
-    "cfa-translate-daemon": "./dist/cli.js"
+    "cfa-translate-daemon": "./dist/cli.mjs"
   },
   "scripts": {
     "dev": "tsx src/cli.ts --no-open",
-    "build": "tsc -p tsconfig.json",
-    "start": "node dist/cli.js",
+    "build": "esbuild src/cli.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/cli.mjs --banner:js=\"import{createRequire}from'module';const require=createRequire(import.meta.url);\"",
+    "start": "node dist/cli.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
@@ -20,6 +20,7 @@
   "devDependencies": {
     "@types/express": "^5.0.3",
     "@types/node": "^22.20.0",
+    "esbuild": "^0.28.1",
     "tsx": "^4.20.5",
     "typescript": "^5.9.3"
   }

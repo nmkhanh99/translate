@@ -66,7 +66,8 @@ Trong app: **Cài đặt → Quét lại CLI**.
 ```bash
 pnpm daemon         # chỉ backend (debug API), không phải luồng chính
 pnpm test           # unit test stream parsers
-pnpm build          # UI + daemon
+pnpm build          # UI + daemon (daemon gộp 1 file ESM bằng esbuild)
+pnpm dist           # đóng gói .app macOS — xem apps/desktop/README.md
 ```
 
 ## Tài liệu

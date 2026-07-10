@@ -15,6 +15,7 @@
     "build": "pnpm build:ui && pnpm build:daemon",
     "build:ui": "pnpm --filter @cfa-translate/ui build",
     "build:daemon": "pnpm --filter @cfa-translate/daemon build",
+    "dist": "pnpm build && pnpm --filter @cfa-translate/desktop run dist",
     "daemon": "pnpm --filter @cfa-translate/daemon dev",
     "test": "pnpm --filter @cfa-translate/agent-adapters test",
     "typecheck": "pnpm -r --filter @cfa-translate/* typecheck"
