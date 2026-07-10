@@ -1,0 +1,26 @@
+{
+  "name": "@cfa-translate/daemon",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "cfa-translate-daemon": "./dist/cli.js"
+  },
+  "scripts": {
+    "dev": "tsx src/cli.ts --no-open",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/cli.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@cfa-translate/agent-adapters": "workspace:*",
+    "@cfa-translate/shared": "workspace:*",
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.20.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.3"
+  }
+}

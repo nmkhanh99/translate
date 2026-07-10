@@ -1,0 +1,273 @@
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, extname, join } from "node:path";
+import { spawnSync } from "node:child_process";
+import type { AppConfig, Volume } from "@cfa-translate/shared";
+import {
+  INPUT_DIR,
+  MANIFEST,
+  OUTPUT_DIR,
+  USER_WORK,
+  pythonBin,
+  PYTHON_DIR,
+} from "./paths.js";
+
+export interface VolumeRec {
+  pdf: string;
+  workdir: string;
+  out: string;
+  vision?: boolean;
+  skip?: boolean;
+  user?: boolean;
+  note?: string;
+  tag: string;
+  display: string;
+}
+
+function prettyName(pdfPath: string): string {
+  const base = basename(pdfPath, extname(pdfPath));
+  return base.replace("2024 CFA level I ", "").replace("2024 ", "");
+}
+
+function discoverUserVolumes(): VolumeRec[] {
+  if (!existsSync(INPUT_DIR)) return [];
+  return readdirSync(INPUT_DIR)
+    .filter((fn) => fn.toLowerCase().endsWith(".pdf"))
+    .sort()
+    .map((fn) => {
+      const name = basename(fn, ".pdf");
+      const slug =
+        name
+          .replace(/[^A-Za-z0-9]+/g, "_")
+          .replace(/^_|_$/g, "")
+          .toLowerCase()
+          .slice(0, 40) || "doc";
+      return {
+        pdf: join(INPUT_DIR, fn),
+        workdir: join(USER_WORK, "user_" + slug),
+        out: join(OUTPUT_DIR, name + "_vi.pdf"),
+        user: true,
+        tag: "user_" + slug,
+        display: prettyName(fn),
+      };
+    });
+}
+
+export function loadVolumes(): VolumeRec[] {
+  const raw = JSON.parse(readFileSync(MANIFEST, "utf8")) as Omit<
+    VolumeRec,
+    "tag" | "display"
+  >[];
+  const vols: VolumeRec[] = [
+    ...raw.map((v) => ({
+      ...v,
+      tag: basename(v.workdir.replace(/\/$/, "")),
+      display: prettyName(v.pdf),
+    })),
+    ...discoverUserVolumes(),
+  ];
+  return vols;
+}
+
+export function findVolume(tag: string): VolumeRec | null {
+  return loadVolumes().find((v) => v.tag === tag) || null;
+}
+
+export function readJson(path: string): Record<string, unknown> | null {
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+export function writeJson(filePath: string, data: unknown) {
+  mkdirSync(join(filePath, ".."), { recursive: true });
+  writeFileSync(filePath, JSON.stringify(data, null, 1), "utf8");
+}
+
+export function runMetaPath(workdir: string) {
+  return join(workdir, "run.json");
+}
+
+export function loadRunMeta(workdir: string) {
+  return readJson(runMetaPath(workdir));
+}
+
+export function saveRunMeta(workdir: string, meta: Record<string, unknown>) {
+  mkdirSync(workdir, { recursive: true });
+  writeFileSync(runMetaPath(workdir), JSON.stringify(meta, null, 1), "utf8");
+}
+
+export function pidAlive(pid: unknown): boolean {
+  if (typeof pid !== "number" || !pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function codexState(vol: VolumeRec) {
+  return readJson(join(vol.workdir, "codex_state.json"));
+}
+
+export function codexDone(vol: VolumeRec): boolean {
+  const s = codexState(vol);
+  if (!s || !existsSync(vol.out)) return false;
+  const last = s.last;
+  const done = s.done_through;
+  return (
+    typeof last === "number" &&
+    typeof done === "number" &&
+    done >= last &&
+    last >= 0
+  );
+}
+
+function countFiles(dir: string, re: RegExp): number {
+  if (!existsSync(dir)) return 0;
+  try {
+    return readdirSync(dir).filter((f) => re.test(f)).length;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Mirror python agent_pipeline._status — pure filesystem, no Python spawn
+ * (fast enough for 3s UI poll of many volumes).
+ */
+export function pythonStatus(workdir: string): {
+  stage: string;
+  translate?: [number, number];
+  verify?: [number, number];
+  vision?: [number, number];
+} {
+  const c = countFiles(join(workdir, "chunks"), /^c_.*\.json$/i);
+  const co = countFiles(join(workdir, "out"), /^c_.*\.json$/i);
+  const v = countFiles(join(workdir, "vchunks"), /^v_.*\.json$/i);
+  const vo = countFiles(join(workdir, "vout"), /^v_.*\.json$/i);
+  const pairs = countFiles(join(workdir, "review"), /^pair_.*\.png$/i);
+  const vis = countFiles(join(workdir, "vis"), /^page_.*\.json$/i);
+
+  let pages: number | null = null;
+  const layout = readJson(join(workdir, "layout.json"));
+  if (layout && typeof layout.pdf === "string" && existsSync(layout.pdf)) {
+    // Prefer cached state.json pages if present (avoid opening PDF every poll)
+    const cached = readJson(join(workdir, "state.json"));
+    if (cached?.vision && Array.isArray(cached.vision) && cached.vision[1]) {
+      pages = Number(cached.vision[1]) || null;
+    } else if (pairs > 0) {
+      pages = pairs;
+    }
+  } else if (pairs > 0) {
+    pages = pairs;
+  }
+
+  let stage: string;
+  if (c === 0 || co < c) stage = "translate";
+  else if (vo < v || v === 0) stage = "verify";
+  else if (pages != null && vis < pages) stage = "vision";
+  else if (c > 0 && co >= c && (v === 0 || vo >= v) && (pages == null || vis >= pages))
+    stage = "done";
+  else stage = "vision";
+
+  return {
+    stage,
+    translate: [co, c],
+    verify: [vo, v],
+    vision: [vis, pages ?? 0],
+  };
+}
+
+export function effectiveStage(
+  raw: string | undefined,
+  cfg: AppConfig
+): string {
+  if (raw === "vision" && !cfg.vision) return "done";
+  return raw || "translate";
+}
+
+export function pdfPageCount(path: string): number {
+  if (!existsSync(path)) return 0;
+  const script = `
+import sys
+try:
+  import fitz
+  d=fitz.open(sys.argv[1]); print(d.page_count)
+except Exception:
+  print(0)
+`;
+  const r = spawnSync(pythonBin(), ["-c", script, path], {
+    encoding: "utf8",
+    timeout: 15000,
+  });
+  return parseInt((r.stdout || "0").trim(), 10) || 0;
+}
+
+export function renderPagePng(
+  path: string,
+  page: number,
+  dpi: number
+): Buffer | null {
+  const script = `
+import sys, fitz
+doc=fitz.open(sys.argv[1])
+page=int(sys.argv[2]); dpi=int(sys.argv[3])
+if not (0<=page<doc.page_count):
+  sys.exit(2)
+sys.stdout.buffer.write(doc[page].get_pixmap(dpi=dpi).tobytes("png"))
+`;
+  const r = spawnSync(pythonBin(), ["-c", script, path, String(page), String(dpi)], {
+    encoding: "buffer",
+    maxBuffer: 40 * 1024 * 1024,
+    timeout: 30000,
+  });
+  if (r.status !== 0 || !r.stdout) return null;
+  return r.stdout as Buffer;
+}
+
+export function volumeToApi(
+  vol: VolumeRec,
+  cfg: AppConfig,
+  running: boolean
+): Volume {
+  let st: ReturnType<typeof pythonStatus> = { stage: "translate" };
+  try {
+    st = pythonStatus(vol.workdir);
+  } catch {
+    /* ignore */
+  }
+  let stage = effectiveStage(st.stage, cfg);
+  if (codexDone(vol)) stage = "done";
+
+  const meta = loadRunMeta(vol.workdir) || {};
+  return {
+    tag: vol.tag,
+    display: vol.display,
+    stage,
+    running,
+    skip: !!vol.skip,
+    user: !!vol.user,
+    translate: st.translate,
+    verify: st.verify,
+    vision: st.vision,
+    out_exists: existsSync(vol.out),
+    engine: typeof meta.engine === "string" ? meta.engine : undefined,
+    logpath: join(vol.workdir, "run.log"),
+    sid: typeof meta.sid === "string" ? meta.sid : undefined,
+    mode: typeof meta.mode === "string" ? meta.mode : undefined,
+    rc: typeof meta.rc === "number" ? meta.rc : null,
+    // Total page count when known (st.vision = [reviewed, totalPages]); lets the
+    // Home/Library UI show real page totals for completed volumes.
+    pages: st.vision && st.vision[1] ? st.vision[1] : undefined,
+  };
+}

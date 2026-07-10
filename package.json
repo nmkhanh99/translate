@@ -1,0 +1,25 @@
+{
+  "name": "cfa-translate",
+  "version": "0.3.0",
+  "private": true,
+  "description": "CFA Translate Studio — macOS desktop app (Electron). Local CLIs: Claude / Codex / Grok.",
+  "packageManager": "pnpm@10.33.2",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "pnpm --filter @cfa-translate/desktop start",
+    "dev": "pnpm start",
+    "app": "pnpm start",
+    "prestart": "node -e \"const fs=require('fs');if(!fs.existsSync('apps/ui/out/index.html')){console.log('→ build UI…');require('child_process').execSync('pnpm build:ui',{stdio:'inherit'})}\"",
+    "build": "pnpm build:ui && pnpm build:daemon",
+    "build:ui": "pnpm --filter @cfa-translate/ui build",
+    "build:daemon": "pnpm --filter @cfa-translate/daemon build",
+    "daemon": "pnpm --filter @cfa-translate/daemon dev",
+    "test": "pnpm --filter @cfa-translate/agent-adapters test",
+    "typecheck": "pnpm -r --filter @cfa-translate/* typecheck"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["electron", "esbuild", "sharp"]
+  }
+}

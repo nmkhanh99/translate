@@ -1,52 +1,78 @@
-# translate — CFA PDF translator + macOS app
+# CFA Translate Studio — **macOS app**
 
-Bộ công cụ **dịch PDF giáo trình CFA sang tiếng Việt GIỮ NGUYÊN layout** (chỉ dịch
-văn xuôi; hình, đồ thị, công thức, bảng số giữ nguyên), kèm **app macOS** điều
-phối dịch qua **Claude** và **Codex**.
+App **desktop (Electron)** dịch PDF CFA sang tiếng Việt **giữ layout**, điều phối qua **CLI local** trên máy: **Claude Code · Codex · Grok**.
 
-> ⚠️ Repo này **không** chứa file PDF giáo trình CFA (có bản quyền) — chúng bị loại
-> qua `.gitignore`. Chỉ chứa **mã nguồn + tài liệu + cấu hình**.
+Cùng tinh thần [open-design](https://github.com/nexu-io/open-design): **agent-native** — app không chứa model, chỉ spawn CLI có sẵn.
 
-## Thành phần
+> PDF giáo trình **không** nằm trong git (bản quyền). Chỉ mã nguồn + tool.
 
-| Thư mục / file | Vai trò |
-|---|---|
-| `tool/pdf_core.py` | Lõi engine dịch-giữ-layout (redact văn xuôi, vẽ lại tiếng Việt). |
-| `tool/server.py` | MCP server `cfa-pdf-translator` (extract → dịch → apply). |
-| `tool/agent_pipeline.py`, `tool/translate_volume.js` | Pipeline agent 4-phase resume được (translate → verify → apply → vision). |
-| `tool/dashboard.py` | Web dashboard + API (`/api/*`): tiến độ, Chạy/Dừng, engine **Claude/Codex**, upload, render trang PDF, **chat theo tài liệu** (`/api/chat`, SSE). |
-| **`tool/web/`** | **Giao diện Next.js 16 + React + TS** (build tĩnh ra `web/out`) do dashboard.py phục vụ: Trang chủ · Dịch · Thư viện · Hàng đợi · Cài đặt · Đọc song song + **khung chat Claude/Codex/Grok**. |
-| `tool/ui/` | Bộ HTML tĩnh cũ (fallback khi chưa build `tool/web`). |
-| `tool/translate_pdf.py`, `tool/translate_all.py` | Dịch tự động (Google) 1 file / cả thư mục, có cache. |
-| **`tool/app/`** | **App macOS (Electron)**: cửa sổ đơn nạp giao diện Next.js; mỗi tài liệu có **khung chat AI** (Claude/Codex/Grok) thay cho Terminal cũ. |
-| **`input/`** | Thả **PDF bất kỳ** vào đây → tự thành mục để dịch (app/dashboard tự phát hiện). |
-| **`output/`** | Bản dịch xuất ra `output/<tên>_vi.pdf`. |
-| `.claude/` | CLAUDE.md + rules + skills (meta-engineer setup). |
-
-## Bắt đầu
+## Cách chạy (app)
 
 ```bash
-# 1) tool: cài phụ thuộc Python
-cd tool && pip3 install -r requirements.txt
+pnpm install
+pip3 install -r python/requirements.txt
 
-# 2) build giao diện Next.js (một lần / mỗi khi sửa tool/web)
-cd web && npm install && npm run build   # xuất ra tool/web/out
-
-# 3) app macOS
-cd ../app && npm install
-npm start                                # mở app; 💬 Chat trên mỗi tài liệu
+pnpm start          # mở app Electron (tự build UI nếu cần: pnpm build:ui)
+# tương đương:
+pnpm app
 ```
 
-Chi tiết: `tool/README.md`, `tool/DASHBOARD.md`, `tool/app/README.md`.
+Lần đầu / sau khi sửa UI:
 
-## Ghi chú kỹ thuật
+```bash
+pnpm build:ui       # build renderer vào apps/ui/out
+pnpm start          # Electron cửa sổ app
+```
 
-- Engine **Claude** (headless, Workflow 4-phase) là luồng chất lượng cao nhất.
-- Engine **Codex** (pipeline dịch cả cuốn): `codex exec` headless **không tự duyệt
-  được MCP tool call** (elicitation bị auto-cancel) → dùng posture `bypass`, hoặc
-  chạy Claude cho headless. Xem `tool/DASHBOARD.md`.
-- **Chat theo tài liệu** (`/api/chat`): Claude/Codex/Grok chạy headless, stream
-  token qua SSE, mỗi cuốn giữ session riêng (resume). Đây là phần thay cho Terminal.
+**Không** phải mở trình duyệt. Daemon chạy **bên trong** app (loopback), cửa sổ Electron nạp UI.
 
-Nội dung giáo trình chỉ dùng cá nhân; không sao chép/redistribute nội dung có bản
-quyền của CFA Institute.
+## Kiến trúc
+
+```
+apps/desktop     ← SẢN PHẨM: Electron macOS app
+apps/daemon      ← backend local (Express): /api/*, spawn claude|codex|grok
+apps/ui          ← renderer (Next.js static) — chỉ giao diện TRONG app, không phải website
+packages/agent-adapters   detect + stream 3 CLI
+packages/shared
+python/          engine PDF + MCP cfa-pdf-translator
+tool/work/       checkpoint pipeline (runtime data)
+input/ output/   thả PDF → nhận bản dịch
+```
+
+Open Design cũng vậy: `apps/desktop` = app, UI renderer trong cửa sổ, `apps/daemon` = process local.
+
+## Local agents
+
+Cài và đăng nhập ít nhất một CLI: `claude` / `codex` / `grok`.
+
+MCP PDF (một lần):
+
+```bash
+claude mcp add cfa-pdf-translator -- python3 "$(pwd)/python/server.py"
+# Codex: ~/.codex/config.toml → command/args trỏ python/server.py
+# Grok:  grok mcp add cfa-pdf-translator python3 -- "$(pwd)/python/server.py"
+```
+
+Trong app: **Cài đặt → Quét lại CLI**.
+
+| Engine | Pipeline |
+|---|---|
+| Claude | Workflow 4-phase (chất lượng cao) |
+| Codex | MCP lô trang (headless cần posture **bypass**) |
+| Grok | MCP lô trang (`--always-approve`) |
+
+## Lệnh khác (dev)
+
+```bash
+pnpm daemon         # chỉ backend (debug API), không phải luồng chính
+pnpm test           # unit test stream parsers
+pnpm build          # UI + daemon
+```
+
+## Tài liệu
+
+- `AGENTS.md` — contract cho coding agent
+- `python/README.md` — MCP + pipeline PDF
+- `apps/desktop/README.md` — app Electron
+
+Chỉ dùng cá nhân; không redistribute nội dung có bản quyền của CFA Institute.

@@ -1,0 +1,36 @@
+{
+  "name": "@cfa-translate/desktop",
+  "version": "0.3.0",
+  "description": "CFA Translate Studio — macOS Electron app (Claude / Codex / Grok local CLIs)",
+  "author": "CFA Translate",
+  "license": "MIT",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --mac"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "io.cfa.translate.studio",
+    "productName": "CFA Translate Studio",
+    "files": ["main.js", "package.json"],
+    "extraResources": [
+      {
+        "from": "../ui/out",
+        "to": "ui-out"
+      },
+      {
+        "from": "../../python",
+        "to": "python",
+        "filter": ["**/*", "!**/__pycache__/**"]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": ["dir"]
+    }
+  }
+}

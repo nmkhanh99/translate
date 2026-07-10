@@ -1,4 +1,4 @@
-# === Nội dung CFA có bản quyền — TUYỆT ĐỐI không commit/đẩy lên GitHub ===
+# === Nội dung CFA có bản quyền — không commit ===
 2024 CFA L1 Curriculum/
 2024 CFA L1 Curriculum - VI/
 2024 CFA L1 Curriculum - VI (agent pilot)/
@@ -18,35 +18,30 @@ __pycache__/
 # === Node / Electron ===
 node_modules/
 dist/
+apps/*/dist/
+apps/ui/out/
+packages/*/dist/
+.pnpm-store/
+package-lock.json
 
-# === Tool: cache / output / state cục bộ (sinh ra, resume được) ===
+# === Runtime data ===
 tool/work/
-tool/agent_pilot/
 **/*.cache.json
 tool/dashboard.json
-tool/p0_agent.json
-tool/p40_agent_translations.json
 **/run.log
 **/run.json
 **/codex_state.json
 **/codex_work.pdf
+input/*
+!input/README.md
+output/*
+!output/.gitkeep
 
 # === OS / editor ===
 .DS_Store
 .vscode/
 .idea/
 
-# === template thiết kế nguồn (đã port sang tool/ui/) — giữ ngoài repo ===
-translate-template/
-
-# === Open Design export scratch trong tool/app/ (UI thật ở tool/ui/) ===
-tool/app/.od-skills/
-tool/app/*.artifact.json
-tool/app/index.html
-tool/app/document.html
-tool/app/library.html
-tool/app/queue.html
-tool/app/settings.html
-tool/app/translate.html
-tool/app/css/
-tool/app/js/
+# === Local tooling / settings (không commit) ===
+.agents/
+.claude/settings.local.json
