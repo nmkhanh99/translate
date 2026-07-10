@@ -19,7 +19,10 @@ export function EngineSwitch({
   value: Engine;
   onChange: (e: Engine) => void;
   ariaLabel?: string;
-  /** When set, missing CLIs are greyed out (from GET /api/agents). */
+  /** From GET /api/agents. Missing CLIs are dimmed as a HINT but still
+   *  selectable — detection depends on the daemon PATH and can be wrong/slow,
+   *  so we never hard-lock the choice. If a CLI truly can't run, the chat/run
+   *  surfaces a clear error instead. */
   available?: Partial<Record<Engine, boolean>>;
 }) {
   return (
@@ -34,9 +37,12 @@ export function EngineSwitch({
             aria-selected={value === e.id}
             className={value === e.id ? "active" : ""}
             onClick={() => onChange(e.id)}
-            disabled={!ok}
-            title={ok ? "Dùng " + e.label : e.label + " chưa có trên PATH"}
-            style={ok ? undefined : { opacity: 0.4 }}
+            title={
+              ok
+                ? "Dùng " + e.label
+                : e.label + " — chưa dò thấy trên PATH (vẫn chọn/thử được)"
+            }
+            style={ok ? undefined : { opacity: 0.55 }}
           >
             {e.label}
           </button>
