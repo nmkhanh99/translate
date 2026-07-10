@@ -45,3 +45,6 @@ output/*
 # === Local tooling / settings (không commit) ===
 .agents/
 .claude/settings.local.json
+
+# === Sample/reference projects (không commit) ===
+open-design-main/
