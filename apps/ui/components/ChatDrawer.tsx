@@ -38,7 +38,7 @@ export function ChatDrawer({
   onClose: () => void;
 }) {
   const toast = useToast();
-  const { available } = useEngine();
+  const { available, rescanAgents } = useEngine();
   const [engine, setEngine] = React.useState<Engine>("claude");
   const [messages, setMessages] = React.useState<ChatMessage[]>([]);
   const [input, setInput] = React.useState("");
@@ -166,6 +166,7 @@ export function ChatDrawer({
             value={engine}
             onChange={pickEngine}
             available={available}
+            onRescan={rescanAgents}
             ariaLabel="Chọn CLI cho chat"
           />
           <button className="btn btn-icon x" onClick={onClose} aria-label="Đóng">
