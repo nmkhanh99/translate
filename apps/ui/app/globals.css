@@ -468,7 +468,8 @@ select.input { appearance: none; cursor: pointer;
  * Slides in from the right; overlays main. Streams from /api/chat.
  * ==========================================================================*/
 .chat-overlay {
-  position: fixed; inset: 0; z-index: 60;
+  position: fixed; top: var(--titlebar); right: 0; bottom: 0; left: 0; z-index: 60;
+  -webkit-app-region: no-drag;
   background: color-mix(in oklab, var(--fg), transparent 78%);
   opacity: 0; pointer-events: none;
   transition: opacity var(--motion-base) var(--ease-standard);
@@ -476,7 +477,8 @@ select.input { appearance: none; cursor: pointer;
 .chat-overlay.open { opacity: 1; pointer-events: auto; }
 
 .chat-drawer {
-  position: fixed; top: 0; right: 0; bottom: 0; z-index: 61;
+  position: fixed; top: var(--titlebar); right: 0; bottom: 0; z-index: 61;
+  -webkit-app-region: no-drag;
   width: min(460px, 92vw);
   display: flex; flex-direction: column;
   background: var(--surface); border-left: 1px solid var(--border);
