@@ -11,7 +11,7 @@
     "start": "pnpm --filter @cfa-translate/desktop start",
     "dev": "pnpm start",
     "app": "pnpm start",
-    "prestart": "node -e \"const fs=require('fs');if(!fs.existsSync('apps/ui/out/index.html')){console.log('→ build UI…');require('child_process').execSync('pnpm build:ui',{stdio:'inherit'})}\"",
+    "prestart": "pnpm build:ui",
     "build": "pnpm build:ui && pnpm build:daemon",
     "build:ui": "pnpm --filter @cfa-translate/ui build",
     "build:daemon": "pnpm --filter @cfa-translate/daemon build",
