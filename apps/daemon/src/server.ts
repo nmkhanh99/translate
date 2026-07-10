@@ -226,6 +226,15 @@ export function createApp() {
     res.json({ ok: true, name });
   });
 
+  /**
+   * Headless chat turn over SSE.
+   *
+   * Open-design patterns ported here:
+   *  - SSE comment heartbeats so proxies don't drop long tool runs
+   *  - resume_failed auto-retry: clear stale CLI session, reseed document
+   *    context, spawn once more (user never sees a dead-session error)
+   *  - model from app config when the adapter supports it
+   */
   app.post("/api/chat", async (req, res) => {
     const tag = String(req.body?.tag || "").trim();
     const engine = (
@@ -238,10 +247,8 @@ export function createApp() {
     if (!message) return res.status(400).json({ error: "message rỗng" });
 
     const adapter = getAdapter(engine) || ADAPTERS.claude;
-    const first = !session;
-    const prompt = first
-      ? chatContextSafe(vol) + "\n\nNGƯỜI DÙNG: " + message
-      : message;
+    const model =
+      engine === "claude" && typeof CFG.model === "string" ? CFG.model : undefined;
 
     res.status(200);
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
@@ -259,38 +266,116 @@ export function createApp() {
       }
     };
 
+    // Keepalive comments (open-design SSE). Browsers ignore `:` lines; they
+    // stop intermediate proxies from idle-closing a multi-minute tool run.
+    const heartbeat = setInterval(() => {
+      try {
+        res.write(": ping\n\n");
+      } catch {
+        /* connection already closed */
+      }
+    }, 15_000);
+
     const ac = new AbortController();
-    req.on("close", () => ac.abort());
-    const runId = randomUUID();
+    // Abort only when the RESPONSE connection closes (client actually
+    // disconnected). Do NOT use req "close": Express fully consumes the JSON
+    // request body, and the request stream then emits "close" within a few ms —
+    // wiring abort to that killed the CLI child before it produced any output
+    // (every engine appeared to "not reply"). The response stays open until we
+    // res.end(), so res "close" is the true client-gone signal.
+    res.on("close", () => ac.abort());
     let gotSession = session;
+    let clientGone = false;
 
     try {
-      for await (const ev of adapter.chat({
-        runId,
-        cwd: REPO_ROOT,
-        prompt,
-        session,
-        timeoutMs: 300_000,
-        signal: ac.signal,
-      })) {
-        if (ev.type === "session") {
-          gotSession = ev.sessionId;
-          continue;
+      // At most two attempts: original (maybe resume) + one fresh reseed.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const isResume = !!session && attempt === 0;
+        const prompt = isResume
+          ? message
+          : chatContextSafe(vol) + "\n\nNGƯỜI DÙNG: " + message;
+        if (attempt === 0 && !isResume) {
+          // first turn — session will be minted by the adapter
         }
-        if (ev.type === "done") {
-          sse({ type: "done", session: gotSession });
+        if (attempt === 1) {
+          session = null;
+          gotSession = null;
+          if (!sse({
+            type: "info",
+            text: "Phiên CLI cũ không còn — đang mở phiên mới và gửi lại ngữ cảnh tài liệu…",
+          })) {
+            clientGone = true;
+            break;
+          }
+        }
+
+        const runId = randomUUID();
+        let resumeFailed = false;
+        let sawDone = false;
+
+        try {
+          for await (const ev of adapter.chat({
+            runId,
+            cwd: REPO_ROOT,
+            prompt,
+            session,
+            model,
+            timeoutMs: 300_000,
+            signal: ac.signal,
+          })) {
+            if (ac.signal.aborted) {
+              clientGone = true;
+              break;
+            }
+            if (ev.type === "session") {
+              gotSession = ev.sessionId;
+              continue;
+            }
+            if (ev.type === "error" && ev.code === "resume_failed") {
+              resumeFailed = true;
+              // Drain is automatic when the async iterator ends after done.
+              continue;
+            }
+            if (ev.type === "done") {
+              sawDone = true;
+              if (resumeFailed && attempt === 0 && isResume && !ac.signal.aborted) {
+                // Retry loop; don't send done yet.
+                break;
+              }
+              sse({ type: "done", session: gotSession });
+              break;
+            }
+            const mapped = agentEventToChatSse(ev);
+            if (mapped && !sse(mapped)) {
+              clientGone = true;
+              break;
+            }
+          }
+        } catch (e) {
+          if (!resumeFailed) {
+            sse({
+              type: "error",
+              text: e instanceof Error ? e.message : String(e),
+            });
+            sse({ type: "done", session: gotSession });
+          }
           break;
         }
-        const mapped = agentEventToChatSse(ev);
-        if (mapped && !sse(mapped)) break;
+
+        if (clientGone || ac.signal.aborted) break;
+
+        if (resumeFailed && attempt === 0 && isResume) {
+          continue; // second attempt with full context
+        }
+
+        if (!sawDone && !resumeFailed) {
+          // Iterator ended without an explicit done (rare) — close cleanly.
+          sse({ type: "done", session: gotSession });
+        }
+        break;
       }
-    } catch (e) {
-      sse({
-        type: "error",
-        text: e instanceof Error ? e.message : String(e),
-      });
-      sse({ type: "done", session: gotSession });
     } finally {
+      clearInterval(heartbeat);
       res.end();
     }
   });

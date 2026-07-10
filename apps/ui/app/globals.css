@@ -550,12 +550,25 @@ select.input { appearance: none; cursor: pointer;
   border-bottom: 1px solid var(--border-soft); background: var(--chrome); }
 .chat-scope small { font-size: var(--text-xs); color: var(--muted); }
 
+.chat-banner { padding: var(--space-2) var(--space-4); flex: none;
+  border-bottom: 1px solid var(--border-soft); }
+.chat-banner.warn { background: color-mix(in oklab, var(--warn), transparent 88%); }
+.chat-banner small { font-size: var(--text-xs); color: var(--muted); }
+
 .chat-log { flex: 1; overflow-y: auto; padding: var(--space-4);
   display: flex; flex-direction: column; gap: var(--space-4); }
-.chat-empty { margin: auto; text-align: center; color: var(--muted); max-width: 30ch; }
+.chat-empty { margin: auto; text-align: center; color: var(--muted); max-width: 36ch; }
 .chat-empty .dz-mark { width: 44px; height: 44px; margin: 0 auto var(--space-3);
   display: grid; place-items: center; border-radius: var(--radius-md);
   background: var(--accent-wash); color: var(--accent); }
+.chat-starters { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center;
+  margin-top: var(--space-3); }
+.chat-starter { font-family: var(--font-body); font-size: var(--text-xs);
+  padding: 6px 10px; border-radius: var(--radius-pill);
+  border: 1px solid var(--border); background: var(--surface); color: var(--fg);
+  cursor: pointer; transition: border-color var(--motion-fast), background var(--motion-fast); }
+.chat-starter:hover:not(:disabled) { border-color: var(--accent); background: var(--accent-wash); }
+.chat-starter:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .msg { display: flex; flex-direction: column; gap: 4px; max-width: 90%; }
 .msg .who { font-size: 11px; font-family: var(--font-mono); color: var(--muted);
@@ -572,6 +585,9 @@ select.input { appearance: none; cursor: pointer;
   white-space: pre-wrap; }
 .msg.error .bubble { background: color-mix(in oklab, var(--danger), transparent 90%);
   border: 1px solid color-mix(in oklab, var(--danger), transparent 70%); color: var(--danger); }
+.msg.info { align-self: center; max-width: 95%; }
+.msg.info .bubble { background: transparent; border: none; color: var(--muted);
+  font-size: var(--text-xs); text-align: center; padding: 4px 8px; }
 .msg .cursor { display: inline-block; width: 7px; height: 14px; vertical-align: -2px;
   background: var(--accent); border-radius: 1px; animation: blink 1s steps(2) infinite; }
 @keyframes blink { 0%,50% { opacity: 1; } 50.01%,100% { opacity: 0; } }

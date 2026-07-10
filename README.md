@@ -61,6 +61,16 @@ Trong app: **Cài đặt → Quét lại CLI**.
 | Codex | MCP lô trang (headless cần posture **bypass**) |
 | Grok | MCP lô trang (`--always-approve`) |
 
+### Chat AI (per-document)
+
+Mở chat từ một volume → daemon spawn CLI headless (`POST /api/chat` SSE):
+
+- **Resume session** theo engine (Claude `--resume` / Codex `exec resume` / Grok `--resume`).
+- **Auto-retry** khi phiên CLI cũ mất (open-design resume-fail): xóa handle, gửi lại ngữ cảnh tài liệu, mở phiên mới — user không bị kẹt lỗi “session not found”.
+- **SSE heartbeat** (comment `: ping`) giữ kết nối khi agent chạy tool lâu.
+- **Claude**: prompt dài qua stdin (tránh E2BIG); text fallback khi không có partial stream.
+- UI: starter prompts, xóa hội thoại (reset session), banner CLI chưa cài, dòng `info` khi reseed.
+
 ## Lệnh khác (dev)
 
 ```bash

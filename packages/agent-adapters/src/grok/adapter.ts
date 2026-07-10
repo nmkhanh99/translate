@@ -7,6 +7,7 @@ import type {
 import { baseDetect } from "../detect.js";
 import { cancelRun, spawnLineStream } from "../spawn-stream.js";
 import { parseGrokLine } from "./stream.js";
+import { isGrokResumeFailure } from "../resume-fail.js";
 
 export const grokAdapter: AgentAdapter = {
   id: "grok",
@@ -32,6 +33,9 @@ export const grokAdapter: AgentAdapter = {
   },
 
   async *chat(params: ChatRunParams) {
+    // Recent Grok Build CLIs require `-p <PROMPT>` as an argv value (no bare
+    // stdin). Keep prompt on argv; open-design stages a --prompt-file for huge
+    // OD system prompts, which we don't need for document-scoped chat.
     const cmd = [
       "grok",
       "-p",
@@ -43,6 +47,9 @@ export const grokAdapter: AgentAdapter = {
       "--permission-mode",
       "auto",
     ];
+    if (params.model) {
+      cmd.push("--model", params.model);
+    }
     if (params.session) {
       cmd.push("--resume", params.session);
     }
@@ -53,6 +60,7 @@ export const grokAdapter: AgentAdapter = {
       parseLine: parseGrokLine,
       timeoutMs: params.timeoutMs,
       signal: params.signal,
+      isResumeFailure: (stderr, stdout) => isGrokResumeFailure(stderr || stdout),
     });
   },
 

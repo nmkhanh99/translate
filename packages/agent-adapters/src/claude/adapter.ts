@@ -7,7 +7,8 @@ import type {
 } from "../types.js";
 import { baseDetect } from "../detect.js";
 import { cancelRun, spawnLineStream } from "../spawn-stream.js";
-import { parseClaudeLine } from "./stream.js";
+import { createClaudeLineParser } from "./stream.js";
+import { isClaudeResumeFailure } from "../resume-fail.js";
 
 const CHAT_TOOLS = [
   "Read",
@@ -57,10 +58,14 @@ export const claudeAdapter: AgentAdapter = {
 
   async *chat(params: ChatRunParams) {
     const session = params.session || randomUUID();
+    // Prefer argv for short prompts (stable across Claude Code builds). Switch
+    // to stdin when large (open-design): avoids Linux E2BIG / Windows
+    // ENAMETOOLONG. `claude -p` with no positional prompt reads stdin.
+    const useStdin = params.prompt.length > 8000;
     const cmd = [
       "claude",
       "-p",
-      params.prompt,
+      ...(useStdin ? [] : [params.prompt]),
       "--output-format",
       "stream-json",
       "--verbose",
@@ -72,6 +77,9 @@ export const claudeAdapter: AgentAdapter = {
       "--allowedTools",
       ...CHAT_TOOLS,
     ];
+    if (params.model) {
+      cmd.push("--model", params.model);
+    }
     if (params.session) {
       cmd.push("--resume", params.session);
     } else {
@@ -82,9 +90,11 @@ export const claudeAdapter: AgentAdapter = {
       runId: params.runId,
       cmd,
       cwd: params.cwd,
-      parseLine: parseClaudeLine,
+      parseLine: createClaudeLineParser(),
       timeoutMs: params.timeoutMs,
       signal: params.signal,
+      stdinText: useStdin ? params.prompt : undefined,
+      isResumeFailure: isClaudeResumeFailure,
     });
   },
 

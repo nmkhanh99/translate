@@ -17,29 +17,37 @@ export async function* spawnLineStream(opts: {
   parseLine: LineParser;
   timeoutMs?: number;
   signal?: AbortSignal;
+  /** When set, written to child stdin then closed (open-design promptViaStdin). */
+  stdinText?: string;
+  /**
+   * Detect a dead resume target from CLI failure channels. When true, yields
+   * `{ type: "error", code: "resume_failed" }` so the daemon can retry fresh.
+   */
+  isResumeFailure?: (stderr: string, stdout: string) => boolean;
 }): AsyncGenerator<AgentEvent> {
   const [bin, ...args] = opts.cmd;
+  const useStdin = typeof opts.stdinText === "string";
   let proc: ChildProcess;
   try {
     proc = spawn(bin, args, {
       cwd: opts.cwd,
       env: { ...process.env, PYTHONUNBUFFERED: "1" },
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [useStdin ? "pipe" : "ignore", "pipe", "pipe"],
       detached: true,
     });
   } catch (e) {
     yield {
       type: "error",
       error:
-        e instanceof Error
-          ? e.message
-          : `Không spawn được ${bin}`,
+        e instanceof Error ? e.message : `Không spawn được ${bin}`,
+      code: "spawn_failed",
     };
     yield { type: "done", reason: "error" };
     return;
   }
 
   active.set(opts.runId, proc);
+
   // A missing binary (ENOENT) surfaces asynchronously via "error", not by
   // throwing from spawn() above. Capture it so an unavailable engine yields an
   // error event instead of crashing the daemon with an unhandled "error".
@@ -47,7 +55,23 @@ export async function* spawnLineStream(opts: {
   proc.once("error", (e) => {
     spawnErr = e instanceof Error ? e.message : String(e);
   });
+
+  if (useStdin && proc.stdin) {
+    // The child may exit before consuming stdin (stale resume, bad arg, …).
+    // Writing then triggers an ASYNC "error" (EPIPE) on the stdin stream that
+    // the try/catch below cannot see; unhandled, it can crash the daemon.
+    proc.stdin.on("error", () => {
+      /* child closed stdin early — safe to ignore */
+    });
+    try {
+      proc.stdin.end(opts.stdinText);
+    } catch {
+      /* ignore — child may already have exited */
+    }
+  }
+
   const errBuf: string[] = [];
+  const outBuf: string[] = [];
   if (proc.stderr) {
     proc.stderr.setEncoding("utf8");
     proc.stderr.on("data", (chunk: string) => {
@@ -70,24 +94,42 @@ export async function* spawnLineStream(opts: {
 
   try {
     if (!proc.stdout) {
-      yield { type: "error", error: "CLI không có stdout" };
+      yield { type: "error", error: "CLI không có stdout", code: "spawn_failed" };
       yield { type: "done", reason: "error" };
       return;
     }
     const rl = createInterface({ input: proc.stdout, crlfDelay: Infinity });
     for await (const line of rl) {
+      // Keep a rolling stdout window for structured resume-failure detection
+      // (Claude stream-json `result` events land here, not on stderr).
+      outBuf.push(line);
+      if (outBuf.length > 80) outBuf.splice(0, 40);
       for (const ev of opts.parseLine(line)) {
         yield ev;
       }
     }
-    const code: number | null = await new Promise((resolve) => {
-      if (proc.exitCode != null) return resolve(proc.exitCode);
-      proc.once("exit", (c) => resolve(c));
-      proc.once("error", () => resolve(null));
-    });
+    // Wait for the child to fully terminate. Guard against the terminal event
+    // having ALREADY fired (common after killTree on abort/timeout, or a fast
+    // ENOENT): re-subscribing to "close"/"exit" would then never resolve and
+    // strand this iterator forever (heartbeat leak, response never ends). Wait
+    // on "close" rather than "exit" so stderr is fully drained before we read
+    // errBuf for resume-failure detection. Capture the signal so a child killed
+    // by an unexpected signal is reported as an error, not a clean completion.
+    const { code, signal }: { code: number | null; signal: NodeJS.Signals | null } =
+      await new Promise((resolve) => {
+        if (spawnErr != null || proc.exitCode != null || proc.signalCode != null) {
+          return resolve({ code: proc.exitCode, signal: proc.signalCode });
+        }
+        proc.once("close", (c, s) => resolve({ code: c, signal: s }));
+        proc.once("error", () => resolve({ code: null, signal: null }));
+      });
 
     if (spawnErr) {
-      yield { type: "error", error: spawnErr };
+      yield {
+        type: "error",
+        error: spawnErr,
+        code: "spawn_failed",
+      };
       yield { type: "done", reason: "error" };
       return;
     }
@@ -96,6 +138,7 @@ export async function* spawnLineStream(opts: {
       yield {
         type: "error",
         error: `Quá thời gian (${Math.round((opts.timeoutMs || 0) / 1000)}s) — đã dừng.`,
+        code: "timeout",
       };
       yield { type: "done", reason: "error" };
       return;
@@ -104,8 +147,31 @@ export async function* spawnLineStream(opts: {
       yield { type: "done", reason: "cancelled" };
       return;
     }
+    // Killed by a signal we did not initiate (segfault, OOM/SIGKILL, external
+    // term). exitCode is null in this case, so it would otherwise slip past the
+    // numeric-code check below and be reported as a clean completion.
+    if (signal && code == null) {
+      const stderr = errBuf.join("").trim();
+      yield {
+        type: "error",
+        error: stderr.slice(-600) || `${bin} bị dừng bởi tín hiệu ${signal}`,
+      };
+      yield { type: "done", reason: "error" };
+      return;
+    }
     if (code !== 0 && code != null) {
-      const err = errBuf.join("").trim().slice(-600);
+      const stderr = errBuf.join("").trim();
+      const stdout = outBuf.join("\n");
+      if (opts.isResumeFailure?.(stderr, stdout)) {
+        yield {
+          type: "error",
+          error: "Phiên CLI cũ không còn (resume failed).",
+          code: "resume_failed",
+        };
+        yield { type: "done", reason: "error" };
+        return;
+      }
+      const err = stderr.slice(-600);
       yield {
         type: "error",
         error: err || `${bin} thoát mã ${code}`,

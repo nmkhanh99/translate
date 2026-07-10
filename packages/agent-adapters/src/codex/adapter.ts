@@ -7,6 +7,7 @@ import type {
 import { baseDetect } from "../detect.js";
 import { cancelRun, spawnLineStream } from "../spawn-stream.js";
 import { parseCodexLine } from "./stream.js";
+import { isCodexResumeFailure } from "../resume-fail.js";
 
 export const codexAdapter: AgentAdapter = {
   id: "codex",
@@ -33,6 +34,8 @@ export const codexAdapter: AgentAdapter = {
   },
 
   async *chat(params: ChatRunParams) {
+    // Prompt as last argv (Codex `exec` reads it as the user message). Long
+    // prompts can still hit OS argv limits; resume path keeps the short form.
     let cmd: string[];
     if (params.session) {
       cmd = [
@@ -60,6 +63,9 @@ export const codexAdapter: AgentAdapter = {
         "-c",
         "approval_policy=never",
       ];
+      if (params.model) {
+        cmd.push("-c", `model=${params.model}`);
+      }
     }
     yield* spawnLineStream({
       runId: params.runId,
@@ -68,6 +74,7 @@ export const codexAdapter: AgentAdapter = {
       parseLine: parseCodexLine,
       timeoutMs: params.timeoutMs,
       signal: params.signal,
+      isResumeFailure: (stderr) => isCodexResumeFailure(stderr),
     });
   },
 

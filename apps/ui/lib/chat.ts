@@ -1,5 +1,5 @@
 // SSE client for /api/chat. Daemon spawns the selected local CLI headless and
-// streams JSON events; we parse `data:` frames. fetch+ReadableStream (POST).
+// streams JSON events; we parse frames open-design style (event/id/data/comment).
 import { API_BASE } from "./api";
 import type { Engine } from "./types";
 
@@ -14,6 +14,35 @@ export interface ChatRequest {
   engine: Engine;
   message: string;
   session?: string | null;
+}
+
+/** open-design `parseSseFrame` — tolerant of CRLF, comments, multi-line data. */
+export function parseSseFrame(frame: string): ChatEvent | null {
+  const lines = frame.split("\n");
+  const dataLines: string[] = [];
+
+  for (const rawLine of lines) {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    if (line.startsWith(":")) {
+      // heartbeat / comment — ignore
+      continue;
+    }
+    if (line.startsWith("data:")) {
+      // Spec allows optional space after "data:"; accept both "data:" and "data: ".
+      dataLines.push(line.slice(5).replace(/^\s/, ""));
+    }
+    // event: / id: ignored — our daemon uses default "message" with JSON body
+  }
+
+  if (!dataLines.length) return null;
+
+  const payload = dataLines.join("\n");
+  try {
+    return JSON.parse(payload) as ChatEvent;
+  } catch {
+    // Non-JSON payload — treat as a raw text delta.
+    return { type: "delta", text: payload };
+  }
 }
 
 export async function streamChat(
@@ -46,23 +75,15 @@ export async function streamChat(
     const { done, value } = await reader.read();
     if (done) break;
     buf += decoder.decode(value, { stream: true });
+    // Normalize CRLF so frame splits stay reliable on all platforms.
+    buf = buf.replace(/\r\n/g, "\n");
     // SSE frames are separated by a blank line.
     let idx: number;
     while ((idx = buf.indexOf("\n\n")) !== -1) {
       const frame = buf.slice(0, idx);
       buf = buf.slice(idx + 2);
-      const dataLines = frame
-        .split("\n")
-        .filter((l) => l.startsWith("data:"))
-        .map((l) => l.slice(5).trim());
-      if (!dataLines.length) continue;
-      const payload = dataLines.join("\n");
-      try {
-        onEvent(JSON.parse(payload) as ChatEvent);
-      } catch {
-        // Non-JSON payload — treat as a raw text delta.
-        onEvent({ type: "delta", text: payload });
-      }
+      const ev = parseSseFrame(frame);
+      if (ev) onEvent(ev);
     }
   }
 }

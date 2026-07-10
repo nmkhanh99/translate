@@ -1,7 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { parseClaudeLine } from "../src/claude/stream.js";
+import {
+  parseClaudeLine,
+  createClaudeLineParser,
+} from "../src/claude/stream.js";
 import { parseCodexLine } from "../src/codex/stream.js";
 import { parseGrokLine } from "../src/grok/stream.js";
+import {
+  isClaudeResumeFailure,
+  isCodexResumeFailure,
+  isAgentResumeFailure,
+  hasClaudeResumeFailureResultEvent,
+} from "../src/resume-fail.js";
 
 describe("parseClaudeLine", () => {
   it("maps text_delta", () => {
@@ -34,6 +43,59 @@ describe("parseClaudeLine", () => {
     expect(parseClaudeLine(sess)).toEqual([
       { type: "session", sessionId: "abc" },
     ]);
+  });
+
+  it("falls back to assistant text when no partials streamed", () => {
+    const parse = createClaudeLineParser();
+    const final = JSON.stringify({
+      type: "assistant",
+      message: {
+        id: "msg_1",
+        content: [{ type: "text", text: "full reply" }],
+      },
+    });
+    expect(parse(final)).toEqual([{ type: "text_delta", text: "full reply" }]);
+  });
+
+  it("does not duplicate assistant text after partials", () => {
+    const parse = createClaudeLineParser();
+    parse(
+      JSON.stringify({
+        type: "stream_event",
+        event: {
+          type: "content_block_delta",
+          delta: { type: "text_delta", text: "hi" },
+        },
+      })
+    );
+    const final = JSON.stringify({
+      type: "assistant",
+      message: {
+        id: "msg_1",
+        content: [{ type: "text", text: "hi there" }],
+      },
+    });
+    expect(parse(final)).toEqual([]);
+  });
+
+  it("emits resume_failed on local result error (0 turns, 0 api ms)", () => {
+    const line = JSON.stringify({
+      type: "result",
+      is_error: true,
+      num_turns: 0,
+      duration_api_ms: 0,
+      session_id: "dead",
+      result: "No conversation found with session ID: dead",
+    });
+    const evs = parseClaudeLine(line);
+    expect(evs).toContainEqual({
+      type: "session",
+      sessionId: "dead",
+    });
+    expect(evs.find((e) => e.type === "error")).toMatchObject({
+      type: "error",
+      code: "resume_failed",
+    });
   });
 });
 
@@ -76,5 +138,62 @@ describe("parseGrokLine", () => {
     expect(
       parseGrokLine(JSON.stringify({ type: "end", sessionId: "s9" }))
     ).toEqual([{ type: "session", sessionId: "s9" }]);
+  });
+});
+
+describe("resume failure detection", () => {
+  it("detects Claude prose on stderr", () => {
+    expect(
+      isClaudeResumeFailure(
+        "No conversation found with session ID: abc-123\n"
+      )
+    ).toBe(true);
+  });
+
+  it("detects Claude structured result on stdout", () => {
+    const stdout = JSON.stringify({
+      type: "result",
+      is_error: true,
+      num_turns: 0,
+      duration_api_ms: 0,
+    });
+    expect(hasClaudeResumeFailureResultEvent(stdout)).toBe(true);
+    expect(isClaudeResumeFailure("", stdout)).toBe(true);
+  });
+
+  it("does not treat in-turn API error as resume failure", () => {
+    const stdout = JSON.stringify({
+      type: "result",
+      is_error: true,
+      num_turns: 2,
+      duration_api_ms: 1200,
+      result: "overload",
+    });
+    expect(isClaudeResumeFailure("", stdout)).toBe(false);
+  });
+
+  it("detects Codex resume miss", () => {
+    expect(
+      isCodexResumeFailure(
+        "Error: thread/resume: thread/resume failed: no rollout found for thread id xyz"
+      )
+    ).toBe(true);
+  });
+
+  it("dispatches per agent", () => {
+    expect(
+      isAgentResumeFailure(
+        "codex",
+        "no rollout found for thread id x",
+        ""
+      )
+    ).toBe(true);
+    expect(
+      isAgentResumeFailure(
+        "claude",
+        "No conversation found with session ID: z",
+        ""
+      )
+    ).toBe(true);
   });
 });

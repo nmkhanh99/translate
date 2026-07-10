@@ -25,12 +25,15 @@ export interface AgentCapabilities {
   pipeline: "workflow" | "mcp-batch";
 }
 
+/** Optional error codes the UI/daemon can act on (open-design style). */
+export type AgentErrorCode = "resume_failed" | "spawn_failed" | "timeout" | string;
+
 export type AgentEvent =
   | { type: "text_delta"; text: string }
   | { type: "tool_call"; name: string; id?: string }
   | { type: "session"; sessionId: string }
   | { type: "progress"; stage?: string; detail?: string }
-  | { type: "error"; error: string }
+  | { type: "error"; error: string; code?: AgentErrorCode }
   | { type: "done"; reason: "completed" | "cancelled" | "error" };
 
 /** SSE events the browser chat UI consumes (compatible with legacy dashboard). */
@@ -104,6 +107,8 @@ export function agentEventToChatSse(ev: AgentEvent): ChatSseEvent | null {
     case "tool_call":
       return { type: "tool", text: "🔧 " + ev.name };
     case "error":
+      // resume_failed is handled by the daemon (auto-retry); don't surface to UI.
+      if (ev.code === "resume_failed") return null;
       return { type: "error", text: ev.error };
     case "done":
       return { type: "done" };

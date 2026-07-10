@@ -5,10 +5,16 @@ import { grokAdapter } from "./grok/adapter.js";
 import type { AgentDetection } from "@cfa-translate/shared";
 
 export * from "./types.js";
-export { parseClaudeLine } from "./claude/stream.js";
+export { parseClaudeLine, createClaudeLineParser } from "./claude/stream.js";
 export { parseCodexLine } from "./codex/stream.js";
 export { parseGrokLine } from "./grok/stream.js";
 export { cancelRun } from "./spawn-stream.js";
+export {
+  isAgentResumeFailure,
+  isClaudeResumeFailure,
+  isCodexResumeFailure,
+  isGrokResumeFailure,
+} from "./resume-fail.js";
 
 export const ADAPTERS: Record<EngineId, AgentAdapter> = {
   claude: claudeAdapter,
