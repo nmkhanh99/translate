@@ -72,34 +72,40 @@ export default function Settings() {
 
       <div className="page narrow stack-6">
         <section className="card stack-4">
-          <h2>Local coding agents</h2>
-          <div className="stack-3">
+          <div className="row-between">
+            <div>
+              <h2>Chế độ chạy — Local CLI</h2>
+              <div className="hint">
+                Chạy qua CLI code-agent trên máy (agent-native) — không gọi API
+                cloud.
+              </div>
+            </div>
+            <span className="count-badge">
+              {agents.filter((a) => a.available).length}/{agents.length} đã cài
+            </span>
+          </div>
+          <div className="cli-list">
             {agents.map((a) => (
-              <div
-                key={a.id}
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  gap: 12,
-                  opacity: a.available ? 1 : 0.45,
-                }}
-              >
-                <div>
+              <div key={a.id} className={"cli-row" + (a.available ? "" : " off")}>
+                <span className={"cli-dot" + (a.available ? " on" : "")} />
+                <div className="cli-main">
                   <strong>{a.displayName}</strong>
-                  <div className="hint">
+                  <div className="hint mono">
                     {a.available
                       ? `${a.executablePath}${a.version ? " · " + a.version : ""}`
-                      : "Chưa cài / không thấy trên PATH"}
+                      : "chưa dò thấy trên PATH"}
                   </div>
                 </div>
-                <span className="hint">{a.available ? "sẵn sàng" : "thiếu"}</span>
+                <span className={"cli-status" + (a.available ? " ok" : "")}>
+                  {a.available ? "sẵn sàng" : "thiếu"}
+                </span>
               </div>
             ))}
           </div>
           <p className="hint">
-            App chỉ spawn CLI local — không gọi API cloud. Cài{" "}
-            <code>claude</code>, <code>codex</code>, hoặc <code>grok</code> rồi
-            bấm Quét lại.
+            Cài <code>claude</code> / <code>codex</code> / <code>grok</code> rồi
+            bấm <b>Quét lại CLI</b>. Dò theo PATH — CLI cài qua nvm/volta/bun vẫn
+            nhận.
           </p>
         </section>
 

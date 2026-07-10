@@ -525,6 +525,25 @@ select.input { appearance: none; cursor: pointer;
 .engine-opt .note { color: var(--muted); font-size: var(--text-xs); }
 .engine-opt .check { margin-left: auto; color: var(--accent); }
 
+/* settings · Local CLI status rows */
+.count-badge { flex: none; font-size: var(--text-xs); font-weight: 600; color: var(--muted);
+  padding: 3px 10px; border: 1px solid var(--border); border-radius: var(--radius-pill); white-space: nowrap; }
+.cli-list { display: flex; flex-direction: column; }
+.cli-row { display: flex; align-items: center; gap: var(--space-3);
+  padding: var(--space-3) var(--space-1); }
+.cli-row + .cli-row { border-top: 1px solid var(--border-soft); }
+.cli-row.off { opacity: 0.6; }
+.cli-dot { width: 8px; height: 8px; border-radius: var(--radius-pill);
+  background: var(--muted); opacity: 0.4; flex: none; }
+.cli-dot.on { background: var(--success); opacity: 1; }
+.cli-main { flex: 1; min-width: 0; }
+.cli-main .mono { font-family: var(--font-mono); font-size: var(--text-xs);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cli-status { flex: none; font-size: var(--text-xs); color: var(--muted);
+  padding: 2px 9px; border-radius: var(--radius-pill); border: 1px solid var(--border); }
+.cli-status.ok { color: var(--success);
+  border-color: color-mix(in oklab, var(--success), transparent 65%); }
+
 .chat-scope { padding: var(--space-2) var(--space-4); flex: none;
   border-bottom: 1px solid var(--border-soft); background: var(--chrome); }
 .chat-scope small { font-size: var(--text-xs); color: var(--muted); }
