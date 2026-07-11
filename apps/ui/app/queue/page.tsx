@@ -23,8 +23,12 @@ export default function Queue() {
   const toast = useToast();
   // Tags the user just launched — shown as "đang khởi động" until the next
   // status poll confirms they are running (spawn + first status write lags a
-  // few seconds, so without this the click looks like nothing happened).
-  const [starting, setStarting] = React.useState<Record<string, number>>({});
+  // few seconds, so without this the click looks like nothing happened). We
+  // track the launch time plus the run's sid so we can distinguish OUR run's
+  // outcome from stale run metadata left by a previous run of the same volume.
+  const [starting, setStarting] = React.useState<
+    Record<string, { at: number; sid?: string }>
+  >({});
 
   const vols = (s?.volumes || []).filter((v) => !v.skip);
   const active = vols.filter((v) => v.running);
@@ -35,15 +39,23 @@ export default function Queue() {
   const errv = vols.filter((v) => v.stage === "error" && !v.running);
   const cur = active[0];
 
-  // A launched tag stops being "starting" once it shows up running, or after a
-  // 20s safety window (e.g. the process failed to start).
+  // A launched tag stops being "starting" once it shows up running, once OUR
+  // run (matched by sid) has already exited (spawn failed / finished instantly),
+  // or after a 20s safety backstop. Matching sid avoids clearing on the stale
+  // "exited" metadata a previous run left behind (e.g. "Chạy tiếp" on an error).
   React.useEffect(() => {
     setStarting((prev) => {
       let changed = false;
       const next = { ...prev };
       for (const tag of Object.keys(prev)) {
         const v = vols.find((x) => x.tag === tag);
-        if ((v && v.running) || Date.now() - prev[tag] > 20000) {
+        const info = prev[tag];
+        const ours = !!(v && info.sid && v.sid === info.sid);
+        if (
+          (v && v.running) ||
+          (ours && !v!.running && v!.mode && v!.mode !== "running") ||
+          Date.now() - info.at > 20000
+        ) {
           delete next[tag];
           changed = true;
         }
@@ -73,9 +85,12 @@ export default function Queue() {
   };
 
   const launch = async (tag: string, ok: string) => {
-    setStarting((prev) => ({ ...prev, [tag]: Date.now() }));
+    setStarting((prev) => ({ ...prev, [tag]: { at: Date.now() } }));
     try {
-      await runVolume(tag);
+      const r = await runVolume(tag);
+      setStarting((prev) =>
+        prev[tag] ? { ...prev, [tag]: { at: prev[tag].at, sid: r?.sid } } : prev
+      );
       toast(ok);
     } catch (e) {
       setStarting((prev) => {
@@ -170,6 +185,20 @@ function Stat({ n, l, suffix }: { n: number; l: string; suffix?: string }) {
   );
 }
 
+// Progress track with a fixed trailing slot for the percentage. Every row
+// reserves the same slot (even when it shows no number) so all tracks start and
+// end at the same x — otherwise active rows, which show a %, would end short.
+function Track({ pct, cls, showPct }: { pct: number; cls?: string; showPct?: boolean }) {
+  return (
+    <div className="row" style={{ gap: "var(--space-3)" }}>
+      <div className={"progress" + (cls ? " " + cls : "")} style={{ flex: 1 }}>
+        <i style={{ width: pct + "%" }} />
+      </div>
+      <span className="num muted job-pct">{showPct ? pct + "%" : ""}</span>
+    </div>
+  );
+}
+
 // Live tail of the volume's run.log so the user can see *what* the run is doing
 // right now, not just the coarse stage. Click to expand the last ~40 lines.
 function LogTail({ tag }: { tag: string }) {
@@ -177,12 +206,20 @@ function LogTail({ tag }: { tag: string }) {
   const [open, setOpen] = React.useState(false);
   React.useEffect(() => {
     let alive = true;
-    const tick = () =>
+    let inFlight = false;
+    const tick = () => {
+      // Skip if the previous poll hasn't returned — never stack requests.
+      if (inFlight) return;
+      inFlight = true;
       getLog(tag)
         .then((d) => {
           if (alive) setLines(d.lines || []);
         })
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => {
+          inFlight = false;
+        });
+    };
     tick();
     const id = setInterval(tick, 2500);
     return () => {
@@ -241,17 +278,7 @@ function Job({
       <div className="job-mid">
         {kind === "active" && (
           <>
-            <div className="row" style={{ gap: "var(--space-3)" }}>
-              <div className="progress" style={{ flex: 1 }}>
-                <i style={{ width: p + "%" }} />
-              </div>
-              <span
-                className="num muted"
-                style={{ fontSize: "var(--text-xs)", minWidth: 32, textAlign: "right" }}
-              >
-                {p}%
-              </span>
-            </div>
+            <Track pct={p} showPct />
             <div
               className="row muted"
               style={{ fontSize: "var(--text-xs)", marginTop: 6, gap: "var(--space-2)" }}
@@ -264,9 +291,7 @@ function Job({
         )}
         {kind === "starting" && (
           <>
-            <div className="progress">
-              <i style={{ width: (p || 4) + "%" }} />
-            </div>
+            <Track pct={p || 4} />
             <div
               className="row muted"
               style={{ fontSize: "var(--text-xs)", marginTop: 6, gap: "var(--space-2)" }}
@@ -276,21 +301,9 @@ function Job({
             </div>
           </>
         )}
-        {kind === "waiting" && (
-          <div className="progress">
-            <i style={{ width: p + "%" }} />
-          </div>
-        )}
-        {kind === "done" && (
-          <div className="progress ok">
-            <i style={{ width: "100%" }} />
-          </div>
-        )}
-        {kind === "error" && (
-          <div className="progress warn">
-            <i style={{ width: p + "%" }} />
-          </div>
-        )}
+        {kind === "waiting" && <Track pct={p} />}
+        {kind === "done" && <Track pct={100} cls="ok" />}
+        {kind === "error" && <Track pct={p} cls="warn" />}
       </div>
 
       <div className="job-actions">

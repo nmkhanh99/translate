@@ -33,6 +33,32 @@
   ghi nhầm sang hội thoại mới → mỗi lượt gửi dùng bản snapshot session riêng,
   chỉ mirror lại ref khi lượt đó vẫn là hội thoại đang xem.
 
+### Fixed (sau Codex review lần 2)
+
+- **Chat — cô lập theo "generation":** thêm bộ đếm owner + khóa `hydrating`;
+  đổi tài liệu/hội thoại là vô hiệu hóa đồng bộ các ref cũ và chặn gửi trong lúc
+  đang nạp. Vá 3 lỗi race (High) làm lẫn transcript/session giữa các hội thoại
+  khi thao tác giữa chừng: gửi lúc đang hydrate, chọn hội thoại rồi gửi trước
+  khi nạp xong, và đổi tài liệu ngay trong lúc `createConversation` đang chạy.
+  `session` snapshot lấy TRƯỚC mọi `await`; `busy` luôn được clear khi stream
+  kết thúc dù đã chuyển tài liệu.
+- **Chat — lưu bị đè:** hai lần lưu mỗi lượt (user-turn + full) giờ được xếp
+  hàng tuần tự (`saveChainRef`) nên bản lưu tạm không thể ghi đè mất câu trả lời.
+- **Hàng đợi:** chip “Đang khởi động…” tự tắt ngay khi CHÍNH lần chạy đó (khớp
+  `sid`) đã thoát (spawn lỗi/chạy xong tức thì), không còn phụ thuộc mỗi timeout
+  20s; tránh false-positive từ metadata cũ khi bấm “Chạy tiếp”.
+- **Hàng đợi:** progress bar của dòng đang chạy trước đây ngắn hơn ~44px (do ô
+  % nằm trong cột 220px) → mọi dòng giờ dùng chung khe % cố định nên track thẳng
+  hàng tuyệt đối.
+
+### Technical (sau Codex review lần 2)
+
+- `/api/log` chỉ đọc **64KB cuối** của `run.log` (bounded tail) thay vì
+  `readFileSync` toàn bộ file mỗi 2.5s → không còn chặn event loop của daemon
+  khi log lớn; client LogTail thêm cờ chống chồng request.
+- Còn nợ (không blocking): đóng gói `better-sqlite3` cho bản Electron (electron
+  -rebuild + ship module) để chat lưu bền trong app đóng gói.
+
 ### Technical
 
 - `apps/daemon`: thêm dependency `better-sqlite3`; esbuild bundle thêm

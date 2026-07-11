@@ -9,6 +9,14 @@
 // transcript and per-engine CLI session id for resume across reloads. If the
 // daemon reports persist:false (SQLite unavailable) the drawer degrades to a
 // single in-memory conversation.
+//
+// Concurrency model: the on-screen {document, conversation} is one "owner",
+// tracked by an incrementing generation (genRef). Every switch (document or
+// conversation) bumps the generation and synchronously invalidates the shared
+// refs, and `hydrating` blocks sending until the new owner is loaded. An
+// in-flight stream captures its generation and only writes back visible state /
+// sessions when it is still the current owner — so switching mid-stream can
+// never mix one conversation's transcript or CLI session into another's.
 import * as React from "react";
 import { ChatDoc, useToast, useEngine } from "./Providers";
 import type { ChatMessage, ChatRole, Engine } from "../lib/types";
@@ -75,22 +83,28 @@ export function ChatDrawer({
   const [conversations, setConversations] = React.useState<ConversationMeta[]>([]);
   const [convId, setConvId] = React.useState<string | null>(null);
   const [persist, setPersist] = React.useState(true);
+  const [hydrating, setHydrating] = React.useState(false);
   const [input, setInput] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [statusLine, setStatusLine] = React.useState<string | null>(null);
   const abortRef = React.useRef<AbortController | null>(null);
   const logRef = React.useRef<HTMLDivElement>(null);
   const tag = doc?.tag || "";
-  // Latest active tag/conversation, so an in-flight stream for a PREVIOUS
-  // document doesn't overwrite the visible messages after a switch.
   const tagRef = React.useRef(tag);
   tagRef.current = tag;
+  // Owner generation — bumped on every document/conversation switch. All async
+  // work captures the generation at start and no-ops if it has moved on.
+  const genRef = React.useRef(0);
   const convIdRef = React.useRef<string | null>(null);
   // Working copy of the visible transcript; read synchronously when starting a
   // turn (setMessages is async). Kept in lock-step via applyMessages().
   const messagesRef = React.useRef<ChatMessage[]>([]);
   // CLI session id per engine for the CURRENT conversation (enables resume).
   const sessionsRef = React.useRef<Partial<Record<Engine, string>>>({});
+  // Serializes persistence so the interim user-turn save always lands before
+  // the final full-transcript save (otherwise a reordered interim save could
+  // overwrite the completed answer).
+  const saveChainRef = React.useRef<Promise<unknown>>(Promise.resolve());
 
   const engineOk = available[engine] !== false;
   const engineLabel = ENGINES.find((e) => e.id === engine)?.label || engine;
@@ -101,11 +115,9 @@ export function ChatDrawer({
     toast("Chat dùng: " + (ENGINES.find((x) => x.id === e)?.label || e));
   }
 
-  // Only touch visible state when the message batch belongs to the on-screen
-  // document; a background stream for a previous tag still updates its own local
-  // `arr` and persists via its captured conversation id.
-  const applyMessages = React.useCallback((next: ChatMessage[], forTag: string) => {
-    if (tagRef.current === forTag) {
+  // Only touch visible state when the batch still belongs to the current owner.
+  const applyMessages = React.useCallback((next: ChatMessage[], gen: number) => {
+    if (genRef.current === gen) {
       messagesRef.current = next;
       setMessages(next);
     }
@@ -127,11 +139,14 @@ export function ChatDrawer({
   const saveConv = React.useCallback(
     (cid: string | null, msgs: ChatMessage[], sessions: Partial<Record<Engine, string>>) => {
       if (!persist || !cid) return;
-      saveConversationApi(cid, {
+      const body = {
         engine,
         messages: toStored(msgs),
         sessions: sessions as Record<string, string>,
-      }).catch(() => {});
+      };
+      saveChainRef.current = saveChainRef.current
+        .catch(() => {})
+        .then(() => saveConversationApi(cid, body).catch(() => {}));
     },
     [persist, engine]
   );
@@ -148,46 +163,46 @@ export function ChatDrawer({
     }
   }, []);
 
+  // Synchronously drop the previous owner's state so a send fired during
+  // hydration cannot reuse it, then load the target's conversation list/messages.
+  const invalidate = React.useCallback(() => {
+    const gen = ++genRef.current;
+    convIdRef.current = null;
+    sessionsRef.current = {};
+    messagesRef.current = [];
+    setConvId(null);
+    setMessages([]);
+    setStatusLine(null);
+    return gen;
+  }, []);
+
   // Load this document's conversation list + most-recent transcript on switch.
   React.useEffect(() => {
-    if (!tag) {
-      setConversations([]);
-      setConvId(null);
-      convIdRef.current = null;
-      sessionsRef.current = {};
-      applyMessages([], tag);
-      return;
-    }
+    const gen = invalidate();
+    setConversations([]);
+    if (!tag) return;
+    setHydrating(true);
     let alive = true;
     (async () => {
       try {
         const r = await listConversations(tag);
-        if (!alive || tagRef.current !== tag) return;
+        if (!alive || genRef.current !== gen) return;
         setPersist(r.persist);
         setConversations(r.conversations);
-        sessionsRef.current = {};
         if (r.conversations.length > 0) {
           const first = r.conversations[0];
           const data = await loadConversation(first.id);
-          if (!alive || tagRef.current !== tag) return;
+          if (!alive || genRef.current !== gen) return;
           convIdRef.current = first.id;
           setConvId(first.id);
           sessionsRef.current = (data.sessions || {}) as Partial<Record<Engine, string>>;
-          applyMessages(fromStored(data.messages || []), tag);
-        } else {
-          convIdRef.current = null;
-          setConvId(null);
-          applyMessages([], tag);
+          applyMessages(fromStored(data.messages || []), gen);
         }
       } catch {
-        if (!alive) return;
-        setPersist(false);
-        setConversations([]);
-        convIdRef.current = null;
-        setConvId(null);
-        applyMessages([], tag);
+        if (alive && genRef.current === gen) setPersist(false);
+      } finally {
+        if (alive && genRef.current === gen) setHydrating(false);
       }
-      if (alive) setStatusLine(null);
     })();
     return () => {
       alive = false;
@@ -212,33 +227,33 @@ export function ChatDrawer({
   }, [open, onClose]);
 
   async function selectConv(id: string) {
-    if (busy || id === convIdRef.current) return;
+    if (busy || hydrating || id === convIdRef.current) return;
+    const gen = invalidate();
+    setHydrating(true);
     try {
       const data = await loadConversation(id);
-      if (tagRef.current !== tag) return;
+      if (genRef.current !== gen) return;
       convIdRef.current = id;
       setConvId(id);
       sessionsRef.current = (data.sessions || {}) as Partial<Record<Engine, string>>;
-      applyMessages(fromStored(data.messages || []), tag);
-      setStatusLine(null);
+      applyMessages(fromStored(data.messages || []), gen);
     } catch (e) {
       toast("Lỗi tải hội thoại: " + (e as Error).message);
+    } finally {
+      if (genRef.current === gen) setHydrating(false);
     }
   }
 
   function newConv() {
-    if (busy) return;
-    convIdRef.current = null;
-    setConvId(null);
-    sessionsRef.current = {};
-    applyMessages([], tag);
-    setStatusLine(null);
+    if (busy || hydrating) return;
+    invalidate();
   }
 
   async function delConv(id: string) {
+    if (busy) return;
     try {
       await deleteConversationApi(id);
-      if (id === convIdRef.current) newConv();
+      if (id === convIdRef.current) invalidate();
       await refreshList(tag);
       toast("Đã xóa hội thoại");
     } catch (e) {
@@ -248,10 +263,14 @@ export function ChatDrawer({
 
   async function send(raw?: string) {
     const text = (raw ?? input).trim();
-    if (!text || !doc || busy) return;
+    if (!text || !doc || busy || hydrating) return;
     setInput("");
+    const sendGen = genRef.current;
     const sendTag = tag;
     const base = messagesRef.current;
+    // Snapshot the session map BEFORE any await: sessionsRef tracks the on-screen
+    // conversation and could be replaced if the user switches during create().
+    const sessions: Partial<Record<Engine, string>> = { ...sessionsRef.current };
     const userMsg: ChatMessage = { id: nextId(), role: "user", text };
     const botId = nextId();
     const botMsg: ChatMessage = {
@@ -262,7 +281,7 @@ export function ChatDrawer({
       streaming: true,
     };
     let arr = [...base, userMsg, botMsg];
-    applyMessages(arr, sendTag);
+    applyMessages(arr, sendGen);
     setBusy(true);
     setStatusLine(null);
 
@@ -272,8 +291,10 @@ export function ChatDrawer({
       try {
         const c = await createConversation(sendTag, text.slice(0, 60), engine);
         cid = c.id;
-        convIdRef.current = c.id;
-        if (tagRef.current === sendTag) {
+        // Only publish the new conversation to shared state if this send is
+        // still the current owner (the user may have switched during create).
+        if (genRef.current === sendGen) {
+          convIdRef.current = c.id;
           setConvId(c.id);
           setConversations((prev) => [{ ...c, msg_count: 0 }, ...prev]);
         }
@@ -283,13 +304,7 @@ export function ChatDrawer({
       }
     }
     const sendConvId = cid;
-    // Per-send session snapshot. `sessionsRef` tracks the ON-SCREEN
-    // conversation; if the user switches document/conversation while this stream
-    // is still running, mutating the ref would corrupt the new target. Work on a
-    // local copy and only mirror it back when this turn is still the current one.
-    const sessions: Partial<Record<Engine, string>> = { ...sessionsRef.current };
-    const stillCurrent = () =>
-      tagRef.current === sendTag && convIdRef.current === sendConvId;
+    const stillCurrent = () => genRef.current === sendGen;
 
     // Persist the user turn immediately (exclude the empty streaming bubble) so
     // a reload mid-stream keeps the question.
@@ -299,13 +314,13 @@ export function ChatDrawer({
 
     const patch = (fn: (m: ChatMessage) => ChatMessage) => {
       arr = arr.map((m) => (m.id === botId ? fn(m) : m));
-      applyMessages(arr, sendTag);
+      applyMessages(arr, sendGen);
     };
 
     try {
       await streamChat(
         {
-          tag: doc.tag,
+          tag: sendTag,
           engine,
           message: text,
           session: sessions[engine] || null,
@@ -318,7 +333,7 @@ export function ChatDrawer({
             const toolMsg: ChatMessage = { id: nextId(), role: "tool", text: ev.text };
             const bi = arr.findIndex((m) => m.id === botId);
             arr = [...arr.slice(0, bi), toolMsg, ...arr.slice(bi)];
-            applyMessages(arr, sendTag);
+            applyMessages(arr, sendGen);
           } else if (ev.type === "info" && ev.text) {
             // Resume-retry clears the CLI session on the server; drop local handle
             // so the next turn uses the new session id from `done`.
@@ -331,8 +346,8 @@ export function ChatDrawer({
               };
               const bi = arr.findIndex((m) => m.id === botId);
               arr = [...arr.slice(0, bi), resetMsg, ...arr.slice(bi)];
-              applyMessages(arr, sendTag);
-            } else {
+              applyMessages(arr, sendGen);
+            } else if (stillCurrent()) {
               setStatusLine(ev.text);
             }
           } else if (ev.type === "done") {
@@ -364,13 +379,17 @@ export function ChatDrawer({
     } finally {
       // Ensure the streaming flag clears even if no explicit done arrived.
       patch((m) => (m.streaming ? { ...m, streaming: false } : m));
+      // busy is the single global streaming flag — always clear it, otherwise a
+      // document the user switched to mid-stream stays stuck as busy.
       setBusy(false);
       abortRef.current = null;
-      setStatusLine(null);
-      // Only mirror the session back to the on-screen ref if this turn is still
-      // the current one; otherwise the user has moved on and we must not touch
-      // the new target's session. Persist always targets this turn's own conv.
-      if (stillCurrent()) sessionsRef.current = sessions;
+      // Only mirror the session / clear the status line if this turn is still
+      // the current owner; a switch mid-stream already moved on.
+      if (stillCurrent()) {
+        setStatusLine(null);
+        sessionsRef.current = sessions;
+      }
+      // Persist always targets this turn's own conversation, regardless of owner.
       saveConv(sendConvId, arr, sessions);
       void refreshList(sendTag);
     }
@@ -402,14 +421,14 @@ export function ChatDrawer({
             <ConversationsMenu
               conversations={conversations}
               convId={convId}
-              busy={busy}
+              busy={busy || hydrating}
               onSelect={selectConv}
               onDelete={delConv}
             />
             <button
               className="btn btn-secondary btn-sm"
               onClick={newConv}
-              disabled={busy}
+              disabled={busy || hydrating}
               title="Bắt đầu hội thoại mới cho cuốn này"
             >
               ＋ Mới
@@ -436,7 +455,11 @@ export function ChatDrawer({
         ) : null}
 
         <div className="chat-log" ref={logRef}>
-          {messages.length === 0 ? (
+          {hydrating && messages.length === 0 ? (
+            <div className="chat-empty">
+              <p className="muted">Đang tải hội thoại…</p>
+            </div>
+          ) : messages.length === 0 ? (
             <div className="chat-empty">
               <div className="dz-mark">
                 <IconChat />
@@ -506,7 +529,7 @@ export function ChatDrawer({
               <button
                 className="btn btn-primary btn-sm"
                 onClick={() => void send()}
-                disabled={!input.trim()}
+                disabled={!input.trim() || hydrating}
               >
                 <IconSend /> Gửi
               </button>

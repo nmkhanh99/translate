@@ -105,7 +105,7 @@ export function post<T = unknown>(path: string, body?: unknown): Promise<T> {
   });
 }
 
-export function runVolume(tag: string) {
+export function runVolume(tag: string): Promise<{ ok: boolean; sid?: string }> {
   return post("/api/run", { tag });
 }
 export function stopVolume(tag: string) {

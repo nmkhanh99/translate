@@ -1,5 +1,15 @@
 import express, { type Request, type Response, type NextFunction } from "express";
-import { createReadStream, existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import {
+  createReadStream,
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  statSync,
+  openSync,
+  readSync,
+  closeSync,
+} from "node:fs";
 import { join, basename } from "node:path";
 import { randomUUID } from "node:crypto";
 import {
@@ -169,7 +179,29 @@ export function createApp() {
     const logPath = join(vol.workdir, "run.log");
     let lines: string[] = [];
     if (existsSync(logPath)) {
-      const text = readFileSync(logPath, "utf8");
+      // Read only a bounded tail — run.log grows unbounded over a long
+      // translation, and this endpoint is polled every 2.5s per active row, so
+      // reading the whole file would repeatedly block the daemon's event loop.
+      const MAX = 64 * 1024;
+      const size = statSync(logPath).size;
+      const start = Math.max(0, size - MAX);
+      const len = size - start;
+      let text = "";
+      if (len > 0) {
+        const buf = Buffer.allocUnsafe(len);
+        const fd = openSync(logPath, "r");
+        try {
+          readSync(fd, buf, 0, len, start);
+        } finally {
+          closeSync(fd);
+        }
+        text = buf.toString("utf8");
+        // Drop the partial first line when we started mid-file.
+        if (start > 0) {
+          const nl = text.indexOf("\n");
+          if (nl >= 0) text = text.slice(nl + 1);
+        }
+      }
       lines = text.split("\n").slice(-200);
     }
     res.json({ tag: vol.tag, lines });
