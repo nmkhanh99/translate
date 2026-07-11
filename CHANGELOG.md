@@ -1,5 +1,60 @@
 # Changelog
 
+## 2026-07-11 (chiều — pipeline dịch + màn chi tiết run)
+
+### Added
+
+- **Stage "review" (đã dịch xong chữ nhưng CHƯA sạch layout).** `_status` giờ chỉ
+  trả "done" khi mọi trang defect ≥ medium đã được sửa/accepted; còn lại là
+  "review" kèm số `defects`. Trước đây "done" chỉ nghĩa "đã vision review hết",
+  che giấu các trang lỗi (vd v1 hiện ra **111 trang cần sửa**).
+- **Vòng auto-fix trong Workflow dịch.** Sau Vision, `translate_volume.js` lặp
+  (tối đa 2 vòng): lấy trang defect → rút gọn bản dịch tràn khung (agent) →
+  re-apply → **chỉ re-vision đúng các trang vừa sửa** → tới khi hết defect. Trang
+  không hội tụ giữ nguyên → stage "review" (trung thực, không auto-accept).
+  Thêm helper `page-segments`, `merge-fix`, và chế độ `vis-pages ... <only>`.
+- **Màn chi tiết run riêng (`/run?tag=`).** Bấm một dòng trong Hàng đợi → mở màn
+  chi tiết: tiến độ từng stage (Dịch / Rà soát / Soát layout), số trang defect,
+  và **log hoạt động trực tiếp** (full, auto-scroll). Có nút Dừng / Chạy để sửa /
+  Đọc song song.
+
+### Fixed
+
+- **Daemon tính sai tổng số trang.** `pythonStatus` lấy `pages` từ số ảnh
+  `pair_*.png` khi `layout.pdf` (đường dẫn tương đối) không `existsSync` được từ
+  cwd của daemon → đếm dư (650 vs 624 trang) khiến volume kẹt ở "vision". Giờ ưu
+  tiên `state.json.vision[1]` (nguồn chuẩn từ python cmd_status).
+
+### Technical
+
+- `defectPages()` (daemon) mirror `_defect_pages` (python) để phân biệt "reviewed"
+  với "sạch layout" mà không spawn python. Volume "review" được `pendingTags`
+  coi là còn việc → batch tự chạy lại để sửa.
+
+### Fixed (sau Codex review — 9 findings)
+
+- **[High] Fix bị mất khi chạy lại / apply-all.** Auto-fix giờ ghi override theo
+  **segment id** vào `fixes.json` (không sửa `text2vi`), và `apply` ưu tiên
+  `fixes[id]` → sống sót qua `merge-tr`/`merge-vr`/`apply-all`.
+- **[High] Sửa 1 trang đổi luôn trang khác cùng chuỗi EN.** Vì override theo id
+  (per-occurrence), chỉ đúng đoạn trên trang lỗi đổi → việc "chỉ re-vision trang
+  vừa sửa" (only=csv) trở nên ĐÚNG (trước đây có thể 'done' với trang chưa soát).
+- **[High] Rút gọn cả công thức/bảng.** Prompt fix chỉ rút gọn đoạn văn xuôi
+  ĐANG tràn, giữ nguyên đoạn đã gọn + mọi số/công thức/thuật ngữ; lỗi phi-văn-bản
+  giữ "review" trung thực (không sửa ẩu).
+- **[High] "Chạy để sửa" có thể bị đánh 'done' giả.** `codexDone()` không còn
+  ghi đè khi stage='review' (còn defect).
+- **[Medium] Resume 'review' re-vision cả cuốn.** Fast-path `stage:"review"` bỏ
+  qua translate/verify/apply + vision toàn bộ, vào thẳng vòng fix trên checkpoint.
+- **[Medium] 'done' giả khi thiếu review_issues.json.** Gate 'done' phải có
+  `review_issues.json` (merge-vis đã chạy) — cả python `_status` lẫn daemon.
+- **[Medium] Enter/Space từ nút con nhảy sang trang chi tiết.** onKeyDown chỉ
+  kích hoạt khi `e.target === e.currentTarget`.
+- **[Medium] Ảnh bìa spawn Python mỗi request, chặn daemon.** `/api/page` cache
+  ra đĩa theo (file, mtime, page, dpi) — lần 2 nhanh ~200× (0.67s → 0.003s).
+- **[Low] review-summary lệch ngưỡng với status.** Dùng chung `FIX_SEV`, báo lỗi
+  'low' riêng (không chặn 'done').
+
 ## 2026-07-11
 
 ### Added

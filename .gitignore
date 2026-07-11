@@ -28,6 +28,7 @@ package-lock.json
 tool/work/
 **/*.cache.json
 tool/dashboard.json
+tool/pagecache/
 tool/chat.sqlite
 tool/chat.sqlite-shm
 tool/chat.sqlite-wal

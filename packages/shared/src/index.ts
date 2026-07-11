@@ -71,6 +71,8 @@ export interface Volume {
   sid?: string;
   mode?: string;
   rc?: number | null;
+  /** Số trang còn lỗi layout cần fix (kind 'defect' >= medium, chưa accepted). */
+  defects?: number;
 }
 
 export interface StatusResponse {

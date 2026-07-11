@@ -3,16 +3,19 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { basename, extname, join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import type { AppConfig, Volume } from "@cfa-translate/shared";
 import {
   INPUT_DIR,
   MANIFEST,
   OUTPUT_DIR,
   USER_WORK,
+  TOOL_DIR,
   pythonBin,
   PYTHON_DIR,
 } from "./paths.js";
@@ -141,6 +144,31 @@ function countFiles(dir: string, re: RegExp): number {
   }
 }
 
+const SEV_RANK: Record<string, number> = { high: 3, medium: 2, low: 1 };
+
+/**
+ * Mirror python agent_pipeline._defect_pages — trang còn LỖI CẦN FIX (kind
+ * 'defect', >= medium, chưa accepted) từ review_issues.json. Dùng để phân biệt
+ * "đã review xong" với "đã sạch layout".
+ */
+export function defectPages(workdir: string, minSev = "medium"): number[] {
+  const thr = SEV_RANK[minSev] || 1;
+  const issues = readJson(join(workdir, "review_issues.json"));
+  const acceptedRaw = readJson(join(workdir, "accepted.json"));
+  const accepted = new Set<number>(
+    Array.isArray(acceptedRaw?.pages) ? (acceptedRaw!.pages as number[]) : []
+  );
+  const arr = Array.isArray(issues) ? (issues as Record<string, unknown>[]) : [];
+  const pages = new Set<number>();
+  for (const x of arr) {
+    const kind = (x.kind as string) || "defect";
+    const sev = SEV_RANK[(x.severity as string) || "low"] || 1;
+    const page = x.page as number;
+    if (kind !== "fit" && sev >= thr && !accepted.has(page)) pages.add(page);
+  }
+  return [...pages].sort((a, b) => a - b);
+}
+
 /**
  * Mirror python agent_pipeline._status — pure filesystem, no Python spawn
  * (fast enough for 3s UI poll of many volumes).
@@ -150,6 +178,7 @@ export function pythonStatus(workdir: string): {
   translate?: [number, number];
   verify?: [number, number];
   vision?: [number, number];
+  defects?: number;
 } {
   const c = countFiles(join(workdir, "chunks"), /^c_.*\.json$/i);
   const co = countFiles(join(workdir, "out"), /^c_.*\.json$/i);
@@ -158,26 +187,29 @@ export function pythonStatus(workdir: string): {
   const pairs = countFiles(join(workdir, "review"), /^pair_.*\.png$/i);
   const vis = countFiles(join(workdir, "vis"), /^page_.*\.json$/i);
 
+  // Total page count. state.json (written by python cmd_status) is the
+  // authoritative source and is preferred FIRST — layout.json stores a pdf path
+  // relative to the python cwd, so existsSync() on it fails from the daemon and
+  // must not gate the page count. `pairs` is a last resort and can overcount
+  // when stale re-render PNGs linger (would wrongly keep a volume in 'vision').
   let pages: number | null = null;
-  const layout = readJson(join(workdir, "layout.json"));
-  if (layout && typeof layout.pdf === "string" && existsSync(layout.pdf)) {
-    // Prefer cached state.json pages if present (avoid opening PDF every poll)
-    const cached = readJson(join(workdir, "state.json"));
-    if (cached?.vision && Array.isArray(cached.vision) && cached.vision[1]) {
-      pages = Number(cached.vision[1]) || null;
-    } else if (pairs > 0) {
-      pages = pairs;
-    }
-  } else if (pairs > 0) {
-    pages = pairs;
+  const cached = readJson(join(workdir, "state.json"));
+  if (cached?.vision && Array.isArray(cached.vision) && cached.vision[1]) {
+    pages = Number(cached.vision[1]) || null;
   }
+  if (pages == null && pairs > 0) pages = pairs;
 
+  const defects = defectPages(workdir).length;
+  // 'done' chỉ khi review_issues.json đã ghi (merge-vis xong) — thiếu nghĩa là
+  // vision chưa chốt, tránh 'done' giả (mirror python _status).
+  const hasReview = existsSync(join(workdir, "review_issues.json"));
   let stage: string;
   if (c === 0 || co < c) stage = "translate";
   else if (vo < v || v === 0) stage = "verify";
-  else if (pages != null && vis < pages) stage = "vision";
+  else if (pages != null && (vis < pages || !hasReview)) stage = "vision";
   else if (c > 0 && co >= c && (v === 0 || vo >= v) && (pages == null || vis >= pages))
-    stage = "done";
+    // Đã review xong mọi trang: 'review' nếu còn defect chưa fix, ngược lại 'done'.
+    stage = defects > 0 ? "review" : "done";
   else stage = "vision";
 
   return {
@@ -185,6 +217,7 @@ export function pythonStatus(workdir: string): {
     translate: [co, c],
     verify: [vo, v],
     vision: [vis, pages ?? 0],
+    defects,
   };
 }
 
@@ -218,6 +251,25 @@ export function renderPagePng(
   page: number,
   dpi: number
 ): Buffer | null {
+  // Disk cache keyed by (source path, mtime, page, dpi). /api/page renders one
+  // page per spawnSync on the daemon's single thread; a library grid of covers
+  // would otherwise serialize dozens of ~1s Python spawns and stall status/log/
+  // run/stop. Rendering the SAME page again (invariant until the file changes)
+  // is served from cache — no spawn.
+  let cacheFile: string | null = null;
+  try {
+    const mtime = Math.floor(statSync(path).mtimeMs);
+    const key = createHash("sha1")
+      .update(`${path}|${mtime}|${page}|${dpi}`)
+      .digest("hex");
+    const dir = join(TOOL_DIR, "pagecache");
+    cacheFile = join(dir, key + ".png");
+    if (existsSync(cacheFile)) return readFileSync(cacheFile);
+    mkdirSync(dir, { recursive: true });
+  } catch {
+    cacheFile = null;
+  }
+
   const script = `
 import sys, fitz
 doc=fitz.open(sys.argv[1])
@@ -232,7 +284,15 @@ sys.stdout.buffer.write(doc[page].get_pixmap(dpi=dpi).tobytes("png"))
     timeout: 30000,
   });
   if (r.status !== 0 || !r.stdout) return null;
-  return r.stdout as Buffer;
+  const png = r.stdout as Buffer;
+  if (cacheFile) {
+    try {
+      writeFileSync(cacheFile, png);
+    } catch {
+      /* cache best-effort */
+    }
+  }
+  return png;
 }
 
 export function volumeToApi(
@@ -247,7 +307,9 @@ export function volumeToApi(
     /* ignore */
   }
   let stage = effectiveStage(st.stage, cfg);
-  if (codexDone(vol)) stage = "done";
+  // codexDone chỉ đánh 'done' khi KHÔNG còn defect layout — nếu vision đã phát
+  // hiện lỗi (stage 'review'), không được ghi đè thành 'done'.
+  if (codexDone(vol) && stage !== "review") stage = "done";
 
   const meta = loadRunMeta(vol.workdir) || {};
   return {
@@ -266,6 +328,7 @@ export function volumeToApi(
     sid: typeof meta.sid === "string" ? meta.sid : undefined,
     mode: typeof meta.mode === "string" ? meta.mode : undefined,
     rc: typeof meta.rc === "number" ? meta.rc : null,
+    defects: st.defects,
     // Total page count when known (st.vision = [reviewed, totalPages]); lets the
     // Home/Library UI show real page totals for completed volumes.
     pages: st.vision && st.vision[1] ? st.vision[1] : undefined,

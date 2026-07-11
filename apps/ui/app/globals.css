@@ -356,6 +356,9 @@ select.input { appearance: none; cursor: pointer;
   align-items: center; gap: var(--space-4); padding: var(--space-4);
   border-top: 1px solid var(--border-soft); }
 .job-mid { min-width: 0; }
+.job-click { cursor: pointer; transition: background var(--motion-fast) var(--ease-standard); }
+.job-click:hover { background: var(--row-hover); }
+.job-click:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 /* Fixed trailing slot so every progress track ends at the same x whether or not
    the row shows a percentage. */
 .job-pct { min-width: 32px; text-align: right; font-size: var(--text-xs); flex: none; }
@@ -375,6 +378,12 @@ select.input { appearance: none; cursor: pointer;
   .job { grid-template-columns: minmax(0, 1fr) auto; }
   .job-mid { grid-column: 1 / -1; }
 }
+
+/* ── Run detail log ───────────────────────────────────────────────────── */
+.log-panel { margin: 0; padding: var(--space-4); max-height: 52vh; overflow: auto;
+  font-family: var(--font-mono); font-size: 11px; line-height: 1.55;
+  white-space: pre-wrap; word-break: break-word; color: var(--muted);
+  background: var(--row-hover); border-top: 1px solid var(--border-soft); }
 
 /* ── Tables ───────────────────────────────────────────────────────────── */
 .ds-table { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
@@ -431,6 +440,9 @@ select.input { appearance: none; cursor: pointer;
 .doc-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
   overflow: hidden; transition: box-shadow var(--motion-fast) var(--ease-standard); }
 .doc-card:hover { box-shadow: var(--elev-raised); }
+.doc-card-link { cursor: pointer; }
+.doc-card-link:hover { border-color: var(--muted); }
+.doc-card-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .doc-card .body { padding: var(--space-3) var(--space-4) var(--space-4); }
 .doc-card .body h3 { font-size: var(--text-base); }
 

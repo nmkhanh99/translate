@@ -146,38 +146,74 @@ def cmd_merge_vr(workdir):
 
 def cmd_apply(pdf, workdir, out):
     text2vi = _load(_wd(workdir, "text2vi.json"), {})
+    # fixes.json = override RÚT GỌN theo SEGMENT ID (ưu tiên cao nhất). Khoá theo
+    # id (không phải EN) nên chỉ đổi đúng đoạn trên trang bị lỗi — các trang khác
+    # dùng cùng chuỗi EN KHÔNG bị ảnh hưởng (điều kiện để only-vision hợp lệ) — và
+    # sống sót qua merge-tr/merge-vr/apply-all vì các bước đó chỉ ghi text2vi.
+    fixes = _load(_wd(workdir, "fixes.json"), {})
     doc = fitz.open(pdf)
     segs, layout = pdf_core.extract_segments(doc, "all")
-    trans = {l["id"]: text2vi.get(s["text"], "") for s, l in zip(segs, layout)}
-    miss = sum(1 for s in segs if not text2vi.get(s["text"]))
+    trans = {l["id"]: (fixes.get(l["id"]) or text2vi.get(s["text"], ""))
+             for s, l in zip(segs, layout)}
+    miss = sum(1 for s, l in zip(segs, layout)
+               if not (fixes.get(l["id"]) or text2vi.get(s["text"])))
     applied, m = pdf_core.apply_translations(doc, layout, trans)
     os.makedirs(os.path.dirname(out), exist_ok=True)
     doc.save(out, garbage=4, deflate=True)
-    print(f"applied={applied} missing={miss} -> {out}")
+    print(f"applied={applied} missing={miss} fixes={len(fixes)} -> {out}")
 
 
 def _count(workdir, sub, pat):
     return len(glob.glob(_wd(workdir, sub, pat)))
 
 
+_SEV = {"high": 3, "medium": 2, "low": 1}
+# Ngưỡng "phải sửa" dùng thống nhất cho gate trạng thái + vòng auto-fix: defect
+# >= medium (kind != fit, chưa accepted) mới chặn 'done'. 'fit' và 'low' được coi
+# là đánh đổi chấp nhận được nên không chặn (tránh kẹt vòng vô hạn vì lỗi vặt).
+FIX_SEV = "medium"
+
+
+def _defect_pages(workdir, min_sev="medium"):
+    """Danh sách trang còn LỖI CẦN FIX: kind 'defect' (không phải 'fit'), >= mức
+    nghiêm trọng, và KHÔNG nằm trong accepted.json (won't-fix). Nguồn sự thật =
+    review_issues.json (đã merge từ vision)."""
+    thr = _SEV.get(min_sev, 1)
+    issues = _load(_wd(workdir, "review_issues.json"), [])
+    accepted = set(_load(_wd(workdir, "accepted.json"), {}).get("pages", []))
+    return sorted({x["page"] for x in issues
+                   if x.get("kind", "defect") != "fit"
+                   and _SEV.get(x.get("severity", "low"), 1) >= thr
+                   and x["page"] not in accepted})
+
+
 def _status(workdir):
-    """Tính tiến độ từng stage (nguồn sự thật = các file). Không in."""
+    """Tính tiến độ từng stage (nguồn sự thật = các file). Không in.
+    Stage 'review' = đã vision xong nhưng CÒN defect chưa fix -> 'done' CHỈ khi
+    mọi defect >= medium đã được sửa/accepted."""
     c, co = _count(workdir, "chunks", "c_*.json"), _count(workdir, "out", "c_*.json")
     v, vo = _count(workdir, "vchunks", "v_*.json"), _count(workdir, "vout", "v_*.json")
     pairs = _count(workdir, "review", "pair_*.png")
     vis = _count(workdir, "vis", "page_*.json")
     layout = _load(_wd(workdir, "layout.json"), {})
     pages = fitz.open(layout["pdf"]).page_count if layout.get("pdf") and os.path.exists(layout.get("pdf", "")) else None
+    defects = _defect_pages(workdir, FIX_SEV)
+    # 'done' chỉ khi review_issues.json ĐÃ được ghi (merge-vis chạy xong) — nếu
+    # thiếu (vd crash sau khi ghi các vis/page_*.json nhưng trước merge-vis) thì
+    # coi như vision chưa chốt, tránh 'done' giả với defect chưa gộp.
+    has_review = os.path.exists(_wd(workdir, "review_issues.json"))
     if c == 0 or co < c:
         stage = "translate"
     elif vo < v or v == 0:
         stage = "verify"
-    elif pages is not None and vis < pages:
+    elif pages is not None and (vis < pages or not has_review):
         stage = "vision"
+    elif defects:
+        stage = "review"
     else:
         stage = "done"
     return {"stage": stage, "translate": [co, c], "verify": [vo, v],
-            "vision": [vis, pages], "pairs": pairs}
+            "vision": [vis, pages], "pairs": pairs, "defects": len(defects)}
 
 
 def cmd_status(workdir, write=True):
@@ -244,23 +280,34 @@ def cmd_batch_status(manifest):
     print(f"done {done}/{len(real)} (bỏ {len(vols)-len(real)} skip)")
 
 
-def cmd_vis_pages(pdf, out, workdir, dpi=130):
+def cmd_vis_pages(pdf, out, workdir, dpi=130, only=None):
     """Render ảnh ghép gốc|dịch (trang còn thiếu PNG, HOẶC PNG đã CŨ hơn file đích
     -> apply sau đã ghi đè PDF -> ảnh cache stale) và liệt kê trang chưa review
     (chưa có vis/page_XXX.json) -> vis_todo.json. Resume-safe per-page.
     PNG stale kéo theo xoá luôn verdict vis/page_XXX.json cũ (nếu có) vì nó được
-    chấm trên ảnh sai -> trang tự động vào lại todo để review lại đúng bản mới."""
+    chấm trên ảnh sai -> trang tự động vào lại todo để review lại đúng bản mới.
+
+    only=CSV: CHỈ xử lý các trang đó (dùng cho vòng auto-fix). apply ghi đè CẢ
+    file đích nên MỌI png thành stale; nếu không giới hạn, mỗi vòng fix sẽ render
+    lại + review lại toàn bộ volume. Các trang không-fix nội dung KHÔNG đổi nên
+    verdict cũ vẫn đúng -> chỉ re-render + re-review đúng trang vừa sửa."""
     rev, visd = _wd(workdir, "review"), _wd(workdir, "vis")
     os.makedirs(rev, exist_ok=True)
     os.makedirs(visd, exist_ok=True)
+    only_set = None
+    if only:
+        only_set = {int(x) for x in str(only).split(",") if x.strip().lstrip("-").isdigit()}
     src, vi = fitz.open(pdf), fitz.open(out)
     out_mtime = os.path.getmtime(out)
     m = fitz.Matrix(dpi / 72, dpi / 72)
     gap, rendered, invalidated, todo = 20, 0, 0, []
     for i in range(src.page_count):
+        if only_set is not None and i not in only_set:
+            continue
         png = _wd(rev, f"pair_{i:03d}.png")
         vjson = _wd(visd, f"page_{i:03d}.json")
-        stale = os.path.exists(png) and os.path.getmtime(png) < out_mtime
+        # only-mode: trang vừa fix -> LUÔN render lại + bỏ verdict cũ.
+        stale = (os.path.exists(png) and os.path.getmtime(png) < out_mtime) or only_set is not None
         if not os.path.exists(png) or stale:
             p1, p2 = src[i].get_pixmap(matrix=m), vi[i].get_pixmap(matrix=m)
             W, H = p1.width + gap + p2.width, max(p1.height, p2.height)
@@ -295,20 +342,11 @@ def cmd_merge_vis(workdir):
     return issues
 
 
-_SEV = {"high": 3, "medium": 2, "low": 1}
-
-
-def cmd_problems(workdir, min_sev="low"):
+def cmd_problems(workdir, min_sev=FIX_SEV):
     """In JSON các trang còn LỖI CẦN FIX = kind 'defect', >= mức nghiêm trọng, và
     KHÔNG nằm trong accepted.json (đã đánh dấu won't-fix). Lỗi kind 'fit' (co/nhồi
     chữ cho vừa layout) bị loại -> vòng lặp hội tụ. Rỗng = trang đã ổn."""
-    thr = _SEV.get(min_sev, 1)
-    issues = _load(_wd(workdir, "review_issues.json"), [])
-    accepted = set(_load(_wd(workdir, "accepted.json"), {}).get("pages", []))
-    pages = sorted({x["page"] for x in issues
-                    if x.get("kind", "defect") != "fit"
-                    and _SEV.get(x.get("severity", "low"), 1) >= thr
-                    and x["page"] not in accepted})
+    pages = _defect_pages(workdir, min_sev)
     print(json.dumps(pages))
     return pages
 
@@ -336,7 +374,7 @@ def cmd_revision(workdir, pages):
     và review lại ĐÚNG những trang này — không đụng trang khác.
     pages='problems' -> lấy mọi trang có lỗi (>=medium); hoặc danh sách '3,5,7'."""
     if str(pages) == "problems":
-        idxs = cmd_problems(workdir, "low")
+        idxs = cmd_problems(workdir, FIX_SEV)
     else:
         idxs = [int(p) for p in str(pages).split(",") if p.strip().lstrip("-").isdigit()]
     removed = 0
@@ -350,18 +388,78 @@ def cmd_revision(workdir, pages):
     return idxs
 
 
+def cmd_page_segments(pdf, workdir, pages_csv):
+    """Ghi fix/page_XXX.json = [{id,en,vi}] cho các đoạn TRÊN những trang cần sửa
+    (để agent rút gọn bản dịch bị tràn khung). In JSON list trang có nội dung."""
+    idxs = {int(x) for x in str(pages_csv).split(",") if x.strip().lstrip("-").isdigit()}
+    doc = fitz.open(pdf)
+    segs, layout = pdf_core.extract_segments(doc, "all")
+    id2en = {s["id"]: s["text"] for s in segs}
+    text2vi = _load(_wd(workdir, "text2vi.json"), {})
+    fixes = _load(_wd(workdir, "fixes.json"), {})
+    fixd = _wd(workdir, "fix")
+    os.makedirs(fixd, exist_ok=True)
+    os.makedirs(_wd(workdir, "fixout"), exist_ok=True)
+    written = []
+    for p in sorted(idxs):
+        items = []
+        for l in layout:
+            if l["page"] != p:
+                continue
+            en = id2en.get(l["id"], "")
+            # Bản vi HIỆN HÀNH = override fix (nếu có) rồi mới tới text2vi — để
+            # agent thấy đúng bản đang hiển thị và rút gọn tiếp nếu vẫn tràn.
+            vi = fixes.get(l["id"]) or text2vi.get(en, "")
+            if en and vi:
+                items.append({"id": l["id"], "en": en, "vi": vi})
+        if items:
+            json.dump(items, open(_wd(fixd, f"page_{p:03d}.json"), "w"), ensure_ascii=False)
+            written.append(p)
+    print(json.dumps(written))
+    return written
+
+
+def cmd_merge_fix(workdir):
+    """Gộp bản dịch RÚT GỌN từ fixout/page_XXX.json ({id: vi_ngắn}) vào
+    fixes.json — override theo SEGMENT ID (KHÔNG đụng text2vi, nên không đổi bản
+    dịch của cùng chuỗi EN trên các trang khác). Xoá fix/ + fixout/ sau khi gộp.
+    Chỉ ghi khi vi_ngắn KHÁC bản hiện tại để tránh churn không cần thiết."""
+    fixes = _load(_wd(workdir, "fixes.json"), {})
+    n = 0
+    for f in glob.glob(_wd(workdir, "fix", "page_*.json")):
+        outf = _wd(workdir, "fixout", os.path.basename(f))
+        if not os.path.exists(outf):
+            continue
+        try:
+            cur = {it["id"]: it.get("vi", "") for it in json.load(open(f, encoding="utf-8"))}
+            short = json.load(open(outf, encoding="utf-8"))
+        except Exception:
+            continue
+        for cid, vi in short.items():
+            if cid in cur and vi and vi != cur[cid]:
+                fixes[cid] = vi
+                n += 1
+    json.dump(fixes, open(_wd(workdir, "fixes.json"), "w"), ensure_ascii=False)
+    shutil.rmtree(_wd(workdir, "fix"), ignore_errors=True)
+    shutil.rmtree(_wd(workdir, "fixout"), ignore_errors=True)
+    print(f"fixes_applied={n} total_overrides={len(fixes)}")
+    return n
+
+
 def cmd_review_summary(workdir):
-    """Tổng quan review 1 volume: defect (cần fix) vs fit (chấp nhận) vs accepted.
-    defect=0 nghĩa là đã hội tụ (mọi lỗi còn lại đều là đánh đổi chấp nhận được)."""
+    """Tổng quan review 1 volume. 'Hội tụ' bám ĐÚNG ngưỡng chặn 'done' của status
+    (defect >= FIX_SEV, chưa accepted) — lỗi 'low' báo riêng, không chặn."""
     issues = _load(_wd(workdir, "review_issues.json"), [])
     accepted = set(_load(_wd(workdir, "accepted.json"), {}).get("pages", []))
-    defects = [x for x in issues
-               if x.get("kind", "defect") != "fit" and x["page"] not in accepted]
+    dp = _defect_pages(workdir, FIX_SEV)   # trang chặn 'done' (>= medium)
+    low = sorted({x["page"] for x in issues
+                  if x.get("kind", "defect") != "fit"
+                  and _SEV.get(x.get("severity", "low"), 1) < _SEV[FIX_SEV]
+                  and x["page"] not in accepted})
     fit = [x for x in issues if x.get("kind") == "fit"]
-    dp = sorted({x["page"] for x in defects})
-    print(f"defect(cần fix)={len(defects)} ở trang {dp} | "
-          f"fit(chấp nhận)={len(fit)} | accepted={sorted(accepted)} | "
-          f"{'ĐÃ HỘI TỤ ✓' if not dp else 'còn việc'}")
+    print(f"defect cần fix (>= {FIX_SEV})={len(dp)} ở trang {dp} | "
+          f"low(không chặn)={len(low)} | fit(chấp nhận)={len(fit)} | "
+          f"accepted={sorted(accepted)} | {'ĐÃ HỘI TỤ ✓' if not dp else 'còn việc'}")
     return dp
 
 
@@ -401,14 +499,16 @@ if __name__ == "__main__":
         "merge-vr": lambda: cmd_merge_vr(a[0]),
         "apply": lambda: cmd_apply(a[0], a[1], a[2]),
         "status": lambda: cmd_status(a[0]),
-        "vis-pages": lambda: cmd_vis_pages(a[0], a[1], a[2]),
+        "vis-pages": lambda: cmd_vis_pages(a[0], a[1], a[2], only=(a[3] if len(a) > 3 else None)),
         "merge-vis": lambda: cmd_merge_vis(a[0]),
         "pending": lambda: cmd_pending(a[0], a[1], *(a[2:4] if len(a) > 3 else [])),
         "volumes": lambda: cmd_volumes(a[0]),
         "batch-status": lambda: cmd_batch_status(a[0]),
         "apply-all": lambda: cmd_apply_all(a[0]),
-        "problems": lambda: cmd_problems(a[0], a[1] if len(a) > 1 else "low"),
+        "problems": lambda: cmd_problems(a[0], a[1] if len(a) > 1 else FIX_SEV),
         "revision": lambda: cmd_revision(a[0], a[1]),
+        "page-segments": lambda: cmd_page_segments(a[0], a[1], a[2]),
+        "merge-fix": lambda: cmd_merge_fix(a[0]),
         "accept": lambda: cmd_accept(a[0], a[1], a[2] if len(a) > 2 else ""),
         "review-summary": lambda: cmd_review_summary(a[0]),
     }[cmd]()

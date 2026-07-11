@@ -139,10 +139,13 @@ export function pageImg(tag: string, which: "source" | "out", page0: number, dpi
 // ---- derived helpers (ported from the old app.js) ----
 import type { Volume } from "./types";
 
-export function volClass(v: Volume): "done" | "error" | "active" | "draft" {
+export function volClass(
+  v: Volume
+): "done" | "error" | "active" | "draft" | "review" {
   if (v.stage === "done") return "done";
   if (v.stage === "error") return "error";
   if (v.running) return "active";
+  if (v.stage === "review") return "review";
   const t = v.translate || [0, 0];
   if (t[0] > 0) return "active";
   return "draft";
@@ -179,7 +182,9 @@ export function stageLabel(stage: string): string {
   const m: Record<string, string> = {
     translate: "Đang dịch",
     verify: "Đang rà soát",
-    vision: "Đang xử lý ảnh/công thức",
+    vision: "Đang soát layout",
+    fix: "Đang sửa layout tràn khung",
+    review: "Cần sửa layout",
     done: "Hoàn tất",
     error: "Lỗi",
   };

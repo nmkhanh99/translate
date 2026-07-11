@@ -7,6 +7,7 @@ export const meta = {
     { title: 'Verify', detail: 'đối chiếu số/bỏ sót vs bản Anh, sửa vào cache' },
     { title: 'Apply', detail: 'ghi đè giữ layout -> file đích' },
     { title: 'Vision', detail: 'review layout từng trang còn thiếu vis/' },
+    { title: 'Fix', detail: 'rút gọn bản dịch tràn khung -> re-apply -> re-vision tới khi hết defect' },
   ],
 }
 
@@ -32,15 +33,40 @@ const STYLE =
   'GIỮ NGUYÊN thuật ngữ tiếng Anh trong ngoặc đơn ở lần xuất hiện đầu, ví dụ "lãi suất chiết khấu (discount rate)". ' +
   'GIỮ NGUYÊN mọi con số, ký hiệu, công thức, mã (LOS, §). KHÔNG bỏ sót ý. Không thêm lời bình.'
 
+const pad = p => String(p).padStart(3, '0')
+
+// Prompt review layout 1 trang (ảnh ghép gốc|dịch) -> ghi vis/page_XXX.json.
+// Dùng cho cả vision lần đầu lẫn re-vision trong vòng auto-fix.
+const visPrompt = (WD, p) =>
+  `Mở ảnh ghép bằng tool Read trên đường dẫn: ${WD}/review/pair_${pad(p)}.png. ` +
+  `Bên TRÁI là trang gốc tiếng Anh, bên PHẢI là bản dịch tiếng Việt (cùng layout). ` +
+  `So sánh layout. Chỉ soi lỗi LAYOUT/hiển thị, KHÔNG chấm chất lượng dịch.\n` +
+  `PHÂN LOẠI mỗi lỗi bằng "kind":\n` +
+  `• "fit" = chữ Việt co nhỏ/nhồi sát/giãn dòng khác bản gốc để vừa khung NHƯNG nội dung ĐỦ và ĐỌC ĐƯỢC ` +
+  `(đánh đổi chấp nhận được, KHÔNG cần fix).\n` +
+  `• "defect" = lỗi thật cần fix: MẤT/CẮT nội dung, chữ đè chồng không đọc được, công thức/phân số vỡ, ` +
+  `bảng/checkbox vỡ, highlight/đồ thị lệch, header hỏng.\n` +
+  `NHIỆM VỤ DUY NHẤT: dùng tool Write ghi ra file ${WD}/vis/page_${pad(p)}.json một MẢNG JSON các lỗi. ` +
+  `Mỗi lỗi {"page": ${p}, "kind": "fit|defect", "severity": "high|medium|low", "detail": "..."}. ` +
+  `Trang ổn thì ghi []. File này là checkpoint resume — BẮT BUỘC phải ghi. Không in gì khác.`
+
+// Số vòng auto-fix tối đa (rút gọn bản dịch tràn khung -> re-apply -> re-vision).
+const MAX_FIX_ROUNDS = 2
+
 // ===== Dịch trọn 1 volume (mỗi phase chỉ làm unit còn thiếu output) =====
 async function runVolume(V) {
   const PDF = V.pdf, WD = V.workdir, OUT = V.out, VISION = V.vision !== false
   const tag = WD.split('/').pop()
   const onlyVision = V.only === 'vision'   // bỏ qua translate/verify/apply (đã current)
-  let ap = 'skipped (only=vision)'
+  // Resume ở stage 'review': translate/verify/vision đã xong, chỉ còn defect ->
+  // NHẢY THẲNG vào vòng auto-fix, KHÔNG re-apply/re-vision cả cuốn (apply ghi đè
+  // OUT khiến mọi ảnh pair stale -> vision lại toàn bộ). Dùng checkpoint sẵn có.
+  const reviewOnly = V.stage === 'review'
+  const skipTranslate = onlyVision || reviewOnly
+  let ap = reviewOnly ? 'skipped (review resume)' : 'skipped (only=vision)'
 
   // -- Translate --
-  if (!onlyVision) {
+  if (!skipTranslate) {
   phase('Translate')
   await sh(`${PY} chunk "${PDF}" "${WD}"`, `${tag}:chunk`)
   const pend = parseList(await sh(`${PY} pending "${WD}" translate`, `${tag}:scan-tr`))
@@ -78,36 +104,66 @@ async function runVolume(V) {
   // -- Vision -- (theo CỬA SỔ nhỏ: pending chỉ trả số trang trong [w,w+STEP),
   // tránh shuttle JSON lớn qua agent rồi mất dữ liệu)
   let vis = 'skipped'
-  if (VISION) {
-    phase('Vision')
-    await sh(`${PY} vis-pages "${PDF}" "${OUT}" "${WD}"`, `${tag}:render`)
-    let total = 0
-    try { total = (JSON.parse(await sh(`${PY} status "${WD}"`, `${tag}:total`)).vision || [0, 0])[1] || 0 } catch {}
-    const lo0 = V.visFrom || 0
-    const hi0 = V.visTo != null ? V.visTo : total
-    const STEP = 30, pad = p => String(p).padStart(3, '0')
-    let reviewed = 0
-    for (let w = lo0; w < hi0; w += STEP) {
-      const hw = Math.min(w + STEP, hi0)
-      const pages = parseList(await sh(`${PY} pending "${WD}" vision ${w} ${hw}`, `${tag}:scan-vis ${w}`))
-      if (!pages.length) continue
-      reviewed += pages.length
-      await parallel(pages.map(p => () => agent(
-        `Mở ảnh ghép bằng tool Read trên đường dẫn: ${WD}/review/pair_${pad(p)}.png. ` +
-        `Bên TRÁI là trang gốc tiếng Anh, bên PHẢI là bản dịch tiếng Việt (cùng layout). ` +
-        `So sánh layout. Chỉ soi lỗi LAYOUT/hiển thị, KHÔNG chấm chất lượng dịch.\n` +
-        `PHÂN LOẠI mỗi lỗi bằng "kind":\n` +
-        `• "fit" = chữ Việt co nhỏ/nhồi sát/giãn dòng khác bản gốc để vừa khung NHƯNG nội dung ĐỦ và ĐỌC ĐƯỢC ` +
-        `(đánh đổi chấp nhận được, KHÔNG cần fix).\n` +
-        `• "defect" = lỗi thật cần fix: MẤT/CẮT nội dung, chữ đè chồng không đọc được, công thức/phân số vỡ, ` +
-        `bảng/checkbox vỡ, highlight/đồ thị lệch, header hỏng.\n` +
-        `NHIỆM VỤ DUY NHẤT: dùng tool Write ghi ra file ${WD}/vis/page_${pad(p)}.json một MẢNG JSON các lỗi. ` +
-        `Mỗi lỗi {"page": ${p}, "kind": "fit|defect", "severity": "high|medium|low", "detail": "..."}. ` +
-        `Trang ổn thì ghi []. File này là checkpoint resume — BẮT BUỘC phải ghi. Không in gì khác.`,
-        { label: `${tag} vis:${p}`, phase: 'Vision' })))
+  if (VISION || reviewOnly) {
+    // Bỏ qua vision lần đầu khi resume review (checkpoint đã đủ) -> vào fix loop.
+    if (!reviewOnly) {
+      phase('Vision')
+      await sh(`${PY} vis-pages "${PDF}" "${OUT}" "${WD}"`, `${tag}:render`)
+      let total = 0
+      try { total = (JSON.parse(await sh(`${PY} status "${WD}"`, `${tag}:total`)).vision || [0, 0])[1] || 0 } catch {}
+      const lo0 = V.visFrom || 0
+      const hi0 = V.visTo != null ? V.visTo : total
+      const STEP = 30
+      let reviewed = 0
+      for (let w = lo0; w < hi0; w += STEP) {
+        const hw = Math.min(w + STEP, hi0)
+        const pages = parseList(await sh(`${PY} pending "${WD}" vision ${w} ${hw}`, `${tag}:scan-vis ${w}`))
+        if (!pages.length) continue
+        reviewed += pages.length
+        await parallel(pages.map(p => () => agent(
+          visPrompt(WD, p), { label: `${tag} vis:${p}`, phase: 'Vision' })))
+      }
+      log(`[${tag}] vision: đã review ${reviewed} trang [${lo0}..${hi0})`)
+      vis = await sh(`${PY} merge-vis "${WD}"`, `${tag}:merge-vis`)
     }
-    log(`[${tag}] vision: đã review ${reviewed} trang [${lo0}..${hi0})`)
-    vis = await sh(`${PY} merge-vis "${WD}"`, `${tag}:merge-vis`)
+
+    // -- Auto-fix -- CHỈ rút gọn đoạn văn xuôi bị TRÀN khung (>=medium defect),
+    // re-apply rồi CHỈ re-vision đúng những trang đó, lặp tới khi hết defect hoặc
+    // hết số vòng. Lỗi phi-văn-bản (công thức/bảng/header vỡ) không rút gọn được
+    // -> giữ 'review' trung thực, KHÔNG tự accept. Override lưu theo segment id
+    // (fixes.json) nên trang khác dùng cùng chuỗi EN không bị đổi ngoài kiểm soát.
+    if (!onlyVision) {
+      phase('Fix')
+      for (let round = 1; round <= MAX_FIX_ROUNDS; round++) {
+        const bad = parseList(await sh(`${PY} problems "${WD}" medium`, `${tag}:problems ${round}`))
+        if (!bad.length) { log(`[${tag}] auto-fix: hết defect ✓`); break }
+        const csv = bad.join(',')
+        log(`[${tag}] auto-fix vòng ${round}/${MAX_FIX_ROUNDS}: ${bad.length} trang defect`)
+        const fpages = parseList(await sh(`${PY} page-segments "${PDF}" "${WD}" ${csv}`, `${tag}:fix-prep ${round}`))
+        if (fpages.length) {
+          await parallel(fpages.map(p => () => agent(
+            `Một số đoạn văn xuôi tiếng Việt trên trang ${p} đang TRÀN/vỡ khung layout vì dài hơn bản Anh. ` +
+            `Đọc file JSON ${WD}/fix/page_${pad(p)}.json (mảng {id, en, vi}).\n` +
+            `Với MỖI mục: nếu 'vi' DÀI gây tràn thì RÚT GỌN cho súc tích (~15–25% ngắn hơn, bỏ từ thừa, ` +
+            `diễn đạt gọn) NHƯNG GIỮ ĐỦ Ý và GIỮ NGUYÊN mọi số/đơn vị/ký hiệu/công thức/thuật ngữ + cụm ` +
+            `"(English term)". Nếu 'vi' đã ngắn gọn hợp lý thì GIỮ NGUYÊN không đổi. KHÔNG bịa, KHÔNG bỏ ý.\n` +
+            `Ghi ra ${WD}/fixout/page_${pad(p)}.json dạng JSON {id: "bản vi"} cho MỌI id (kể cả id giữ nguyên). ` +
+            `Dùng tool Write. Chỉ ghi file, không in gì khác.`,
+            { label: `${tag} fix:${p}`, phase: 'Fix' })))
+        }
+        await sh(`${PY} merge-fix "${WD}"`, `${tag}:merge-fix ${round}`)
+        ap = await sh(`${PY} apply "${PDF}" "${WD}" "${OUT}"`, `${tag}:reapply ${round}`)
+        // re-render + re-vision CHỈ các trang vừa sửa (only=csv) — tránh review lại cả cuốn
+        await sh(`${PY} vis-pages "${PDF}" "${OUT}" "${WD}" ${csv}`, `${tag}:re-render ${round}`)
+        const reTodo = parseList(await sh(`${PY} pending "${WD}" vision`, `${tag}:re-scan ${round}`))
+        if (reTodo.length) {
+          await parallel(reTodo.map(p => () => agent(
+            visPrompt(WD, p), { label: `${tag} re-vis:${p}`, phase: 'Fix' })))
+        }
+        vis = await sh(`${PY} merge-vis "${WD}"`, `${tag}:re-merge-vis ${round}`)
+      }
+      log(`[${tag}] ${await sh(`${PY} review-summary "${WD}"`, `${tag}:review-summary`)}`)
+    }
   }
 
   const st = await sh(`${PY} status "${WD}"`, `${tag}:status`)

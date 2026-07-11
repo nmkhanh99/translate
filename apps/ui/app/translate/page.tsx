@@ -1,14 +1,15 @@
 "use client";
 import * as React from "react";
+import Link from "next/link";
 import { getStatus, uploadPdf, runVolume, pagesLabel } from "../../lib/api";
-import { useToast, useChat, useEngine } from "../../components/Providers";
+import { useToast, useEngine } from "../../components/Providers";
 import { EngineSwitch } from "../../components/EngineSwitch";
-import { IconUpload, IconChat } from "../../components/icons";
+import { Cover } from "../../components/Cover";
+import { IconUpload } from "../../components/icons";
 import type { Volume } from "../../lib/types";
 
 export default function Translate() {
   const toast = useToast();
-  const { openChat } = useChat();
   const { engine, setEngine, available } = useEngine();
   const [drag, setDrag] = React.useState(false);
   const [selected, setSelected] = React.useState<Volume | null>(null);
@@ -114,7 +115,7 @@ export default function Translate() {
           <section className="card">
             <div className="row-between wrap" style={{ gap: "var(--space-4)" }}>
               <div className="row" style={{ gap: "var(--space-4)" }}>
-                <div className="thumb" style={{ width: 48, flex: "none" }} />
+                <Cover tag={selected.tag} dpi={60} style={{ width: 48, flex: "none" }} />
                 <div>
                   <h3>{selected.display}</h3>
                   <div className="sub muted num" style={{ fontSize: "var(--text-xs)" }}>
@@ -123,18 +124,12 @@ export default function Translate() {
                 </div>
               </div>
               <div className="row" style={{ gap: "var(--space-2)" }}>
-                <button
+                <Link
                   className="btn btn-ghost btn-sm"
-                  onClick={() =>
-                    openChat({
-                      tag: selected.tag,
-                      display: selected.display,
-                      pages: selected.pages,
-                    })
-                  }
+                  href={"/document?tag=" + encodeURIComponent(selected.tag)}
                 >
-                  <IconChat /> Mở chat
-                </button>
+                  Mở chi tiết
+                </Link>
                 <button className="btn btn-primary" onClick={start}>
                   Bắt đầu dịch
                 </button>
@@ -156,8 +151,9 @@ export default function Translate() {
               Bấm <b>Bắt đầu dịch</b> để chạy headless; theo dõi ở <b>Hàng đợi</b>.
             </li>
             <li>
-              Cần hỏi/điều khiển AI theo cuốn cụ thể → bấm <b>Mở chat</b> hoặc nút
-              💬 trong Thư viện.
+              Cần hỏi/điều khiển AI theo cuốn cụ thể → mở <b>chi tiết tài liệu</b>
+              {" "}(bấm vào cuốn trong <b>Thư viện</b>, hoặc <b>Mở chi tiết</b> ở
+              trên) rồi bấm <b>Hỏi AI</b>.
             </li>
           </ol>
         </section>

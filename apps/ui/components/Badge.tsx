@@ -5,9 +5,14 @@ const MAP: Record<string, { cls: string; label: string }> = {
   active: { cls: "badge-accent", label: "Đang dịch" },
   draft: { cls: "", label: "Chưa dịch" },
   error: { cls: "badge-danger", label: "Lỗi" },
+  review: { cls: "badge-warn", label: "Cần sửa layout" },
 };
 
-export function Badge({ kind }: { kind: "done" | "active" | "draft" | "error" }) {
+export function Badge({
+  kind,
+}: {
+  kind: "done" | "active" | "draft" | "error" | "review";
+}) {
   const b = MAP[kind] || MAP.draft;
   return (
     <span className={"badge " + b.cls}>

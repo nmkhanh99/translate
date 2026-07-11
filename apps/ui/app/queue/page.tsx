@@ -1,6 +1,7 @@
 "use client";
 import * as React from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useStatus } from "../../lib/useStatus";
 import {
   volClass,
@@ -13,6 +14,7 @@ import {
   post,
 } from "../../lib/api";
 import { Badge } from "../../components/Badge";
+import { Cover } from "../../components/Cover";
 import { useToast } from "../../components/Providers";
 import type { Volume } from "../../lib/types";
 
@@ -21,6 +23,8 @@ type Kind = "active" | "starting" | "waiting" | "done" | "error";
 export default function Queue() {
   const s = useStatus(2000);
   const toast = useToast();
+  const router = useRouter();
+  const openRun = (t: string) => router.push("/run?tag=" + encodeURIComponent(t));
   // Tags the user just launched — shown as "đang khởi động" until the next
   // status poll confirms they are running (spawn + first status write lags a
   // few seconds, so without this the click looks like nothing happened). We
@@ -137,13 +141,13 @@ export default function Queue() {
             </span>
           </div>
           {active.map((v) => (
-            <Job key={v.tag} v={v} kind="active" act={act} launch={launch} />
+            <Job key={v.tag} v={v} kind="active" act={act} launch={launch} onOpen={openRun} />
           ))}
           {startingVols.map((v) => (
-            <Job key={v.tag} v={v} kind="starting" act={act} launch={launch} />
+            <Job key={v.tag} v={v} kind="starting" act={act} launch={launch} onOpen={openRun} />
           ))}
           {waitingRest.map((v) => (
-            <Job key={v.tag} v={v} kind="waiting" act={act} launch={launch} />
+            <Job key={v.tag} v={v} kind="waiting" act={act} launch={launch} onOpen={openRun} />
           ))}
           {queueCount === 0 && (
             <div style={{ padding: "var(--space-4)" }} className="muted">
@@ -155,10 +159,10 @@ export default function Queue() {
         <div className="panel">
           <div className="panel-head">Hoàn tất gần đây</div>
           {donev.map((v) => (
-            <Job key={v.tag} v={v} kind="done" act={act} launch={launch} />
+            <Job key={v.tag} v={v} kind="done" act={act} launch={launch} onOpen={openRun} />
           ))}
           {errRest.map((v) => (
-            <Job key={v.tag} v={v} kind="error" act={act} launch={launch} />
+            <Job key={v.tag} v={v} kind="error" act={act} launch={launch} onOpen={openRun} />
           ))}
           {!donev.length && !errRest.length && (
             <div style={{ padding: "var(--space-4)" }} className="muted">
@@ -232,13 +236,27 @@ function LogTail({ tag }: { tag: string }) {
   const last = nonEmpty[nonEmpty.length - 1] || "Đang khởi động…";
   if (open) {
     return (
-      <div className="logtail open" onClick={() => setOpen(false)} title="Ẩn log">
+      <div
+        className="logtail open"
+        onClick={(e) => {
+          e.stopPropagation();
+          setOpen(false);
+        }}
+        title="Ẩn log"
+      >
         {nonEmpty.slice(-40).join("\n") || "Chưa có log."}
       </div>
     );
   }
   return (
-    <div className="logtail" onClick={() => setOpen(true)} title="Bấm để xem log">
+    <div
+      className="logtail"
+      onClick={(e) => {
+        e.stopPropagation();
+        setOpen(true);
+      }}
+      title="Bấm để xem log"
+    >
       {last}
     </div>
   );
@@ -249,23 +267,48 @@ function Job({
   kind,
   act,
   launch,
+  onOpen,
 }: {
   v: Volume;
   kind: Kind;
   act: (fn: () => Promise<unknown>, ok: string) => void;
   launch: (tag: string, ok: string) => void;
+  onOpen: (tag: string) => void;
 }) {
   const p = volPct(v);
   return (
-    <div className="job">
+    <div
+      className="job job-click"
+      role="link"
+      tabIndex={0}
+      title="Xem chi tiết hoạt động"
+      onClick={() => onOpen(v.tag)}
+      onKeyDown={(e) => {
+        // Only when the row itself is focused — not a bubbling Enter/Space from
+        // an inner action button (those handle their own activation).
+        if (
+          (e.key === "Enter" || e.key === " ") &&
+          e.target === e.currentTarget
+        ) {
+          e.preventDefault();
+          onOpen(v.tag);
+        }
+      }}
+    >
       <div className="row" style={{ gap: "var(--space-3)", minWidth: 0 }}>
-        <div className="thumb" style={{ width: 40, flex: "none" }} />
+        <Cover tag={v.tag} dpi={60} style={{ width: 40, flex: "none" }} />
         <div style={{ minWidth: 0 }}>
           <div className="row" style={{ gap: "var(--space-2)" }}>
             <strong>{v.display}</strong>
             <Badge
               kind={
-                kind === "waiting" || kind === "starting" ? "draft" : volClass(v)
+                kind === "starting"
+                  ? "draft"
+                  : kind === "waiting"
+                  ? v.stage === "review"
+                    ? "review"
+                    : "draft"
+                  : volClass(v)
               }
             />
           </div>
@@ -306,7 +349,7 @@ function Job({
         {kind === "error" && <Track pct={p} cls="warn" />}
       </div>
 
-      <div className="job-actions">
+      <div className="job-actions" onClick={(e) => e.stopPropagation()}>
         {kind === "active" && (
           <button
             className="btn btn-secondary btn-sm"
@@ -323,9 +366,14 @@ function Job({
         {kind === "waiting" && (
           <button
             className="btn btn-primary btn-sm"
-            onClick={() => launch(v.tag, "Đang chạy (headless)")}
+            onClick={() =>
+              launch(
+                v.tag,
+                v.stage === "review" ? "Đang chạy để sửa layout" : "Đang chạy (headless)"
+              )
+            }
           >
-            Chạy ngay
+            {v.stage === "review" ? `Chạy để sửa (${v.defects || 0})` : "Chạy ngay"}
           </button>
         )}
         {kind === "done" && (

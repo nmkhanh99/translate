@@ -1,11 +1,13 @@
 "use client";
 import * as React from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useStatus } from "../../lib/useStatus";
 import { volClass, volPct, pagesLabel, runVolume } from "../../lib/api";
 import { Badge } from "../../components/Badge";
-import { IconSearch, IconChat } from "../../components/icons";
-import { useChat, useToast, useEngine } from "../../components/Providers";
+import { Cover } from "../../components/Cover";
+import { IconSearch } from "../../components/icons";
+import { useToast, useEngine } from "../../components/Providers";
 import { EngineSwitch } from "../../components/EngineSwitch";
 import type { Volume } from "../../lib/types";
 
@@ -19,7 +21,7 @@ const FILTERS = [
 export default function Library() {
   const s = useStatus();
   const toast = useToast();
-  const { openChat } = useChat();
+  const router = useRouter();
   const { engine, setEngine, available } = useEngine();
   const [filter, setFilter] = React.useState("all");
   const [q, setQ] = React.useState("");
@@ -87,7 +89,12 @@ export default function Library() {
 
         <div className="grid-auto" id="doc-grid">
           {shown.map((v) => (
-            <DocCard key={v.tag} v={v} onRun={onRun} onChat={openChat} />
+            <DocCard
+              key={v.tag}
+              v={v}
+              onRun={onRun}
+              onOpen={(tag) => router.push("/document?tag=" + encodeURIComponent(tag))}
+            />
           ))}
           {s && shown.length === 0 && (
             <p className="muted">Không có cuốn nào khớp bộ lọc.</p>
@@ -101,18 +108,39 @@ export default function Library() {
 function DocCard({
   v,
   onRun,
-  onChat,
+  onOpen,
 }: {
   v: Volume;
   onRun: (tag: string) => void;
-  onChat: (d: { tag: string; display: string; pages?: number }) => void;
+  onOpen: (tag: string) => void;
 }) {
   const c = volClass(v);
   const p = volPct(v);
   const showBar = c === "active" || (v.translate && v.translate[0] > 0 && c !== "done");
+  // Whole card opens the document detail (nơi có Chat). Inner action buttons
+  // stop propagation so they keep their own behavior.
+  const stop = (e: React.MouseEvent) => e.stopPropagation();
   return (
-    <article className="doc-card" data-status={c}>
-      <div className="thumb" />
+    <article
+      className="doc-card doc-card-link"
+      data-status={c}
+      role="link"
+      tabIndex={0}
+      title="Mở chi tiết tài liệu"
+      onClick={() => onOpen(v.tag)}
+      onKeyDown={(e) => {
+        // Only when the card itself is focused, not a bubbling Enter/Space from
+        // an inner action button/link.
+        if (
+          (e.key === "Enter" || e.key === " ") &&
+          e.target === e.currentTarget
+        ) {
+          e.preventDefault();
+          onOpen(v.tag);
+        }
+      }}
+    >
+      <Cover tag={v.tag} alt={"Bìa: " + v.display} />
       <div className="body">
         <div className="row-between">
           <h3>{v.display}</h3>
@@ -137,26 +165,26 @@ function DocCard({
             {pagesLabel(v)}
           </span>
           <div className="row" style={{ gap: "var(--space-2)" }}>
-            <button
-              className="btn btn-ghost btn-sm"
-              title="Trò chuyện với AI về cuốn này"
-              onClick={() => onChat({ tag: v.tag, display: v.display, pages: v.pages })}
-            >
-              <IconChat /> Chat
-            </button>
             {c === "done" ? (
               <Link
                 className="btn btn-secondary btn-sm"
                 href={"/document?tag=" + encodeURIComponent(v.tag)}
+                onClick={stop}
               >
                 Đọc song song
               </Link>
             ) : c === "active" ? (
-              <Link className="btn btn-ghost btn-sm" href="/queue">
+              <Link className="btn btn-ghost btn-sm" href="/queue" onClick={stop}>
                 Xem tiến độ
               </Link>
             ) : (
-              <button className="btn btn-primary btn-sm" onClick={() => onRun(v.tag)}>
+              <button
+                className="btn btn-primary btn-sm"
+                onClick={(e) => {
+                  stop(e);
+                  onRun(v.tag);
+                }}
+              >
                 {c === "error" ? "Chạy tiếp" : "Dịch"}
               </button>
             )}

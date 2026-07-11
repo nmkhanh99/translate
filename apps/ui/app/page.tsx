@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useStatus } from "../lib/useStatus";
 import { volClass, volPct, pagesLabel } from "../lib/api";
 import { Badge } from "../components/Badge";
+import { Cover } from "../components/Cover";
 import { IconUpload } from "../components/icons";
 import type { Volume } from "../lib/types";
 
@@ -76,7 +77,7 @@ export default function Home() {
               className="doc-card"
               href={"/document?tag=" + encodeURIComponent(v.tag)}
             >
-              <div className="thumb" />
+              <Cover tag={v.tag} alt={"Bìa: " + v.display} />
               <div className="body">
                 <div className="row-between">
                   <h3>{v.display}</h3>
@@ -117,7 +118,7 @@ function ContinueCard({ v }: { v: Volume }) {
     <section className="card">
       <div className="row-between wrap" style={{ gap: "var(--space-4)" }}>
         <div className="row" style={{ gap: "var(--space-4)" }}>
-          <div className="thumb" style={{ width: 48, flex: "none" }} />
+          <Cover tag={v.tag} dpi={60} style={{ width: 48, flex: "none" }} />
           <div>
             <div className="row" style={{ gap: "var(--space-2)" }}>
               <strong>
