@@ -104,11 +104,13 @@ async function runVolume(V) {
   // -- Vision -- (theo CỬA SỔ nhỏ: pending chỉ trả số trang trong [w,w+STEP),
   // tránh shuttle JSON lớn qua agent rồi mất dữ liệu)
   let vis = 'skipped'
-  if (VISION || reviewOnly) {
+  if (VISION || reviewOnly || onlyVision) {
     // Bỏ qua vision lần đầu khi resume review (checkpoint đã đủ) -> vào fix loop.
     if (!reviewOnly) {
       phase('Vision')
-      await sh(`${PY} vis-pages "${PDF}" "${OUT}" "${WD}"`, `${tag}:render`)
+      // V.visPages (csv 0-based): redo theo trang — CHỈ re-render các trang đó.
+      // Không giới hạn thì mọi pair cũ hơn OUT bị coi stale -> xoá sạch verdict.
+      await sh(`${PY} vis-pages "${PDF}" "${OUT}" "${WD}"${V.visPages ? ` ${V.visPages}` : ''}`, `${tag}:render`)
       let total = 0
       try { total = (JSON.parse(await sh(`${PY} status "${WD}"`, `${tag}:total`)).vision || [0, 0])[1] || 0 } catch {}
       const lo0 = V.visFrom || 0
@@ -135,8 +137,12 @@ async function runVolume(V) {
     if (!onlyVision) {
       phase('Fix')
       for (let round = 1; round <= MAX_FIX_ROUNDS; round++) {
-        const bad = parseList(await sh(`${PY} problems "${WD}" medium`, `${tag}:problems ${round}`))
-        if (!bad.length) { log(`[${tag}] auto-fix: hết defect ✓`); break }
+        // CHỈ lấy trang có defect kênh 'text' (tràn khung/đè do bản dịch dài) —
+        // rút gọn text mới có tác dụng. Trang lỗi engine (công thức/bảng/bullet
+        // vỡ) thuộc kênh 'code': xem defect-report + LAYOUT_PLAYBOOK.md, sửa
+        // pdf_core rồi apply lại — không rút gọn bừa bản dịch đang đúng.
+        const bad = parseList(await sh(`${PY} problems "${WD}" medium text`, `${tag}:problems ${round}`))
+        if (!bad.length) { log(`[${tag}] auto-fix: hết defect kênh text ✓ (lỗi engine xem defect-report)`); break }
         const csv = bad.join(',')
         log(`[${tag}] auto-fix vòng ${round}/${MAX_FIX_ROUNDS}: ${bad.length} trang defect`)
         const fpages = parseList(await sh(`${PY} page-segments "${PDF}" "${WD}" ${csv}`, `${tag}:fix-prep ${round}`))
@@ -174,7 +180,8 @@ async function runVolume(V) {
 let queue
 if (A.pdf) {
   queue = [{ pdf: A.pdf, workdir: A.workdir, out: A.out, vision: A.vision,
-             visFrom: A.visFrom, visTo: A.visTo, only: A.only }]
+             visFrom: A.visFrom, visTo: A.visTo, only: A.only,
+             visPages: A.visPages }]
 } else {
   queue = parseList(await sh(`${PY} volumes "${MANIFEST}"`, 'scan:volumes'))
 }

@@ -33,12 +33,17 @@ import {
   REPO_ROOT,
   resolveUiRoot,
   INPUT_DIR,
+  PYTHON_DIR,
+  pythonBin,
 } from "./paths.js";
+import { execFile } from "node:child_process";
 import {
   findVolume,
+  loadEnginePref,
   loadVolumes,
   pdfPageCount,
   renderPagePng,
+  resetStage,
   saveEnginePref,
   volumeToApi,
 } from "./volumes.js";
@@ -59,6 +64,34 @@ import {
   launchVolume,
   stopVolume,
 } from "./runs.js";
+
+// "5-10, 12, 15" (SỐ TRANG người dùng, 1-based) -> mảng CHỈ SỐ 0-based, clamp
+// trong [0, total). Dùng cho redo vision theo trang cụ thể.
+function parsePageList(spec: unknown, total: number): number[] {
+  if (typeof spec !== "string") return [];
+  const out = new Set<number>();
+  for (const part of spec.split(",")) {
+    const s = part.trim();
+    if (!s) continue;
+    const m = s.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (m) {
+      let a = parseInt(m[1], 10);
+      let b = parseInt(m[2], 10);
+      if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+      if (a > b) [a, b] = [b, a];
+      // Clamp TRƯỚC khi loop — "1-1000000000" sẽ khoá event loop; endpoint gần
+      // Number.MAX_SAFE_INTEGER còn làm p++ đứng yên (vòng lặp vô hạn).
+      if (a > total || b < 1) continue; // khoảng hoàn toàn ngoài phạm vi -> bỏ
+      a = Math.max(1, a);
+      b = Math.min(b, total);
+      for (let p = a; p <= b; p++) out.add(p - 1);
+    } else if (/^\d+$/.test(s)) {
+      const i = parseInt(s, 10) - 1;
+      if (i >= 0 && i < total) out.add(i);
+    }
+  }
+  return [...out].sort((a, b) => a - b);
+}
 
 export function createApp() {
   ensureDirs();
@@ -163,7 +196,57 @@ export function createApp() {
       return res.status(400).json({ error: "engine không hợp lệ" });
     }
     const engine = typeof bodyEngine === "string" ? bodyEngine : undefined;
-    const r = launchVolume(vol, CFG, engine);
+
+    // redo: chạy LẠI 1 stage (xoá output stage đó để pipeline làm lại). Với
+    // 'vision' có thể chỉ định trang cụ thể + chạy only='vision' (chỉ soát lại
+    // đúng trang đó, không dịch/apply lại cả cuốn).
+    let runOpts:
+      | { only?: string; vision?: boolean; visPages?: string }
+      | undefined;
+    const redo = req.body?.redo;
+    if (redo && typeof redo === "object") {
+      const stage = redo.stage;
+      if (stage !== "translate" && stage !== "verify" && stage !== "vision") {
+        return res.status(400).json({ error: "redo.stage không hợp lệ" });
+      }
+      // Redo cần pipeline Claude (Workflow) — Codex/Grok chạy prompt MCP không
+      // hiểu runOpts: sẽ XOÁ checkpoint rồi không làm lại stage đó. Chặn TRƯỚC
+      // khi resetStage.
+      const effEngine =
+        engine || loadEnginePref(vol.workdir) || CFG.engine || "claude";
+      if (effEngine !== "claude") {
+        return res.status(400).json({
+          error: `chạy lại stage cần engine Claude (đang chọn: ${effEngine})`,
+        });
+      }
+      // KHÔNG reset khi cuốn đang chạy — resetStage xoá output, sẽ hỏng tiến trình
+      // đang dở. Chặn TRƯỚC khi xoá (launchVolume cũng chặn nhưng quá muộn).
+      if (isVolumeRunning(vol)) {
+        return res.status(409).json({ error: "cuốn đang chạy — không thể chạy lại" });
+      }
+      let pages: number[] | undefined;
+      if (stage === "vision" && redo.pages != null && String(redo.pages).trim() !== "") {
+        pages = parsePageList(redo.pages, pdfPageCount(vol.pdf));
+        // Người dùng CÓ nhập trang nhưng parse ra rỗng (gõ sai/ngoài phạm vi):
+        // từ chối thay vì rơi xuống nhánh xoá TOÀN BỘ vision (mất mọi verdict).
+        if (!pages.length) {
+          return res.status(400).json({ error: "redo.pages không hợp lệ" });
+        }
+      }
+      resetStage(vol.workdir, stage, pages);
+      if (stage === "vision") {
+        // vision:true — redo vision phải chạy được cả khi config tắt vision.
+        // visPages — CHỈ re-render các trang này; thiếu nó, vis-pages sẽ thấy
+        // mọi pair cũ hơn OUT (luôn vậy sau apply) và xoá TOÀN BỘ verdict.
+        runOpts = {
+          only: "vision",
+          vision: true,
+          ...(pages ? { visPages: pages.join(",") } : {}),
+        };
+      }
+    }
+
+    const r = launchVolume(vol, CFG, engine, runOpts);
     if (!r.ok) return res.status(409).json({ error: r.error });
     if (engine) saveEnginePref(vol.workdir, engine);
     res.json({ ok: true, sid: r.sid, engine });
@@ -201,6 +284,32 @@ export function createApp() {
       return res.json({ ok: true });
     }
     res.status(400).json({ error: "action không hợp lệ" });
+  });
+
+  // Báo cáo defect theo CỤM pattern + kênh sửa (text/code/policy) — chạy
+  // python defect-report (nguồn sự thật duy nhất cho rule phân cụm; không port
+  // sang TS để khỏi lệch). Gọi 1 lần khi mở màn chi tiết, không poll.
+  app.get("/api/defects", (req, res) => {
+    const vol = findVolume(String(req.query.tag || ""));
+    if (!vol) return res.status(404).json({ error: "tag không tồn tại" });
+    // execFile ASYNC — spawnSync ở đây sẽ khoá event loop tới 20s mỗi request
+    // (fitz import chậm / máy bận), chặn cả /api/stop lẫn status polling.
+    execFile(
+      pythonBin(),
+      [join(PYTHON_DIR, "agent_pipeline.py"), "defect-report", vol.workdir],
+      { cwd: PYTHON_DIR, timeout: 20000, maxBuffer: 8 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err || !stdout) {
+          return res.status(500).json({ error: "defect-report failed" });
+        }
+        try {
+          const lines = stdout.trim().split("\n");
+          res.json(JSON.parse(lines[lines.length - 1]));
+        } catch {
+          res.status(500).json({ error: "defect-report: output không hợp lệ" });
+        }
+      }
+    );
   });
 
   app.get("/api/log", (req, res) => {

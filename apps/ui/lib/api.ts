@@ -46,6 +46,20 @@ export function getLog(tag: string): Promise<{ tag: string; lines: string[] }> {
   return req("/api/log?tag=" + encodeURIComponent(tag));
 }
 
+// ---- Báo cáo defect layout theo cụm (từ python defect-report) ----
+export interface DefectCluster {
+  name: string;
+  channel: "text" | "code" | "policy" | "mixed" | "unknown";
+  count: number;
+  pages: number[];
+  sample_details: { page: number; detail: string }[];
+}
+export function getDefectReport(
+  tag: string
+): Promise<{ defect_pages: number; clusters: DefectCluster[] }> {
+  return req("/api/defects?tag=" + encodeURIComponent(tag));
+}
+
 // ---- Per-document chat conversations (SQLite-persisted on the daemon) ----
 export interface ConversationMeta {
   id: string;
@@ -114,6 +128,21 @@ export function runVolume(
 /** Chọn engine riêng cho 1 cuốn mà không chạy ngay. */
 export function setVolEngine(tag: string, engine: string): Promise<{ ok: boolean }> {
   return post("/api/volconfig", { tag, engine });
+}
+/**
+ * Chạy LẠI một stage của cuốn (xoá output stage đó rồi làm lại).
+ * stage='vision' + pages="5-10,12" (1-based) = chỉ soát lại đúng các trang đó.
+ */
+export function redoStage(
+  tag: string,
+  stage: "translate" | "verify" | "vision",
+  opts?: { pages?: string; engine?: string }
+): Promise<{ ok: boolean; sid?: string }> {
+  return post("/api/run", {
+    tag,
+    redo: { stage, pages: opts?.pages },
+    ...(opts?.engine ? { engine: opts.engine } : {}),
+  });
 }
 /** Chạy hàng loạt các cuốn còn dở, tối đa `limit` cuốn song song. */
 export function startBatch(limit: number): Promise<{ ok: boolean; limit: number }> {

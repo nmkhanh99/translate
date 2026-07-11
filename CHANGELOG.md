@@ -1,5 +1,87 @@
 # Changelog
 
+## 2026-07-12 (hệ thống sửa layout "cho chuẩn": defect-report + golden + playbook)
+
+### Added
+
+- **`defect-report`** — phân cụm defect theo pattern + kênh sửa (`text` = auto-fix
+  rút gọn / `code` = sửa engine pdf_core / `policy` / `mixed`). Endpoint
+  `GET /api/defects` + hiển thị cụm lỗi ở màn chi tiết run (bấm cụm → tự điền ô
+  "Soát lại trang cụ thể"). Số liệu v1: 111 trang defect, chỉ 17 trang kênh text
+  — còn lại cần sửa engine.
+- **Golden regression harness** — `golden-snap` / `golden-diff` (pixel-hash từng
+  trang). Đã kiểm chứng: `apply` DETERMINISTIC (27/27 trang giống hệt) → sửa
+  pdf_core xong chỉ cần apply lại (không tốn agent) + diff → biết chính xác trang
+  nào đổi; trang đổi ngoài dự kiến = regression bắt ngay. Test: no-change → diff
+  rỗng; inject 1 thay đổi → bắt đúng trang.
+- **`python/LAYOUT_PLAYBOOK.md`** — quy trình sửa layout theo kênh, kèm bảng
+  root-cause ĐÃ XÁC MINH cho 8 cụm lỗi (workflow 8 agents đọc ảnh gốc|dịch +
+  code, 7 phản biện đồng ý): `_NUM_CELL` cấm chữ cái → bảng có EUR/USD vỡ;
+  line-art vector vô hình với extractor → tràn/đè khung; `_is_formula_like`
+  không chạy per-line → công thức vỡ; highlight bị xoá cả trên vùng không redact;
+  v.v. + thứ tự sửa khuyến nghị + rủi ro từng fix.
+
+### Changed
+
+- Vòng auto-fix trong `translate_volume.js` chỉ rút gọn trang có defect kênh
+  **text** (`problems <wd> medium text`) — không phí agent vào trang lỗi engine,
+  không rút gọn bừa bản dịch đang đúng.
+
+### Fixed (sau Codex review — 11 findings: 4 High/6 Medium/1 Low)
+
+- **[H] "Dịch lại" bị verify cũ đè mất:** resetStage(translate) giờ xoá cả
+  `vchunks/vout/vid2en` (sinh từ bản dịch CŨ — giữ lại thì merge-vr đè sửa lỗi
+  cũ lên bản dịch mới); resetStage(verify) cũng xoá vchunks (snapshot vi cũ).
+- **[H] Redo xoá checkpoint rồi không chạy lại stage:** redo yêu cầu engine
+  Claude (Codex/Grok không hiểu runOpts) → 400 TRƯỚC khi xoá; redo vision ép
+  `vision:true` (chạy được cả khi config tắt vision).
+- **[H] Engine fix đổi segmentation làm fixes.json dán nhầm chỗ:** fixes.json
+  giờ lưu `{en, vi}` — apply xác minh id còn trỏ đúng đoạn (lệch en → bỏ qua);
+  `chunk/vchunk --force` tự MERGE tiến độ cũ vào cache rồi mới xoá output cũ
+  (tránh va index); playbook thêm thủ tục sau engine-fix.
+- **[H] `accept` page-wide nuốt lỗi thật:** cảnh báo ⚠ khi trang còn defect
+  kênh khác policy (vd trang 27/65 vừa mất highlight vừa vỡ công thức).
+- **[M] Redo theo trang vẫn invalidate cả cuốn:** `visPages` truyền suốt
+  server→Workflow → `vis-pages only=csv` (không còn cảnh mọi pair cũ hơn OUT bị
+  coi stale → xoá sạch verdict).
+- **[M] golden-diff fail-closed:** lệch số trang → các trang ngoài phần chung
+  tính là changed + `"ok": false`; cảnh báo khi baseline chụp từ file khác.
+- **[M] apply-all race với pipeline đang chạy:** tự bỏ qua volume có
+  run.json mode=running + pid sống.
+- **[M] `parsePageList` treo daemon với "1-999999999":** clamp endpoint trước
+  khi loop (đo: 0s); khoảng ngoài phạm vi bị bỏ, không kéo về trang cuối.
+- **[M] Cụm defect stale trong UI:** refetch theo cả stage + xoá list cũ khi
+  đang tải (tránh bấm cụm cũ điền nhầm trang).
+- **[M] `/api/defects` chặn event loop 20s:** chuyển spawnSync → execFile async.
+- **[L] Regex chữ HOA tiếng Việt:** `[À-Ỵ]` lẫn chữ thường và thiếu Ỷ/Ỹ → liệt
+  kê tường minh.
+- Vá thêm (tự phát hiện): redo.pages nhập sai (parse rỗng) suýt xoá TOÀN BỘ
+  vision verdicts → giờ trả 400.
+
+## 2026-07-12 (chạy lại theo stage/trang + fix log)
+
+### Added
+
+- **Chạy lại theo stage ở màn chi tiết run.** Nút "Dịch lại" / "Rà soát lại" /
+  "Soát layout lại (cả cuốn)" — xoá output stage đó rồi pipeline làm lại.
+- **Chạy lại theo TRANG cụ thể (Soát layout).** Nhập "5-10, 12, 15" (số trang
+  1-based) → chỉ render + soát lại đúng các trang đó (`only=vision`), không dịch/
+  apply lại cả cuốn.
+
+### Fixed
+
+- **Log "dính vào nhau".** Log CLI (Codex/Grok) stream nhiều message nối liền
+  không xuống dòng (vd `…PDF.MCP … chưa kết nối.Đang tìm…`). Panel giờ chèn ngắt
+  dòng sau dấu kết câu khi ngay sau là chữ HOA/`` ` ``/`*` — KHÔNG tách số thập
+  phân (3.14, 0.39%).
+
+### Technical
+
+- `resetStage(workdir, stage, pages?)` (xoá out/vout/vis/review theo stage/trang;
+  dịch lại xoá luôn `fixes.json` cũ); `POST /api/run {redo:{stage,pages}}`;
+  `launchVolume(..., runOpts)` + `buildClaudePipelinePrompt(..., runOpts)` truyền
+  `only/visFrom/visTo` vào Workflow; `parsePageList` (1-based→0-based, clamp).
+
 ## 2026-07-12 (engine riêng từng cuốn + chạy song song)
 
 ### Added

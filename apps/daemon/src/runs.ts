@@ -7,6 +7,7 @@ import type { AppConfig } from "@cfa-translate/shared";
 import {
   buildClaudePipelinePrompt,
   buildMcpBatchPrompt,
+  type RunOpts,
 } from "./prompts.js";
 import { REPO_ROOT } from "./paths.js";
 import {
@@ -56,7 +57,8 @@ export function isVolumeRunning(vol: VolumeRec): boolean {
 export function launchVolume(
   vol: VolumeRec,
   cfg: AppConfig,
-  engineOverride?: string
+  engineOverride?: string,
+  runOpts?: RunOpts
 ): { ok: true; sid: string } | { ok: false; error: string } {
   if (vol.skip) return { ok: false, error: "volume này đánh skip" };
   if (starting.has(vol.tag) || isVolumeRunning(vol)) {
@@ -80,7 +82,7 @@ export function launchVolume(
   const sid = randomUUID();
   const prompt =
     engine === "claude"
-      ? buildClaudePipelinePrompt(vol, !!cfg.vision)
+      ? buildClaudePipelinePrompt(vol, !!cfg.vision, runOpts)
       : buildMcpBatchPrompt(vol, cfg.codex_batch ?? 25);
 
   const cmd = adapter.buildPipelineCmd({

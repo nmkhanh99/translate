@@ -3,6 +3,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -97,6 +98,60 @@ export function writeJson(filePath: string, data: unknown) {
 
 export function runMetaPath(workdir: string) {
   return join(workdir, "run.json");
+}
+
+/**
+ * Xoá output của MỘT stage để pipeline làm lại (resume-safe: các bước sau tự
+ * chạy vì thiếu output). translate/verify xoá toàn bộ chunk-output; vision có
+ * thể xoá theo TRANG cụ thể (chỉ soát lại đúng trang đó) hoặc toàn bộ.
+ */
+export function resetStage(
+  workdir: string,
+  stage: "translate" | "verify" | "vision",
+  pages?: number[]
+): void {
+  const rm = (p: string) => {
+    try {
+      rmSync(p, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  };
+  const pad = (n: number) => String(n).padStart(3, "0");
+  if (stage === "translate") {
+    rm(join(workdir, "out"));
+    mkdirSync(join(workdir, "out"), { recursive: true });
+    // fixes.json là bản rút gọn của bản dịch CŨ -> bỏ khi dịch lại.
+    rm(join(workdir, "fixes.json"));
+    // Artifacts verify được sinh từ bản dịch CŨ: nếu giữ, cmd_vchunk sẽ no-op
+    // (đã có vchunks/) và merge-vr đè các sửa lỗi CŨ lên bản dịch MỚI -> bản
+    // dịch lại gần như bị vứt bỏ. Xoá để verify chạy lại trên bản mới.
+    rm(join(workdir, "vchunks"));
+    rm(join(workdir, "vout"));
+    mkdirSync(join(workdir, "vout"), { recursive: true });
+    rm(join(workdir, "vid2en.json"));
+  } else if (stage === "verify") {
+    // Xoá cả vchunks/vid2en: vchunk chứa snapshot {en, vi} tại thời điểm tạo —
+    // giữ lại thì lần verify sau đối chiếu bản vi CŨ thay vì text2vi hiện tại.
+    rm(join(workdir, "vchunks"));
+    rm(join(workdir, "vout"));
+    mkdirSync(join(workdir, "vout"), { recursive: true });
+    rm(join(workdir, "vid2en.json"));
+  } else if (stage === "vision") {
+    if (pages && pages.length) {
+      for (const p of pages) {
+        rm(join(workdir, "vis", `page_${pad(p)}.json`));
+        rm(join(workdir, "review", `pair_${pad(p)}.png`));
+      }
+    } else {
+      for (const d of ["vis", "review"]) {
+        rm(join(workdir, d));
+        mkdirSync(join(workdir, d), { recursive: true });
+      }
+      rm(join(workdir, "vis_todo.json"));
+      rm(join(workdir, "review_issues.json"));
+    }
+  }
 }
 
 /** Engine chọn riêng cho 1 volume (ghi đè engine global). Lưu ở workdir/pref.json. */

@@ -384,6 +384,16 @@ select.input { appearance: none; cursor: pointer;
   .job-mid { grid-column: 1 / -1; }
 }
 
+/* ── Run detail: defect clusters ──────────────────────────────────────── */
+.defect-cluster { display: flex; align-items: center; gap: var(--space-2); width: 100%;
+  padding: 6px var(--space-3); border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm); background: transparent; color: var(--fg);
+  font-family: var(--font-body); font-size: var(--text-sm); text-align: left;
+  cursor: pointer; transition: border-color var(--motion-fast); }
+.defect-cluster:hover { border-color: var(--accent); background: var(--accent-wash); }
+.defect-cluster .spacer { margin-left: auto; }
+.defect-cluster .num { font-size: var(--text-xs); }
+
 /* ── Run detail log ───────────────────────────────────────────────────── */
 .log-panel { margin: 0; padding: var(--space-4); max-height: 52vh; overflow: auto;
   font-family: var(--font-mono); font-size: 11px; line-height: 1.55;

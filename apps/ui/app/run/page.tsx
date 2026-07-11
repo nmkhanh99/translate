@@ -12,7 +12,10 @@ import {
   runVolume,
   stopVolume,
   setVolEngine,
+  redoStage,
   getLog,
+  getDefectReport,
+  type DefectCluster,
 } from "../../lib/api";
 import { Badge } from "../../components/Badge";
 import { Cover } from "../../components/Cover";
@@ -48,6 +51,19 @@ function RunDetail() {
     (v?.pref_engine as Engine) ||
     (s?.config?.engine as Engine) ||
     "claude") as Engine;
+
+  const [redoPages, setRedoPages] = React.useState("");
+  const redo = (stage: "translate" | "verify" | "vision", pages?: string) =>
+    act(
+      () => redoStage(tag, stage, { pages, engine: effEngine }),
+      pages
+        ? `Đang soát lại trang ${pages}`
+        : stage === "translate"
+        ? "Đang dịch lại"
+        : stage === "verify"
+        ? "Đang rà soát lại"
+        : "Đang soát layout lại",
+    );
 
   const pickEngine = async (e: Engine) => {
     setEngineSel(e);
@@ -186,9 +202,62 @@ function RunDetail() {
                   {defects}
                 </span>
               </div>
+              {defects > 0 && (
+                <DefectClusters
+                  tag={v.tag}
+                  defects={defects}
+                  stage={v.stage}
+                  onPickPages={setRedoPages}
+                />
+              )}
             </div>
           </div>
         </section>
+
+        {!running && (
+          <div className="panel">
+            <div className="panel-head">Chạy lại</div>
+            <div className="stack-4" style={{ padding: "var(--space-4)" }}>
+              <div className="row wrap" style={{ gap: "var(--space-2)" }}>
+                <button className="btn btn-secondary btn-sm" onClick={() => redo("translate")}>
+                  Dịch lại
+                </button>
+                <button className="btn btn-secondary btn-sm" onClick={() => redo("verify")}>
+                  Rà soát lại
+                </button>
+                <button className="btn btn-secondary btn-sm" onClick={() => redo("vision")}>
+                  Soát layout lại (cả cuốn)
+                </button>
+              </div>
+              <div
+                className="row wrap"
+                style={{ gap: "var(--space-2)", alignItems: "center" }}
+              >
+                <input
+                  className="input"
+                  placeholder="VD: 5-10, 12, 15"
+                  value={redoPages}
+                  onChange={(e) => setRedoPages(e.target.value)}
+                  style={{ width: 170 }}
+                />
+                <button
+                  className="btn btn-primary btn-sm"
+                  disabled={!redoPages.trim()}
+                  onClick={() => redo("vision", redoPages.trim())}
+                >
+                  Soát lại trang cụ thể
+                </button>
+                <span className="muted" style={{ fontSize: "var(--text-xs)" }}>
+                  Số trang (1-based), cách nhau dấu phẩy hoặc dạng khoảng a-b.
+                </span>
+              </div>
+              <div className="muted" style={{ fontSize: "var(--text-xs)" }}>
+                Rà soát & Soát layout chạy bằng pipeline <b>Claude</b> (chọn engine ở
+                trên). “Dịch lại” xoá bản dịch cũ và làm lại các bước sau.
+              </div>
+            </div>
+          </div>
+        )}
 
         <div className="panel">
           <div className="panel-head">
@@ -209,6 +278,96 @@ function RunDetail() {
         </div>
       </div>
     </>
+  );
+}
+
+const CLUSTER_VN: Record<string, string> = {
+  congthuc_vo: "Công thức vỡ",
+  bang_vo: "Bảng vỡ",
+  bullet_indent: "Bullet / thụt lề",
+  highlight_mat: "Mất highlight",
+  chu_de_chong: "Chữ đè chồng",
+  tran_khung: "Tràn khung",
+  label_tach_dong: "Nhãn tách dòng",
+  header_hong: "Header hỏng",
+  khac: "Khác",
+};
+const CHANNEL_VN: Record<string, { label: string; cls: string }> = {
+  text: { label: "tự rút gọn được", cls: "badge-success" },
+  code: { label: "cần sửa engine", cls: "badge-warn" },
+  policy: { label: "chính sách engine", cls: "" },
+  mixed: { label: "text + engine", cls: "badge-accent" },
+  unknown: { label: "chưa phân loại", cls: "" },
+};
+
+// Cụm lỗi layout (từ /api/defects). Bấm một cụm -> điền số trang (1-based) vào ô
+// "Soát lại trang cụ thể" để chạy lại vision đúng các trang đó.
+function DefectClusters({
+  tag,
+  defects,
+  stage,
+  onPickPages,
+}: {
+  tag: string;
+  defects: number;
+  stage: string;
+  onPickPages: (pages: string) => void;
+}) {
+  const [clusters, setClusters] = React.useState<DefectCluster[] | null>(null);
+  React.useEffect(() => {
+    let alive = true;
+    // Xoá danh sách cũ ngay khi refetch — cluster stale bấm vào sẽ điền nhầm
+    // trang; refetch theo cả stage vì tập trang/kênh có thể đổi mà SỐ defect
+    // tình cờ giữ nguyên.
+    setClusters(null);
+    getDefectReport(tag)
+      .then((d) => {
+        if (alive) setClusters(d.clusters || []);
+      })
+      .catch(() => {
+        if (alive) setClusters([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [tag, defects, stage]);
+
+  if (!clusters) {
+    return (
+      <div className="muted" style={{ fontSize: "var(--text-xs)", marginTop: 8 }}>
+        Đang phân tích cụm lỗi…
+      </div>
+    );
+  }
+  if (!clusters.length) return null;
+  return (
+    <div className="stack-2" style={{ marginTop: "var(--space-3)" }}>
+      {clusters.map((c) => (
+        <button
+          key={c.name}
+          type="button"
+          className="defect-cluster"
+          title={
+            (c.sample_details[0]?.detail || "") +
+            "\n→ Bấm để điền các trang này vào ô Soát lại"
+          }
+          onClick={() => onPickPages(c.pages.map((p) => p + 1).join(", "))}
+        >
+          <span>{CLUSTER_VN[c.name] || c.name}</span>
+          <span className={"badge " + (CHANNEL_VN[c.channel]?.cls || "")}>
+            {CHANNEL_VN[c.channel]?.label || c.channel}
+          </span>
+          <span className="spacer" />
+          <span className="num muted">
+            {c.count} lỗi · {c.pages.length} trang
+          </span>
+        </button>
+      ))}
+      <div className="muted" style={{ fontSize: "var(--text-xs)" }}>
+        “Cần sửa engine”: rút gọn bản dịch không chữa được — xem{" "}
+        <span className="num">python/LAYOUT_PLAYBOOK.md</span> (quy trình golden-diff).
+      </div>
+    </div>
   );
 }
 
@@ -274,7 +433,18 @@ function LogPanel({ tag, live }: { tag: string; live: boolean }) {
     if (el) el.scrollTop = el.scrollHeight;
   }, [lines]);
 
-  const text = lines.filter((l) => l.length).join("\n");
+  // CLI (Codex/Grok) hay stream nhiều message NỐI LIỀN không xuống dòng. Chèn
+  // ngắt sau dấu kết câu ) . ! ? : khi ngay sau là chữ HOA / ` / * (bắt đầu
+  // message mới) để dễ đọc — không đụng số thập phân (theo sau là chữ số).
+  // Lưu ý: KHÔNG dùng range [À-Ỵ] — dải đó lẫn cả chữ thường (à, đ…) và thiếu
+  // Ỷ/Ỹ; liệt kê tường minh các chữ HOA tiếng Việt.
+  const text = lines
+    .filter((l) => l.length)
+    .join("\n")
+    .replace(
+      /([.!?:)\]])(?=[A-Z`*ÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬĐÈÉẺẼẸÊỀẾỂỄỆÌÍỈĨỊÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢÙÚỦŨỤƯỪỨỬỮỰỲÝỶỸỴ])/g,
+      "$1\n"
+    );
   return (
     <pre className="log-panel" ref={boxRef}>
       {text || "Chưa có log. Bấm Chạy để bắt đầu."}

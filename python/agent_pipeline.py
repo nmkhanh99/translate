@@ -15,6 +15,7 @@ Quy trình 1 volume:
 Cache text2vi.json đặt trong workdir, có thể tái dùng giữa các bước/đổi tool.
 """
 import glob
+import hashlib
 import json
 import os
 import re
@@ -37,12 +38,19 @@ def _load(p, default):
 
 def cmd_chunk(pdf, workdir, size=40, force=False):
     """Resume-safe: chỉ tạo chunks/ một lần. KHÔNG xoá out/ (giữ tiến độ dịch).
-    Đã có chunks/ -> no-op trừ khi force=True (force chỉ xoá chunks, GIỮ out/)."""
+    Đã có chunks/ -> no-op trừ khi force=True.
+    force: MERGE out/ cũ vào text2vi trước (giữ tiến độ) rồi xoá cả chunks/ lẫn
+    out/ — out cũ đánh index theo chunking CŨ, giữ lại sẽ va index với chunks
+    mới (merge-tr dán nhầm bản dịch). Dùng sau khi sửa engine đổi segmentation:
+    todo mới = các text CHƯA có trong cache -> chỉ dịch phần mới."""
     os.makedirs(workdir, exist_ok=True)
     existing = glob.glob(_wd(workdir, "chunks", "c_*.json"))
     if existing and not force:
         print(f"chunk: đã có {len(existing)} chunks, bỏ qua (dùng force để tạo lại).")
         return len(existing)
+    if force and glob.glob(_wd(workdir, "out", "c_*.json")):
+        cmd_merge_tr(pdf, workdir)  # gom tiến độ cũ vào text2vi trước khi xoá
+        shutil.rmtree(_wd(workdir, "out"), ignore_errors=True)
     shutil.rmtree(_wd(workdir, "chunks"), ignore_errors=True)
     os.makedirs(_wd(workdir, "chunks"))
     os.makedirs(_wd(workdir, "out"), exist_ok=True)
@@ -87,11 +95,17 @@ def cmd_merge_tr(pdf, workdir):
 def cmd_vchunk(pdf, workdir, size=25, mode="all", force=False):
     """mode='all': verify MỌI đoạn (bắt cả bỏ sót/sai nghĩa, chính xác hơn vision).
     mode='num': chỉ đoạn có số / nghi chưa dịch.
-    Resume-safe: đã có vchunks/ -> no-op trừ khi force (force GIỮ vout/)."""
+    Resume-safe: đã có vchunks/ -> no-op trừ khi force.
+    force: MERGE vout/ cũ (theo vid2en CŨ) vào text2vi trước rồi xoá vchunks/ +
+    vout/ — vout cũ đánh vid theo vid2en cũ, giữ lại sẽ dán sửa lỗi nhầm đoạn
+    sau khi vid2en bị ghi đè."""
     existing = glob.glob(_wd(workdir, "vchunks", "v_*.json"))
     if existing and not force:
         print(f"vchunk: đã có {len(existing)} vchunks, bỏ qua (dùng force để tạo lại).")
         return len(existing)
+    if force and glob.glob(_wd(workdir, "vout", "v_*.json")):
+        cmd_merge_vr(workdir)  # gom theo vid2en CŨ trước khi ghi đè
+        shutil.rmtree(_wd(workdir, "vout"), ignore_errors=True)
     shutil.rmtree(_wd(workdir, "vchunks"), ignore_errors=True)
     os.makedirs(_wd(workdir, "vchunks"))
     os.makedirs(_wd(workdir, "vout"), exist_ok=True)
@@ -144,6 +158,20 @@ def cmd_merge_vr(workdir):
     return n
 
 
+def _fix_lookup(fixes, sid, en):
+    """Tra override rút gọn theo id, XÁC MINH en còn khớp (id sN đánh theo thứ tự
+    trích xuất — engine fix đổi segmentation sẽ dịch chuyển id; entry lệch en bị
+    bỏ qua). Chấp nhận format cũ (string, không có en để đối chiếu)."""
+    f = fixes.get(sid)
+    if f is None:
+        return None
+    if isinstance(f, str):
+        return f  # legacy — không xác minh được
+    if f.get("en") == en:
+        return f.get("vi") or None
+    return None  # id đã trỏ sang đoạn khác -> override hết hiệu lực
+
+
 def cmd_apply(pdf, workdir, out):
     text2vi = _load(_wd(workdir, "text2vi.json"), {})
     # fixes.json = override RÚT GỌN theo SEGMENT ID (ưu tiên cao nhất). Khoá theo
@@ -153,10 +181,12 @@ def cmd_apply(pdf, workdir, out):
     fixes = _load(_wd(workdir, "fixes.json"), {})
     doc = fitz.open(pdf)
     segs, layout = pdf_core.extract_segments(doc, "all")
-    trans = {l["id"]: (fixes.get(l["id"]) or text2vi.get(s["text"], ""))
+    trans = {l["id"]: (_fix_lookup(fixes, l["id"], s["text"])
+                       or text2vi.get(s["text"], ""))
              for s, l in zip(segs, layout)}
     miss = sum(1 for s, l in zip(segs, layout)
-               if not (fixes.get(l["id"]) or text2vi.get(s["text"])))
+               if not (_fix_lookup(fixes, l["id"], s["text"])
+                       or text2vi.get(s["text"])))
     applied, m = pdf_core.apply_translations(doc, layout, trans)
     os.makedirs(os.path.dirname(out), exist_ok=True)
     doc.save(out, garbage=4, deflate=True)
@@ -253,6 +283,16 @@ def cmd_apply_all(manifest):
         if not os.path.exists(_wd(v["workdir"], "layout.json")):
             print(f"  [bỏ]  {os.path.basename(v['pdf'])}: chưa chunk")
             continue
+        # Volume đang có pipeline chạy: merge out/vout dở dang + ghi đè PDF sẽ
+        # RACE với tiến trình đó (mất cache update / hỏng file đích). Bỏ qua.
+        meta = _load(_wd(v["workdir"], "run.json"), {})
+        if meta.get("mode") == "running" and meta.get("pid"):
+            try:
+                os.kill(int(meta["pid"]), 0)
+                print(f"  [đang chạy — bỏ qua] {os.path.basename(v['pdf'])}")
+                continue
+            except (OSError, ValueError):
+                pass  # pid chết -> meta cũ, xử lý bình thường
         # gom out/ + vout/ vào text2vi trước (volume đang dịch dở có thể chưa merge)
         if glob.glob(_wd(v["workdir"], "out", "c_*.json")):
             cmd_merge_tr(v["pdf"], v["workdir"])
@@ -342,21 +382,111 @@ def cmd_merge_vis(workdir):
     return issues
 
 
-def cmd_problems(workdir, min_sev=FIX_SEV):
+# ── Phân loại defect theo CỤM pattern + kênh sửa ─────────────────────────────
+# channel: 'text'   = rút gọn bản dịch là đủ (vòng auto-fix hiện có)
+#          'code'   = phải sửa engine pdf_core (extraction/apply) — sửa 1 lần
+#                     chữa MỌI trang cùng pattern
+#          'policy' = hành vi cố ý của engine (vd xoá highlight) — đổi chính
+#                     sách hoặc accept
+#          'mixed'  = phần text + phần code
+DEFECT_RULES = [
+    ("highlight_mat",   r"highlight|nền vàng|màu vàng",                                    "policy"),
+    ("congthuc_vo",     r"công thức|phân số|subscript|superscript|số mũ|overline|căn bậc", "code"),
+    ("bang_vo",         r"bảng|exhibit.*cột|cột.*dồn|2 cột|3 cột|hàng.*giá trị",           "code"),
+    ("bullet_indent",   r"bullet|indent|thụt lề|đánh dấu đầu dòng",                        "code"),
+    ("chu_de_chong",    r"đè|chồng|overlap|xuyên qua",                                     "mixed"),
+    ("tran_khung",      r"tràn|sát viền|chạm viền|vượt khung|bị cắt|clip",                 "text"),
+    ("label_tach_dong", r"tách.*dòng riêng|thành.*tiêu đề|run-in",                         "code"),
+    ("header_hong",     r"header|đầu trang.*lặp",                                          "code"),
+]
+
+
+def _classify_defects(workdir, min_sev=FIX_SEV):
+    """Trả về list cluster: {name, channel, count, pages, sample_details}."""
+    thr = _SEV.get(min_sev, 1)
+    issues = _load(_wd(workdir, "review_issues.json"), [])
+    accepted = set(_load(_wd(workdir, "accepted.json"), {}).get("pages", []))
+    defects = [x for x in issues
+               if x.get("kind", "defect") != "fit"
+               and _SEV.get(x.get("severity", "low"), 1) >= thr
+               and x["page"] not in accepted]
+    groups = {}
+    for d in defects:
+        det = d.get("detail", "").lower()
+        for name, pat, channel in DEFECT_RULES:
+            if re.search(pat, det):
+                key, ch = name, channel
+                break
+        else:
+            key, ch = "khac", "unknown"
+        g = groups.setdefault(key, {"name": key, "channel": ch, "count": 0,
+                                    "pages": set(), "sample_details": []})
+        g["count"] += 1
+        g["pages"].add(d["page"])
+        if len(g["sample_details"]) < 3:
+            g["sample_details"].append(
+                {"page": d["page"], "detail": d.get("detail", "")[:160]})
+    out = []
+    for g in sorted(groups.values(), key=lambda x: -x["count"]):
+        g["pages"] = sorted(g["pages"])
+        out.append(g)
+    return out
+
+
+def cmd_defect_report(workdir, min_sev=FIX_SEV):
+    """Báo cáo defect theo CỤM + kênh sửa gợi ý (JSON). Dùng để quyết định:
+    cụm nào để vòng auto-fix rút gọn text, cụm nào phải sửa engine (pdf_core),
+    cụm nào là policy/accept. Xem python/LAYOUT_PLAYBOOK.md."""
+    clusters = _classify_defects(workdir, min_sev)
+    total_pages = sorted({p for c in clusters for p in c["pages"]})
+    print(json.dumps({"min_sev": min_sev, "defect_pages": len(total_pages),
+                      "clusters": clusters}, ensure_ascii=False))
+    return clusters
+
+
+def cmd_problems(workdir, min_sev=FIX_SEV, channel=None):
     """In JSON các trang còn LỖI CẦN FIX = kind 'defect', >= mức nghiêm trọng, và
     KHÔNG nằm trong accepted.json (đã đánh dấu won't-fix). Lỗi kind 'fit' (co/nhồi
-    chữ cho vừa layout) bị loại -> vòng lặp hội tụ. Rỗng = trang đã ổn."""
-    pages = _defect_pages(workdir, min_sev)
+    chữ cho vừa layout) bị loại -> vòng lặp hội tụ. Rỗng = trang đã ổn.
+    channel='text': CHỈ trang có defect kênh text/mixed (rút gọn bản dịch có tác
+    dụng) — để vòng auto-fix không phí công rút gọn trang lỗi engine."""
+    if channel:
+        want = {"text", "mixed"} if channel == "text" else {channel}
+        pages = sorted({p for c in _classify_defects(workdir, min_sev)
+                        if c["channel"] in want for p in c["pages"]})
+    else:
+        pages = _defect_pages(workdir, min_sev)
     print(json.dumps(pages))
     return pages
 
 
 def cmd_accept(workdir, pages, note=""):
     """Đánh dấu trang là WON'T-FIX (lỗi chấp nhận, vd co chữ) -> accepted.json.
-    'problems' sẽ bỏ qua các trang này nên vòng lặp fit→fix→re-vision hội tụ."""
+    'problems' sẽ bỏ qua các trang này nên vòng lặp fit→fix→re-vision hội tụ.
+    CẢNH BÁO nếu trang còn defect KÊNH KHÁC policy — accept là PAGE-WIDE nên sẽ
+    nuốt luôn các lỗi thật đó (vd trang vừa mất highlight vừa vỡ công thức)."""
     p = _wd(workdir, "accepted.json")
     acc = _load(p, {"pages": [], "notes": {}})
     idxs = [int(x) for x in str(pages).split(",") if x.strip().lstrip("-").isdigit()]
+    issues = _load(_wd(workdir, "review_issues.json"), [])
+    for i in idxs:
+        others = []
+        for x in issues:
+            if x["page"] != i or x.get("kind", "defect") == "fit":
+                continue
+            if _SEV.get(x.get("severity", "low"), 1) < _SEV[FIX_SEV]:
+                continue
+            det = x.get("detail", "").lower()
+            ch = "unknown"
+            for name, pat, channel in DEFECT_RULES:
+                if re.search(pat, det):
+                    ch = channel
+                    break
+            if ch != "policy":
+                others.append(f"[{ch}] {x.get('detail', '')[:80]}")
+        if others:
+            print(f"  ⚠ trang {i} còn {len(others)} defect KHÔNG phải policy — "
+                  f"accept sẽ nuốt luôn: {others[0]}")
     for i in idxs:
         if i not in acc["pages"]:
             acc["pages"].append(i)
@@ -407,9 +537,9 @@ def cmd_page_segments(pdf, workdir, pages_csv):
             if l["page"] != p:
                 continue
             en = id2en.get(l["id"], "")
-            # Bản vi HIỆN HÀNH = override fix (nếu có) rồi mới tới text2vi — để
-            # agent thấy đúng bản đang hiển thị và rút gọn tiếp nếu vẫn tràn.
-            vi = fixes.get(l["id"]) or text2vi.get(en, "")
+            # Bản vi HIỆN HÀNH = override fix (nếu có, đã xác minh en) rồi mới
+            # tới text2vi — agent thấy đúng bản đang hiển thị.
+            vi = _fix_lookup(fixes, l["id"], en) or text2vi.get(en, "")
             if en and vi:
                 items.append({"id": l["id"], "en": en, "vi": vi})
         if items:
@@ -431,13 +561,17 @@ def cmd_merge_fix(workdir):
         if not os.path.exists(outf):
             continue
         try:
-            cur = {it["id"]: it.get("vi", "") for it in json.load(open(f, encoding="utf-8"))}
+            items = {it["id"]: it for it in json.load(open(f, encoding="utf-8"))}
             short = json.load(open(outf, encoding="utf-8"))
         except Exception:
             continue
         for cid, vi in short.items():
-            if cid in cur and vi and vi != cur[cid]:
-                fixes[cid] = vi
+            it = items.get(cid)
+            if it and vi and vi != it.get("vi", ""):
+                # Lưu kèm 'en' để apply xác minh id vẫn trỏ đúng đoạn đó — id sN
+                # đánh theo THỨ TỰ trích xuất, một engine fix đổi segmentation sẽ
+                # dịch chuyển id; entry lệch en bị bỏ qua thay vì dán nhầm chỗ.
+                fixes[cid] = {"en": it.get("en", ""), "vi": vi}
                 n += 1
     json.dump(fixes, open(_wd(workdir, "fixes.json"), "w"), ensure_ascii=False)
     shutil.rmtree(_wd(workdir, "fix"), ignore_errors=True)
@@ -461,6 +595,55 @@ def cmd_review_summary(workdir):
           f"low(không chặn)={len(low)} | fit(chấp nhận)={len(fit)} | "
           f"accepted={sorted(accepted)} | {'ĐÃ HỘI TỤ ✓' if not dp else 'còn việc'}")
     return dp
+
+
+# ── Golden regression: sửa engine (pdf_core) an toàn ────────────────────────
+# apply là DETERMINISTIC (cùng text2vi/fixes -> cùng pixel, đã kiểm chứng), nên
+# pixel-hash từng trang là ground truth rẻ để phát hiện trang thay đổi.
+# Quy trình: golden-snap -> sửa pdf_core -> apply -> golden-diff:
+#   trang đổi = đúng các trang defect nhắm tới -> OK, re-vision đúng các trang đó
+#   trang KHÁC cũng đổi -> engine fix gây tác dụng phụ, soi lại trước khi nhận.
+
+
+def _page_hashes(pdf_path, dpi=100):
+    doc = fitz.open(pdf_path)
+    m = fitz.Matrix(dpi / 72, dpi / 72)
+    return [hashlib.md5(doc[i].get_pixmap(matrix=m).tobytes("png")).hexdigest()
+            for i in range(doc.page_count)]
+
+
+def cmd_golden_snap(out_pdf, workdir, dpi=100):
+    """Chụp baseline pixel-hash từng trang của PDF đích hiện tại -> golden.json.
+    Chạy TRƯỚC khi sửa pdf_core."""
+    hashes = _page_hashes(out_pdf, int(dpi))
+    json.dump({"dpi": int(dpi), "out": out_pdf, "pages": len(hashes),
+               "hashes": hashes},
+              open(_wd(workdir, "golden.json"), "w"))
+    print(f"golden-snap: {len(hashes)} trang @dpi{dpi} -> golden.json")
+    return len(hashes)
+
+
+def cmd_golden_diff(out_pdf, workdir):
+    """So pixel-hash hiện tại với baseline -> JSON {changed:[trang 0-based], same}.
+    Chạy SAU khi sửa pdf_core + apply lại. Trang đổi ngoài dự kiến = regression."""
+    g = _load(_wd(workdir, "golden.json"), None)
+    if not g:
+        print(json.dumps({"error": "chưa có golden.json — chạy golden-snap trước"}))
+        return None
+    cur = _page_hashes(out_pdf, g["dpi"])
+    n = min(len(cur), len(g["hashes"]))
+    changed = [i for i in range(n) if cur[i] != g["hashes"][i]]
+    # Fail-closed: lệch SỐ TRANG là thay đổi nghiêm trọng nhất — các trang ngoài
+    # phần chung được coi là changed (mất trang cuối không được phép trả []).
+    hi = max(len(cur), len(g["hashes"]))
+    changed += list(range(n, hi))
+    result = {"changed": changed, "same": n - len([i for i in changed if i < n]),
+              "pages_before": len(g["hashes"]), "pages_after": len(cur),
+              "ok": len(cur) == len(g["hashes"])}
+    if g.get("out") and g["out"] != out_pdf:
+        result["warn"] = f"baseline chụp từ file khác: {g['out']}"
+    print(json.dumps(result, ensure_ascii=False))
+    return result
 
 
 def cmd_pending(workdir, stage, lo=None, hi=None):
@@ -505,10 +688,14 @@ if __name__ == "__main__":
         "volumes": lambda: cmd_volumes(a[0]),
         "batch-status": lambda: cmd_batch_status(a[0]),
         "apply-all": lambda: cmd_apply_all(a[0]),
-        "problems": lambda: cmd_problems(a[0], a[1] if len(a) > 1 else FIX_SEV),
+        "problems": lambda: cmd_problems(a[0], a[1] if len(a) > 1 else FIX_SEV,
+                                         a[2] if len(a) > 2 else None),
         "revision": lambda: cmd_revision(a[0], a[1]),
         "page-segments": lambda: cmd_page_segments(a[0], a[1], a[2]),
         "merge-fix": lambda: cmd_merge_fix(a[0]),
+        "defect-report": lambda: cmd_defect_report(a[0], a[1] if len(a) > 1 else FIX_SEV),
+        "golden-snap": lambda: cmd_golden_snap(a[0], a[1], a[2] if len(a) > 2 else 100),
+        "golden-diff": lambda: cmd_golden_diff(a[0], a[1]),
         "accept": lambda: cmd_accept(a[0], a[1], a[2] if len(a) > 2 else ""),
         "review-summary": lambda: cmd_review_summary(a[0]),
     }[cmd]()

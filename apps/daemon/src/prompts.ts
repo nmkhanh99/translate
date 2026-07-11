@@ -18,9 +18,21 @@ export function chatContextSafe(vol: VolumeRec): string {
   );
 }
 
+export interface RunOpts {
+  /** 'vision' = chỉ chạy soát layout (bỏ translate/verify/apply). */
+  only?: string;
+  visFrom?: number;
+  visTo?: number;
+  /** Ép bật vision cho lần chạy này (redo vision phải chạy được cả khi cfg.vision=false). */
+  vision?: boolean;
+  /** CSV chỉ số trang 0-based: CHỈ re-render + soát các trang này (redo theo trang). */
+  visPages?: string;
+}
+
 export function buildClaudePipelinePrompt(
   vol: VolumeRec,
-  vision: boolean
+  vision: boolean,
+  runOpts?: RunOpts
 ): string {
   const runArgs = {
     pdf: vol.pdf,
@@ -28,6 +40,7 @@ export function buildClaudePipelinePrompt(
     out: vol.out,
     vision: !!vision,
     tool: PYTHON_DIR,
+    ...(runOpts || {}),
   };
   return (
     "Bạn đang chạy pipeline dịch 1 volume CFA sang tiếng Việt (giữ layout). " +
