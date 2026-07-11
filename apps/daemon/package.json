@@ -8,16 +8,18 @@
   },
   "scripts": {
     "dev": "tsx src/cli.ts --no-open",
-    "build": "esbuild src/cli.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/cli.mjs --banner:js=\"import{createRequire}from'module';const require=createRequire(import.meta.url);\"",
+    "build": "esbuild src/cli.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/cli.mjs --external:better-sqlite3 --banner:js=\"import{createRequire}from'module';const require=createRequire(import.meta.url);\"",
     "start": "node dist/cli.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
     "@cfa-translate/agent-adapters": "workspace:*",
     "@cfa-translate/shared": "workspace:*",
+    "better-sqlite3": "^12.11.1",
     "express": "^5.1.0"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/express": "^5.0.3",
     "@types/node": "^22.20.0",
     "esbuild": "^0.28.1",

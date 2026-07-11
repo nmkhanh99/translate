@@ -28,6 +28,9 @@ package-lock.json
 tool/work/
 **/*.cache.json
 tool/dashboard.json
+tool/chat.sqlite
+tool/chat.sqlite-shm
+tool/chat.sqlite-wal
 **/run.log
 **/run.json
 **/codex_state.json

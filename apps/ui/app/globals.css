@@ -349,6 +349,30 @@ select.input { appearance: none; cursor: pointer;
 .progress.ok > i { background: var(--success); }
 .progress.warn > i { background: var(--warn); }
 
+/* ── Queue job rows ───────────────────────────────────────────────────── */
+/* Fixed 3-column grid so every progress bar starts/ends at the same x,
+   regardless of title length — rows stay aligned across the whole list. */
+.job { display: grid; grid-template-columns: minmax(0, 1fr) 220px 132px;
+  align-items: center; gap: var(--space-4); padding: var(--space-4);
+  border-top: 1px solid var(--border-soft); }
+.job-mid { min-width: 0; }
+.job-actions { display: flex; align-items: center; justify-content: flex-end;
+  gap: var(--space-2); }
+.job-live { display: inline-block; width: 7px; height: 7px; flex: none;
+  border-radius: var(--radius-pill); background: var(--accent);
+  animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .35; transform: scale(.7); } }
+.logtail { margin-top: 6px; font-family: var(--font-mono); font-size: 11px;
+  color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.logtail.open { white-space: pre-wrap; max-height: 180px; overflow-y: auto;
+  background: var(--row-hover); border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-3); line-height: 1.5; }
+@media (max-width: 720px) {
+  .job { grid-template-columns: minmax(0, 1fr) auto; }
+  .job-mid { grid-column: 1 / -1; }
+}
+
 /* ── Tables ───────────────────────────────────────────────────────────── */
 .ds-table { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
 .ds-table th { text-align: left; font-weight: 500; color: var(--muted);
@@ -545,6 +569,39 @@ select.input { appearance: none; cursor: pointer;
   padding: 2px 9px; border-radius: var(--radius-pill); border: 1px solid var(--border); }
 .cli-status.ok { color: var(--success);
   border-color: color-mix(in oklab, var(--success), transparent 65%); }
+
+/* conversations bar — pick / create / delete conversations for this document */
+.chat-convbar { display: flex; align-items: center; gap: var(--space-2);
+  padding: var(--space-2) var(--space-4); flex: none;
+  border-bottom: 1px solid var(--border-soft); background: var(--chrome); }
+.conv-menu { position: relative; flex: 1; min-width: 0; }
+.conv-trigger { display: flex; align-items: center; gap: var(--space-2); width: 100%;
+  padding: 5px var(--space-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface); color: var(--fg); cursor: pointer;
+  font-family: var(--font-body); font-size: var(--text-sm); text-align: left;
+  transition: border-color var(--motion-fast); }
+.conv-trigger:hover { border-color: var(--muted); }
+.conv-trigger .title { flex: 1; min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.conv-trigger .caret { color: var(--muted); font-size: 11px; flex: none; }
+.conv-menu-list { position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 70;
+  max-height: 300px; overflow-y: auto; margin: 0; padding: var(--space-1); list-style: none;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
+  box-shadow: var(--elev-raised); }
+.conv-opt { display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 7px var(--space-2); border: none; background: transparent;
+  border-radius: var(--radius-sm); cursor: pointer;
+  font-family: var(--font-body); font-size: var(--text-sm); color: var(--fg); text-align: left; }
+.conv-opt:hover { background: color-mix(in oklab, var(--fg), transparent 94%); }
+.conv-opt.active { color: var(--accent); font-weight: 600; }
+.conv-opt .body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.conv-opt .body .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conv-opt .meta { color: var(--muted); font-size: var(--text-xs); }
+.conv-del { flex: none; border: none; background: transparent; color: var(--muted);
+  cursor: pointer; padding: 2px 7px; border-radius: var(--radius-sm); font-size: var(--text-sm); }
+.conv-del:hover { color: var(--warn);
+  background: color-mix(in oklab, var(--warn), transparent 88%); }
+.conv-empty { padding: 7px var(--space-2); color: var(--muted); font-size: var(--text-xs); }
 
 .chat-scope { padding: var(--space-2) var(--space-4); flex: none;
   border-bottom: 1px solid var(--border-soft); background: var(--chrome); }

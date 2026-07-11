@@ -42,6 +42,61 @@ export function getPageInfo(tag: string): Promise<PageInfo> {
   return req<PageInfo>("/api/pageinfo?tag=" + encodeURIComponent(tag));
 }
 
+export function getLog(tag: string): Promise<{ tag: string; lines: string[] }> {
+  return req("/api/log?tag=" + encodeURIComponent(tag));
+}
+
+// ---- Per-document chat conversations (SQLite-persisted on the daemon) ----
+export interface ConversationMeta {
+  id: string;
+  tag: string;
+  title: string | null;
+  engine: string | null;
+  created_at: number;
+  updated_at: number;
+  msg_count: number;
+}
+export interface StoredMessage {
+  id: string;
+  role: string;
+  text: string;
+  engine?: string | null;
+}
+
+export function listConversations(
+  tag: string
+): Promise<{ persist: boolean; conversations: ConversationMeta[] }> {
+  return req("/api/conversations?tag=" + encodeURIComponent(tag));
+}
+export function createConversation(
+  tag: string,
+  title: string | null,
+  engine: string | null
+): Promise<ConversationMeta> {
+  return post("/api/conversations", { tag, title, engine });
+}
+export function loadConversation(id: string): Promise<{
+  conversation: ConversationMeta | null;
+  messages: StoredMessage[];
+  sessions: Record<string, string>;
+}> {
+  return req("/api/conversation?id=" + encodeURIComponent(id));
+}
+export function saveConversationApi(
+  id: string,
+  body: {
+    title?: string | null;
+    engine?: string | null;
+    messages: StoredMessage[];
+    sessions?: Record<string, string>;
+  }
+): Promise<{ ok: boolean }> {
+  return post("/api/conversation/save", { id, ...body });
+}
+export function deleteConversationApi(id: string): Promise<{ ok: boolean }> {
+  return post("/api/conversation/delete", { id });
+}
+
 export function post<T = unknown>(path: string, body?: unknown): Promise<T> {
   return req<T>(path, {
     method: "POST",
@@ -118,3 +173,15 @@ export const STATUS_TEXT: Record<string, string> = {
   error: "Lỗi",
   draft: "Chưa dịch",
 };
+
+// Human-readable Vietnamese label for a run stage shown on the queue card.
+export function stageLabel(stage: string): string {
+  const m: Record<string, string> = {
+    translate: "Đang dịch",
+    verify: "Đang rà soát",
+    vision: "Đang xử lý ảnh/công thức",
+    done: "Hoàn tất",
+    error: "Lỗi",
+  };
+  return m[stage] || stage || "Đang chuẩn bị";
+}

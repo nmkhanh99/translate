@@ -33,6 +33,14 @@ import {
 } from "./volumes.js";
 import { chatContextSafe } from "./prompts.js";
 import {
+  chatDbReady,
+  listConversations,
+  createConversation,
+  deleteConversation,
+  getConversation,
+  saveConversation,
+} from "./chat-db.js";
+import {
   BATCH,
   batchStart,
   batchStop,
@@ -224,6 +232,60 @@ export function createApp() {
     mkdirSync(INPUT_DIR, { recursive: true });
     writeFileSync(join(INPUT_DIR, name), body);
     res.json({ ok: true, name });
+  });
+
+  // ── Per-document chat conversations (SQLite-persisted) ──────────────────
+  // A document tag is the "project"; each can hold many named conversations.
+  app.get("/api/conversations", (req, res) => {
+    const tag = String(req.query.tag || "").trim();
+    if (!tag) return res.status(400).json({ error: "thiếu tag" });
+    res.json({ persist: chatDbReady(), conversations: listConversations(tag) });
+  });
+
+  app.post("/api/conversations", (req, res) => {
+    const tag = String(req.body?.tag || "").trim();
+    if (!tag) return res.status(400).json({ error: "thiếu tag" });
+    if (!chatDbReady()) return res.status(503).json({ error: "SQLite không khả dụng" });
+    const title = req.body?.title ? String(req.body.title).slice(0, 120) : null;
+    const engine = req.body?.engine ? String(req.body.engine) : null;
+    res.json(createConversation(tag, title, engine));
+  });
+
+  app.get("/api/conversation", (req, res) => {
+    const id = String(req.query.id || "").trim();
+    if (!id) return res.status(400).json({ error: "thiếu id" });
+    const data = getConversation(id);
+    if (!data.conversation) return res.status(404).json({ error: "không tìm thấy hội thoại" });
+    res.json(data);
+  });
+
+  app.post("/api/conversation/save", (req, res) => {
+    const id = String(req.body?.id || "").trim();
+    if (!id) return res.status(400).json({ error: "thiếu id" });
+    const rawMsgs = Array.isArray(req.body?.messages) ? req.body.messages : [];
+    const messages = rawMsgs.map((m: Record<string, unknown>) => ({
+      id: m.id ? String(m.id) : undefined,
+      role: String(m.role || "assistant"),
+      text: String(m.text ?? ""),
+      engine: m.engine ? String(m.engine) : null,
+    }));
+    const ok = saveConversation(id, {
+      title: req.body?.title != null ? String(req.body.title).slice(0, 120) : undefined,
+      engine: req.body?.engine != null ? String(req.body.engine) : undefined,
+      messages,
+      sessions:
+        req.body?.sessions && typeof req.body.sessions === "object"
+          ? (req.body.sessions as Record<string, string>)
+          : undefined,
+    });
+    if (!ok) return res.status(404).json({ error: "không lưu được (hội thoại không tồn tại?)" });
+    res.json({ ok: true });
+  });
+
+  app.post("/api/conversation/delete", (req, res) => {
+    const id = String(req.body?.id || "").trim();
+    if (!id) return res.status(400).json({ error: "thiếu id" });
+    res.json({ ok: deleteConversation(id) });
   });
 
   /**

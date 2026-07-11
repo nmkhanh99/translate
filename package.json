@@ -21,6 +21,11 @@
     "typecheck": "pnpm -r --filter @cfa-translate/* typecheck"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["electron", "esbuild", "sharp"]
+    "onlyBuiltDependencies": [
+      "electron",
+      "esbuild",
+      "sharp",
+      "better-sqlite3"
+    ]
   }
 }
