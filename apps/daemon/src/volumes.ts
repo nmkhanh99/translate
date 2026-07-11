@@ -99,6 +99,17 @@ export function runMetaPath(workdir: string) {
   return join(workdir, "run.json");
 }
 
+/** Engine chọn riêng cho 1 volume (ghi đè engine global). Lưu ở workdir/pref.json. */
+export function loadEnginePref(workdir: string): string | undefined {
+  const p = readJson(join(workdir, "pref.json"));
+  return typeof p?.engine === "string" ? p.engine : undefined;
+}
+
+export function saveEnginePref(workdir: string, engine: string) {
+  mkdirSync(workdir, { recursive: true });
+  writeJson(join(workdir, "pref.json"), { engine });
+}
+
 export function loadRunMeta(workdir: string) {
   return readJson(runMetaPath(workdir));
 }
@@ -329,6 +340,7 @@ export function volumeToApi(
     mode: typeof meta.mode === "string" ? meta.mode : undefined,
     rc: typeof meta.rc === "number" ? meta.rc : null,
     defects: st.defects,
+    pref_engine: loadEnginePref(vol.workdir),
     // Total page count when known (st.vision = [reviewed, totalPages]); lets the
     // Home/Library UI show real page totals for completed volumes.
     pages: st.vision && st.vision[1] ? st.vision[1] : undefined,

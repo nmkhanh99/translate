@@ -11,12 +11,14 @@ import {
   stageLabel,
   runVolume,
   stopVolume,
+  setVolEngine,
   getLog,
 } from "../../lib/api";
 import { Badge } from "../../components/Badge";
 import { Cover } from "../../components/Cover";
-import { useToast } from "../../components/Providers";
-import type { Volume } from "../../lib/types";
+import { EngineSwitch } from "../../components/EngineSwitch";
+import { useToast, useEngine } from "../../components/Providers";
+import type { Volume, Engine } from "../../lib/types";
 
 export default function RunPage() {
   return (
@@ -36,7 +38,28 @@ function RunDetail() {
   const tag = sp.get("tag") || "";
   const s = useStatus(2000);
   const toast = useToast();
+  const { available, rescanAgents } = useEngine();
   const v = (s?.volumes || []).find((x) => x.tag === tag);
+  // Engine chọn riêng cho cuốn này: local pick > pref đã lưu > engine global.
+  // Fallback lấy TỪ s.config.engine (hydrate cùng trang) chứ không phải giá trị
+  // mặc định "claude" của provider — tránh chạy nhầm Claude khi global là Codex/Grok.
+  const [engineSel, setEngineSel] = React.useState<Engine | null>(null);
+  const effEngine = (engineSel ||
+    (v?.pref_engine as Engine) ||
+    (s?.config?.engine as Engine) ||
+    "claude") as Engine;
+
+  const pickEngine = async (e: Engine) => {
+    setEngineSel(e);
+    if (tag) {
+      try {
+        await setVolEngine(tag, e);
+        toast("Cuốn này sẽ dịch bằng: " + e);
+      } catch (err) {
+        toast("Lỗi: " + (err as Error).message);
+      }
+    }
+  };
 
   const act = async (fn: () => Promise<unknown>, ok: string) => {
     try {
@@ -87,6 +110,15 @@ function RunDetail() {
         <span className="spacer" />
         <div className="row" style={{ gap: "var(--space-2)" }}>
           <Badge kind={cls} />
+          {!running && (
+            <EngineSwitch
+              value={effEngine}
+              onChange={pickEngine}
+              available={available}
+              onRescan={rescanAgents}
+              ariaLabel="Chọn CLI dịch cuốn này"
+            />
+          )}
           {running ? (
             <button
               className="btn btn-secondary btn-sm"
@@ -97,14 +129,18 @@ function RunDetail() {
           ) : v.stage === "review" ? (
             <button
               className="btn btn-primary btn-sm"
-              onClick={() => act(() => runVolume(v.tag), "Đang chạy để sửa layout")}
+              onClick={() =>
+                act(() => runVolume(v.tag, effEngine), "Đang chạy để sửa layout")
+              }
             >
               Chạy để sửa ({defects})
             </button>
           ) : v.stage !== "done" ? (
             <button
               className="btn btn-primary btn-sm"
-              onClick={() => act(() => runVolume(v.tag), "Đang chạy (headless)")}
+              onClick={() =>
+                act(() => runVolume(v.tag, effEngine), "Đang chạy (headless)")
+              }
             >
               {cls === "error" ? "Chạy tiếp" : "Chạy"}
             </button>

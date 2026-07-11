@@ -105,8 +105,19 @@ export function post<T = unknown>(path: string, body?: unknown): Promise<T> {
   });
 }
 
-export function runVolume(tag: string): Promise<{ ok: boolean; sid?: string }> {
-  return post("/api/run", { tag });
+export function runVolume(
+  tag: string,
+  engine?: string
+): Promise<{ ok: boolean; sid?: string; engine?: string }> {
+  return post("/api/run", engine ? { tag, engine } : { tag });
+}
+/** Chọn engine riêng cho 1 cuốn mà không chạy ngay. */
+export function setVolEngine(tag: string, engine: string): Promise<{ ok: boolean }> {
+  return post("/api/volconfig", { tag, engine });
+}
+/** Chạy hàng loạt các cuốn còn dở, tối đa `limit` cuốn song song. */
+export function startBatch(limit: number): Promise<{ ok: boolean; limit: number }> {
+  return post("/api/batch", { action: "start", limit });
 }
 export function stopVolume(tag: string) {
   return post("/api/stop", { tag });

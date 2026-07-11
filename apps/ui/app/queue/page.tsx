@@ -10,6 +10,8 @@ import {
   stageLabel,
   runVolume,
   stopVolume,
+  startBatch,
+  setVolEngine,
   getLog,
   post,
 } from "../../lib/api";
@@ -25,6 +27,9 @@ export default function Queue() {
   const toast = useToast();
   const router = useRouter();
   const openRun = (t: string) => router.push("/run?tag=" + encodeURIComponent(t));
+  const globalEngine = s?.config?.engine || "claude";
+  const batch = s?.batch;
+  const [parN, setParN] = React.useState(2); // số cuốn chạy song song
   // Tags the user just launched — shown as "đang khởi động" until the next
   // status poll confirms they are running (spawn + first status write lags a
   // few seconds, so without this the click looks like nothing happened). We
@@ -88,10 +93,13 @@ export default function Queue() {
     }
   };
 
-  const launch = async (tag: string, ok: string) => {
+  const onEngine = (tag: string, engine: string) =>
+    act(() => setVolEngine(tag, engine), "Cuốn này sẽ dịch bằng: " + engine);
+
+  const launch = async (tag: string, ok: string, engine?: string) => {
     setStarting((prev) => ({ ...prev, [tag]: { at: Date.now() } }));
     try {
-      const r = await runVolume(tag);
+      const r = await runVolume(tag, engine);
       setStarting((prev) =>
         prev[tag] ? { ...prev, [tag]: { at: prev[tag].at, sid: r?.sid } } : prev
       );
@@ -113,15 +121,47 @@ export default function Queue() {
       <div className="topbar">
         <div>
           <h1>Hàng đợi</h1>
-          <div className="sub">Chạy tuần tự từng cuốn — dừng/chạy lại là tự resume.</div>
+          <div className="sub">
+            Chọn engine riêng cho từng cuốn ngay dưới tên · chạy song song nhiều
+            cuốn · dừng/chạy lại là tự resume.
+          </div>
         </div>
         <span className="spacer" />
-        <button
-          className="btn btn-secondary"
-          onClick={() => act(() => post("/api/batch", { action: "stop" }), "Đã dừng batch")}
-        >
-          Tạm dừng tất cả
-        </button>
+        <div className="row" style={{ gap: "var(--space-2)" }}>
+          <label className="muted" style={{ fontSize: "var(--text-xs)" }}>
+            Song song
+          </label>
+          <input
+            className="input num"
+            type="number"
+            min={1}
+            max={8}
+            value={parN}
+            onChange={(e) =>
+              setParN(Math.max(1, Math.min(8, Number(e.target.value) || 1)))
+            }
+            style={{ width: 56, textAlign: "center" }}
+            title="Số cuốn chạy cùng lúc"
+          />
+          {batch?.active ? (
+            <button
+              className="btn btn-secondary"
+              onClick={() => act(() => post("/api/batch", { action: "stop" }), "Đã dừng batch")}
+            >
+              Dừng tất cả ({batch.running?.length || 0})
+            </button>
+          ) : (
+            <button
+              className="btn btn-primary"
+              onClick={() =>
+                act(() => startBatch(parN), `Chạy tất cả (tối đa ${parN} song song)`)
+              }
+              title="Chạy mọi cuốn còn dở, mỗi cuốn dùng engine riêng"
+            >
+              ▶ Chạy tất cả
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="page stack-6">
@@ -137,17 +177,19 @@ export default function Queue() {
             <span className="spacer" />
             <span className="badge badge-accent">
               <span className="dot" />
-              Tuần tự
+              {batch?.active
+                ? `Song song ${batch.running?.length || 0}/${batch.limit || parN}`
+                : `${active.length} đang chạy`}
             </span>
           </div>
           {active.map((v) => (
-            <Job key={v.tag} v={v} kind="active" act={act} launch={launch} onOpen={openRun} />
+            <Job key={v.tag} v={v} kind="active" act={act} launch={launch} onOpen={openRun} globalEngine={globalEngine} onEngine={onEngine} />
           ))}
           {startingVols.map((v) => (
-            <Job key={v.tag} v={v} kind="starting" act={act} launch={launch} onOpen={openRun} />
+            <Job key={v.tag} v={v} kind="starting" act={act} launch={launch} onOpen={openRun} globalEngine={globalEngine} onEngine={onEngine} />
           ))}
           {waitingRest.map((v) => (
-            <Job key={v.tag} v={v} kind="waiting" act={act} launch={launch} onOpen={openRun} />
+            <Job key={v.tag} v={v} kind="waiting" act={act} launch={launch} onOpen={openRun} globalEngine={globalEngine} onEngine={onEngine} />
           ))}
           {queueCount === 0 && (
             <div style={{ padding: "var(--space-4)" }} className="muted">
@@ -159,10 +201,10 @@ export default function Queue() {
         <div className="panel">
           <div className="panel-head">Hoàn tất gần đây</div>
           {donev.map((v) => (
-            <Job key={v.tag} v={v} kind="done" act={act} launch={launch} onOpen={openRun} />
+            <Job key={v.tag} v={v} kind="done" act={act} launch={launch} onOpen={openRun} globalEngine={globalEngine} onEngine={onEngine} />
           ))}
           {errRest.map((v) => (
-            <Job key={v.tag} v={v} kind="error" act={act} launch={launch} onOpen={openRun} />
+            <Job key={v.tag} v={v} kind="error" act={act} launch={launch} onOpen={openRun} globalEngine={globalEngine} onEngine={onEngine} />
           ))}
           {!donev.length && !errRest.length && (
             <div style={{ padding: "var(--space-4)" }} className="muted">
@@ -268,14 +310,23 @@ function Job({
   act,
   launch,
   onOpen,
+  globalEngine,
+  onEngine,
 }: {
   v: Volume;
   kind: Kind;
   act: (fn: () => Promise<unknown>, ok: string) => void;
-  launch: (tag: string, ok: string) => void;
+  launch: (tag: string, ok: string, engine?: string) => void;
   onOpen: (tag: string) => void;
+  globalEngine: string;
+  onEngine: (tag: string, engine: string) => void;
 }) {
   const p = volPct(v);
+  // Optimistic local pick so the <select> doesn't snap back before the 2s poll
+  // reflects the saved pref.
+  const [engSel, setEngSel] = React.useState<string | null>(null);
+  const curEngine = engSel ?? v.pref_engine ?? globalEngine;
+  const canPick = kind === "waiting" || kind === "done" || kind === "error";
   return (
     <div
       className="job job-click"
@@ -312,8 +363,38 @@ function Job({
               }
             />
           </div>
-          <div className="muted num" style={{ fontSize: "var(--text-xs)" }}>
-            {v.tag} · {v.engine || ""}
+          <div
+            className="row"
+            style={{ gap: "var(--space-2)", marginTop: 2, flexWrap: "wrap" }}
+          >
+            <span className="muted num" style={{ fontSize: "var(--text-xs)" }}>
+              {v.tag}
+            </span>
+            {canPick ? (
+              <select
+                className="engine-mini"
+                value={curEngine}
+                title="Engine dịch cuốn này"
+                onClick={(e) => e.stopPropagation()}
+                onChange={(e) => {
+                  e.stopPropagation();
+                  setEngSel(e.target.value);
+                  onEngine(v.tag, e.target.value);
+                }}
+              >
+                <option value="claude">Claude</option>
+                <option value="codex">Codex</option>
+                <option value="grok">Grok</option>
+              </select>
+            ) : (
+              <span
+                className="muted num"
+                style={{ fontSize: "var(--text-xs)" }}
+                title={kind === "active" ? "Engine đang chạy" : "Engine sẽ dùng"}
+              >
+                · {kind === "active" ? v.engine || curEngine : curEngine}
+              </span>
+            )}
           </div>
         </div>
       </div>
@@ -369,7 +450,8 @@ function Job({
             onClick={() =>
               launch(
                 v.tag,
-                v.stage === "review" ? "Đang chạy để sửa layout" : "Đang chạy (headless)"
+                v.stage === "review" ? "Đang chạy để sửa layout" : "Đang chạy (headless)",
+                curEngine
               )
             }
           >
@@ -387,7 +469,7 @@ function Job({
         {kind === "error" && (
           <button
             className="btn btn-secondary btn-sm"
-            onClick={() => launch(v.tag, "Đang chạy tiếp")}
+            onClick={() => launch(v.tag, "Đang chạy tiếp", curEngine)}
           >
             Chạy tiếp
           </button>

@@ -73,6 +73,8 @@ export interface Volume {
   rc?: number | null;
   /** Số trang còn lỗi layout cần fix (kind 'defect' >= medium, chưa accepted). */
   defects?: number;
+  /** Engine đã chọn RIÊNG cho cuốn này (ghi đè engine global). undefined = dùng global. */
+  pref_engine?: string;
 }
 
 export interface StatusResponse {
@@ -84,7 +86,13 @@ export interface StatusResponse {
   done?: number;
   total?: number;
   running?: number;
-  batch?: { active: boolean; current?: string | null; queue?: string[] };
+  batch?: {
+    active: boolean;
+    current?: string | null;
+    queue?: string[];
+    running?: string[];
+    limit?: number;
+  };
   agents?: AgentDetection[];
 }
 

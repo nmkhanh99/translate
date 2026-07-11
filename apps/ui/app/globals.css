@@ -362,6 +362,11 @@ select.input { appearance: none; cursor: pointer;
 /* Fixed trailing slot so every progress track ends at the same x whether or not
    the row shows a percentage. */
 .job-pct { min-width: 32px; text-align: right; font-size: var(--text-xs); flex: none; }
+/* Compact per-row engine picker in the queue. */
+.engine-mini { font-family: var(--font-body); font-size: 11px; padding: 1px 4px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface); color: var(--fg); cursor: pointer; }
+.engine-mini:hover { border-color: var(--muted); }
 .job-actions { display: flex; align-items: center; justify-content: flex-end;
   gap: var(--space-2); }
 .job-live { display: inline-block; width: 7px; height: 7px; flex: none;

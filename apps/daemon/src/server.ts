@@ -39,6 +39,7 @@ import {
   loadVolumes,
   pdfPageCount,
   renderPagePng,
+  saveEnginePref,
   volumeToApi,
 } from "./volumes.js";
 import { chatContextSafe } from "./prompts.js";
@@ -116,6 +117,8 @@ export function createApp() {
         active: BATCH.active,
         current: BATCH.current,
         queue: BATCH.queue,
+        running: [...BATCH.running],
+        limit: BATCH.limit,
       },
       agents,
     });
@@ -149,9 +152,33 @@ export function createApp() {
     const vol = findVolume(String(req.body?.tag || ""));
     if (!vol) return res.status(404).json({ error: "tag không tồn tại" });
     if (vol.skip) return res.status(400).json({ error: "volume này đánh skip" });
-    const r = launchVolume(vol, CFG);
+    // Cho phép chọn engine RIÊNG cho cuốn này lúc chạy. Engine gửi lên mà không
+    // hợp lệ thì TỪ CHỐI (không âm thầm dùng engine cũ). Chỉ lưu làm mặc định
+    // SAU KHI chạy thành công (tránh đổi hành vi batch khi lệnh chạy 409).
+    const bodyEngine = req.body?.engine;
+    if (
+      bodyEngine != null &&
+      (typeof bodyEngine !== "string" || !ENGINE_IDS.includes(bodyEngine as EngineId))
+    ) {
+      return res.status(400).json({ error: "engine không hợp lệ" });
+    }
+    const engine = typeof bodyEngine === "string" ? bodyEngine : undefined;
+    const r = launchVolume(vol, CFG, engine);
     if (!r.ok) return res.status(409).json({ error: r.error });
-    res.json({ ok: true, sid: r.sid });
+    if (engine) saveEnginePref(vol.workdir, engine);
+    res.json({ ok: true, sid: r.sid, engine });
+  });
+
+  // Chọn engine cho 1 cuốn mà KHÔNG chạy ngay (lưu pref để dùng khi chạy/batch).
+  app.post("/api/volconfig", (req, res) => {
+    const vol = findVolume(String(req.body?.tag || ""));
+    if (!vol) return res.status(404).json({ error: "tag không tồn tại" });
+    const engine = req.body?.engine;
+    if (typeof engine !== "string" || !ENGINE_IDS.includes(engine as EngineId)) {
+      return res.status(400).json({ error: "engine không hợp lệ" });
+    }
+    saveEnginePref(vol.workdir, engine);
+    res.json({ ok: true, engine });
   });
 
   app.post("/api/stop", (req, res) => {
@@ -163,8 +190,11 @@ export function createApp() {
   app.post("/api/batch", (req, res) => {
     const action = req.body?.action;
     if (action === "start") {
-      batchStart(CFG);
-      return res.json({ ok: true, queue: BATCH.queue });
+      const n = Number(req.body?.limit);
+      const limit = Number.isFinite(n) ? Math.floor(n) : 1; // batchStart clamp 1..8
+      const ok = batchStart(CFG, limit);
+      if (!ok) return res.status(409).json({ error: "batch đang chạy" });
+      return res.json({ ok: true, queue: BATCH.queue, limit: BATCH.limit });
     }
     if (action === "stop") {
       batchStop();

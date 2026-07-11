@@ -1,5 +1,47 @@
 # Changelog
 
+## 2026-07-12 (engine riêng từng cuốn + chạy song song)
+
+### Added
+
+- **Chọn engine RIÊNG cho từng tài liệu.** Mỗi cuốn có thể dịch bằng Claude /
+  Codex / Grok khác nhau. Chọn ở màn chi tiết run (`/run?tag=`); lưu vào
+  `workdir/pref.json` và dùng cho mọi lần chạy sau (kể cả batch). Ưu tiên:
+  engine chỉ định lúc chạy > pref của cuốn > engine global.
+- **Chạy nhiều tài liệu song song.** Nút "▶ Chạy tất cả" ở Hàng đợi với ô chọn
+  số cuốn chạy cùng lúc (1–8); batch lấp đầy tới hạn mức, mỗi cuốn dùng engine
+  riêng của nó. Nút chuyển thành "Dừng tất cả (N)" khi đang chạy; badge hiện
+  "Song song N/limit". (Chạy lẻ từng cuốn vốn đã song song được.)
+
+### Technical
+
+- Endpoint mới `POST /api/volconfig {tag, engine}` (chọn engine không chạy ngay);
+  `POST /api/run` nhận `engine`; `POST /api/batch {action:"start", limit}`.
+  `launchVolume(vol, cfg, engineOverride?)`; `BATCH` thêm `running:Set` + `limit`,
+  `runBatch` chạy tối đa `limit` cuốn đồng thời. Status trả `batch.running[]` +
+  `limit`, `Volume.pref_engine`. Chọn engine ngay trên mỗi dòng Hàng đợi.
+
+### Fixed (sau Codex review — engine + song song)
+
+- **[High] `launchVolume` không an toàn ngoại lệ sau spawn.** Nếu `saveRunMeta`
+  lỗi sau khi spawn, sẽ rò `starting`, không gắn listener, và ném ra khiến batch
+  scheduler kẹt. Giờ clear `starting` + gắn listener TRƯỚC, `saveRunMeta` là
+  best-effort (try/catch).
+- **[Medium] Race stop→start chạy 2 scheduler.** `BATCH.gen` (generation token):
+  stop/start tăng gen → vòng `runBatch` cũ tự thoát, không xử lý queue mới.
+- **[Medium] `limit` không phải trần đồng thời thật.** `runningCount()` đếm MỌI
+  cuốn đang chạy (kể cả chạy lẻ) → đúng "tối đa N cùng lúc".
+- **[Medium] `/api/run` engine sai bị nuốt; lưu pref trước khi chạy.** Giờ engine
+  sai → 400; chỉ lưu pref SAU khi chạy thành công. pref.json hỏng bị bỏ qua.
+- **[Medium] Nút Chạy ở Hàng đợi không dùng engine vừa chọn.** `launch` truyền
+  thẳng engine đang chọn vào `runVolume` (không phụ thuộc pref lưu kịp hay chưa).
+- **[Medium] Màn chi tiết fallback cứng "claude".** Lấy fallback từ
+  `s.config.engine` → không chạy nhầm Claude khi global là Codex/Grok.
+- **[Low] `/api/batch`**: start khi đang chạy → 409; limit ép số nguyên.
+- **[Low] Dòng đang chạy hiện engine THẬT (`v.engine`)**, không phải pref sắp dùng.
+- Còn lại (nhỏ, tự lành): stop→start tức thì có thể bỏ qua cuốn vừa SIGTERM chưa
+  thoát (lần chạy sau tự nhận lại); reap theo tag chưa theo sid.
+
 ## 2026-07-11 (chiều — pipeline dịch + màn chi tiết run)
 
 ### Added

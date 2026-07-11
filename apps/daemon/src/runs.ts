@@ -2,7 +2,7 @@ import { mkdirSync, openSync, closeSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { getAdapter, type EngineId } from "@cfa-translate/agent-adapters";
+import { getAdapter, ENGINE_IDS, type EngineId } from "@cfa-translate/agent-adapters";
 import type { AppConfig } from "@cfa-translate/shared";
 import {
   buildClaudePipelinePrompt,
@@ -13,6 +13,7 @@ import {
   codexDone,
   effectiveStage,
   findVolume,
+  loadEnginePref,
   loadRunMeta,
   loadVolumes,
   pidAlive,
@@ -37,6 +38,12 @@ export const BATCH = {
   stop: false,
   current: null as string | null,
   queue: [] as string[],
+  running: new Set<string>(),
+  limit: 1,
+  // Tăng mỗi lần start/stop. runBatch bám theo gen của nó — stop→start nhanh sẽ
+  // đổi gen nên vòng cũ (đang chờ sleep) tự thoát, không chạy song song với vòng
+  // mới trên cùng state.
+  gen: 0,
 };
 
 export function isVolumeRunning(vol: VolumeRec): boolean {
@@ -48,7 +55,8 @@ export function isVolumeRunning(vol: VolumeRec): boolean {
 
 export function launchVolume(
   vol: VolumeRec,
-  cfg: AppConfig
+  cfg: AppConfig,
+  engineOverride?: string
 ): { ok: true; sid: string } | { ok: false; error: string } {
   if (vol.skip) return { ok: false, error: "volume này đánh skip" };
   if (starting.has(vol.tag) || isVolumeRunning(vol)) {
@@ -56,7 +64,13 @@ export function launchVolume(
   }
   starting.add(vol.tag);
 
-  const engine = (cfg.engine || "claude") as EngineId;
+  // Ưu tiên: engine chỉ định lúc gọi > engine đã chọn riêng cho cuốn (pref.json)
+  // > engine global. Bỏ qua pref không hợp lệ (pref.json hỏng) thay vì để
+  // getAdapter fail. Cho phép mỗi tài liệu dịch bằng CLI khác nhau, song song.
+  const prefRaw = loadEnginePref(vol.workdir);
+  const pref =
+    prefRaw && ENGINE_IDS.includes(prefRaw as EngineId) ? prefRaw : undefined;
+  const engine = (engineOverride || pref || cfg.engine || "claude") as EngineId;
   const adapter = getAdapter(engine);
   if (!adapter) {
     starting.delete(vol.tag);
@@ -125,7 +139,10 @@ export function launchVolume(
     engine,
   };
   RUNS.set(vol.tag, { proc, sid, mode: "running", pid: proc.pid, engine });
-  saveRunMeta(vol.workdir, meta);
+  // Clear `starting` and attach lifecycle listeners BEFORE the (best-effort)
+  // meta write — so a failing saveRunMeta can't leak `starting`, skip the
+  // exit/error listeners, or throw out of launchVolume (which would reject the
+  // batch scheduler's promise and wedge BATCH.active).
   starting.delete(vol.tag);
 
   proc.on("exit", (code) => {
@@ -171,6 +188,12 @@ export function launchVolume(
     }
   });
 
+  try {
+    saveRunMeta(vol.workdir, meta);
+  } catch {
+    /* meta write best-effort — status recomputes from files; the exit handler
+       re-writes run.json on completion. */
+  }
   return { ok: true, sid };
 }
 
@@ -217,42 +240,68 @@ function pendingTags(cfg: AppConfig): string[] {
   return tags;
 }
 
-export function batchStart(cfg: AppConfig): boolean {
+export function batchStart(cfg: AppConfig, limit = 1): boolean {
   if (BATCH.active) return false;
+  const gen = ++BATCH.gen;
   BATCH.queue = pendingTags(cfg);
+  BATCH.limit = Math.max(1, Math.min(8, Math.floor(limit) || 1));
   BATCH.active = true;
   BATCH.stop = false;
   BATCH.current = null;
-  void runBatch(cfg);
+  BATCH.running.clear();
+  void runBatch(cfg, gen);
   return true;
 }
 
 export function batchStop() {
   BATCH.stop = true;
-  if (BATCH.current) {
-    const vol = findVolume(BATCH.current);
+  BATCH.gen++; // vô hiệu hoá vòng runBatch hiện tại ngay lập tức
+  for (const tag of BATCH.running) {
+    const vol = findVolume(tag);
     if (vol) stopVolume(vol);
   }
   BATCH.active = false;
   BATCH.current = null;
+  BATCH.running.clear();
+  BATCH.queue = [];
 }
 
-async function runBatch(cfg: AppConfig) {
-  while (BATCH.queue.length && !BATCH.stop) {
-    const tag = BATCH.queue.shift()!;
-    BATCH.current = tag;
-    const vol = findVolume(tag);
-    if (!vol) continue;
-    const res = launchVolume(vol, cfg);
-    if (!res.ok) continue;
-    await new Promise<void>((resolve) => {
-      const tick = () => {
-        if (!isVolumeRunning(vol) || BATCH.stop) return resolve();
-        setTimeout(tick, 1500);
-      };
-      tick();
-    });
+// Chạy queue với tối đa BATCH.limit cuốn CÙNG LÚC (mỗi cuốn dùng engine riêng của
+// nó). limit=1 = tuần tự như cũ. Vòng lặp: lấp đầy tới limit, chờ, thu cuốn xong.
+// Thoát ngay nếu gen đổi (một start/stop khác đã tiếp quản).
+// Tổng số cuốn ĐANG chạy (kể cả cuốn chạy lẻ bằng "Chạy ngày"), để limit là trần
+// đồng thời THẬT, không chỉ đếm cuốn do batch mở.
+function runningCount(): number {
+  return loadVolumes().filter((v) => !v.skip && isVolumeRunning(v)).length;
+}
+
+async function runBatch(cfg: AppConfig, gen: number) {
+  const alive = () => BATCH.gen === gen && !BATCH.stop;
+  while (alive() && (BATCH.queue.length || BATCH.running.size)) {
+    while (alive() && runningCount() < BATCH.limit && BATCH.queue.length) {
+      const tag = BATCH.queue.shift()!;
+      const vol = findVolume(tag);
+      if (!vol) continue;
+      if (isVolumeRunning(vol)) {
+        BATCH.running.add(tag);
+        continue;
+      }
+      const res = launchVolume(vol, cfg);
+      if (res.ok) BATCH.running.add(tag);
+      else console.error(`[batch] không chạy được ${tag}: ${res.error}`);
+    }
+    BATCH.current = BATCH.running.values().next().value ?? null;
+    await new Promise<void>((resolve) => setTimeout(resolve, 1500));
+    if (BATCH.gen !== gen) return; // start/stop khác đã tiếp quản -> nhường
+    for (const tag of [...BATCH.running]) {
+      const vol = findVolume(tag);
+      if (!vol || !isVolumeRunning(vol)) BATCH.running.delete(tag);
+    }
   }
-  BATCH.active = false;
-  BATCH.current = null;
+  // Chỉ dọn state nếu vòng này vẫn là vòng hiện hành (tránh xoá state của vòng mới).
+  if (BATCH.gen === gen) {
+    BATCH.active = false;
+    BATCH.current = null;
+    BATCH.running.clear();
+  }
 }
