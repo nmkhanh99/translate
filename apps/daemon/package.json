@@ -8,7 +8,7 @@
   },
   "scripts": {
     "dev": "tsx src/cli.ts --no-open",
-    "build": "esbuild src/cli.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/cli.mjs --external:better-sqlite3 --banner:js=\"import{createRequire}from'module';const require=createRequire(import.meta.url);\"",
+    "build": "esbuild src/cli.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/cli.mjs --external:better-sqlite3 --banner:js=\"import{createRequire}from'module';const require=createRequire(import.meta.url);\" && cp src/pipeline-runner.mjs dist/",
     "start": "node dist/cli.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

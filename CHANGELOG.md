@@ -1,5 +1,34 @@
 # Changelog
 
+## 2026-07-12 (kiến trúc: runner điều phối pipeline — bỏ hẳn "LLM trông workflow")
+
+### Changed
+
+- **Pipeline Claude giờ do `pipeline-runner.mjs` (Node) điều phối**, thay cho mô
+  hình cũ "spawn `claude -p` → model gọi Workflow nền → model chờ" (nguồn gốc
+  lỗi *chạy 1 lúc bị dừng*, và bản vá sleep-loop trước đó cũng chỉ là chắp vá).
+  Đảo vai trò: Node giữ vòng đời (vòng lặp, checkpoint, retry, concurrency 3),
+  model CHỈ dịch — mỗi đơn vị việc là một lệnh `claude -p` ngắn, tool-call
+  đồng bộ, không có gì chạy nền để bị giết.
+- Runner cover đủ pipeline: chunk → translate → merge → vchunk → verify →
+  merge → apply → vision (theo trang) → auto-fix (kênh text, ≤2 vòng) →
+  review-summary; hỗ trợ resume stage `review`, `only=vision` + `visPages`;
+  volume `done` chạy lại là thoát ngay (không apply/re-vision vô ích);
+  thiếu output translate/verify thì DỪNG (rc=2), không apply thiếu.
+- Log tiến độ từng đơn vị (`✔ tr:003 (4/7)`) đổ thẳng vào run.log — thấy live
+  trong màn chi tiết run. Watchdog giữ nguyên làm lưới an toàn (rc=0 non) cho
+  đường Codex/Grok; rc≠0 là lỗi thật, không tự lặp.
+- Bỏ prompt "sleep 120 + poll" (không hợp lý — vẫn dựa kỷ luật LLM);
+  `buildClaudePipelinePrompt` xoá khỏi prompts.ts.
+
+### Kiểm chứng (end-to-end thật, stub engine — không tốn quota)
+
+- PDF 4 trang + stub `claude` (CFA_CLAUDE_BIN): full pipeline chạy RC=0,
+  bản dịch vào PDF, vision pool song song, hội tụ stage=done.
+- Resume nguyên trạng → done-exit tức thì; CLI hỏng → retry 1 lần rồi rc=2,
+  KHÔNG apply thiếu; only=vision + visPages=1 → render + soát đúng 1 trang.
+
+
 ## 2026-07-12 (fix: chạy một lúc bị dừng — thoát non ở chế độ headless)
 
 ### Fixed

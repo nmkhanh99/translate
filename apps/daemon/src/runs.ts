@@ -5,11 +5,10 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { getAdapter, ENGINE_IDS, type EngineId } from "@cfa-translate/agent-adapters";
 import type { AppConfig } from "@cfa-translate/shared";
 import {
-  buildClaudePipelinePrompt,
   buildMcpBatchPrompt,
   type RunOpts,
 } from "./prompts.js";
-import { REPO_ROOT } from "./paths.js";
+import { PYTHON_DIR, REPO_ROOT, RUNNER_PATH, pythonBin } from "./paths.js";
 import {
   codexDone,
   effectiveStage,
@@ -93,20 +92,38 @@ export function launchVolume(
   }
 
   const sid = randomUUID();
-  const prompt =
-    engine === "claude"
-      ? buildClaudePipelinePrompt(vol, !!cfg.vision, runOpts)
-      : buildMcpBatchPrompt(vol, cfg.codex_batch ?? 25);
-
-  const cmd = adapter.buildPipelineCmd({
-    runId: sid,
-    cwd: REPO_ROOT,
-    workdir: vol.workdir,
-    prompt,
-    model: cfg.model,
-    posture: cfg.posture,
-    sessionId: sid,
-  });
+  let cmd: string[];
+  if (engine === "claude") {
+    // Orchestration nằm ở RUNNER (node) — model chỉ dịch từng đơn vị việc qua
+    // `claude -p` ngắn, KHÔNG còn cảnh model gọi Workflow nền rồi kết thúc lượt
+    // làm workflow bị giết giữa chừng ("chạy 1 lúc lại bị dừng").
+    cmd = [
+      process.execPath,
+      RUNNER_PATH,
+      JSON.stringify({
+        pdf: vol.pdf,
+        workdir: vol.workdir,
+        out: vol.out,
+        tool: PYTHON_DIR,
+        python: pythonBin(),
+        model: cfg.model,
+        posture: cfg.posture,
+        vision: !!cfg.vision,
+        ...(runOpts || {}),
+      }),
+    ];
+  } else {
+    const prompt = buildMcpBatchPrompt(vol, cfg.codex_batch ?? 25);
+    cmd = adapter.buildPipelineCmd({
+      runId: sid,
+      cwd: REPO_ROOT,
+      workdir: vol.workdir,
+      prompt,
+      model: cfg.model,
+      posture: cfg.posture,
+      sessionId: sid,
+    });
+  }
 
   mkdirSync(vol.workdir, { recursive: true });
   const logPath = join(vol.workdir, "run.log");

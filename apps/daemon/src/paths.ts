@@ -28,6 +28,10 @@ export const CFG_PATH = join(TOOL_DIR, "dashboard.json");
  *  (packaged → Resources/ui-out). */
 export const UI_OUT = process.env.CFA_UI_OUT || join(REPO_ROOT, "apps/ui/out");
 
+/** Orchestrator pipeline (plain .mjs, không bundle) — nằm cạnh file này:
+ *  dev = apps/daemon/src/, packaged = dist/ (build script copy sang). */
+export const RUNNER_PATH = join(here, "pipeline-runner.mjs");
+
 export function ensureDirs() {
   for (const d of [INPUT_DIR, OUTPUT_DIR, USER_WORK]) {
     if (!existsSync(d)) mkdirSync(d, { recursive: true });
