@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-07-12 (fix: chạy một lúc bị dừng — thoát non ở chế độ headless)
+
+### Fixed
+
+- **Run tự dừng sau ~10 phút dù pipeline chưa xong.** Nguyên nhân (thấy ở cả
+  v4/v5/v6): CLI headless gọi Workflow (chạy nền) rồi KẾT THÚC LƯỢT ("Đang chờ
+  workflow hoàn tất...") → process thoát rc=0 → workflow nền bị giết giữa chừng.
+  Sửa 2 tầng:
+  1. **Prompt pipeline** ép vòng chờ chủ động: sau khi gọi Workflow phải lặp
+     `sleep 120` + poll `agent_pipeline.py status` tới khi done/review — cấm
+     dùng lịch hẹn/kết thúc lượt khi workflow còn chạy.
+  2. **Watchdog daemon**: thoát rc=0 mà stage chưa done/review/error → tự chạy
+     tiếp sau 5s (resume theo checkpoint), tối đa 3 lần liên tiếp; ghi rõ
+     `[watchdog] ... tự chạy tiếp (lần N/3)` vào run.log (thấy ngay trong màn
+     chi tiết). Bấm Dừng huỷ cả timer đang chờ (không tự chạy lại cái vừa dừng);
+     rc≠0 (lỗi thật/Dừng) không bao giờ tự chạy — tránh lặp khi hết quota.
+
+
 ## 2026-07-12 (ENGINE FIX đợt 1 — sửa 7 lớp cơ chế trong pdf_core)
 
 ### Fixed

@@ -62,6 +62,7 @@ import {
   batchStop,
   isVolumeRunning,
   launchVolume,
+  resetAutoResume,
   stopVolume,
 } from "./runs.js";
 
@@ -246,6 +247,7 @@ export function createApp() {
       }
     }
 
+    resetAutoResume(vol.tag); // chạy thủ công: cấp lại quota watchdog tự-chạy-tiếp
     const r = launchVolume(vol, CFG, engine, runOpts);
     if (!r.ok) return res.status(409).json({ error: r.error });
     if (engine) saveEnginePref(vol.workdir, engine);

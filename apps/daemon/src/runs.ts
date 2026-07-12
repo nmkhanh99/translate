@@ -34,6 +34,19 @@ export interface RunInfo {
 const RUNS = new Map<string, RunInfo>();
 const starting = new Set<string>();
 
+// Watchdog "thoát non": CLI headless đôi khi gọi Workflow (chạy nền) rồi KẾT
+// THÚC LƯỢT ("đang chờ workflow...") -> process thoát rc=0, workflow bị giết
+// giữa chừng dù pipeline chưa xong. Checkpoint theo file nên chạy lại là resume
+// đúng chỗ — tự relaunch tối đa AUTO_RESUME_MAX lần; đặt lại đếm khi user bấm
+// Chạy thủ công (resetAutoResume từ /api/run).
+const AUTO_RESUME_MAX = 3;
+const autoResume = new Map<string, number>();
+const autoResumeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+export function resetAutoResume(tag: string) {
+  autoResume.delete(tag);
+}
+
 export const BATCH = {
   active: false,
   stop: false,
@@ -160,6 +173,7 @@ export function launchVolume(
       r.proc = null;
       r.mode = "exited";
     }
+    maybeAutoResume(vol, cfg, engine, runOpts, code, logPath);
   });
 
   // spawn() reports a missing binary (ENOENT) via an async "error" event, not
@@ -199,7 +213,60 @@ export function launchVolume(
   return { ok: true, sid };
 }
 
+/**
+ * Thoát SẠCH (rc=0) nhưng pipeline CHƯA tới done/review/error = agent kết thúc
+ * lượt non (workflow nền bị giết). Tự chạy tiếp sau 5s (resume theo checkpoint),
+ * tối đa AUTO_RESUME_MAX lần liên tiếp. rc != 0 (lỗi thật / bị Dừng SIGTERM)
+ * thì KHÔNG tự chạy — tôn trọng người dùng và tránh lặp trên lỗi quota.
+ */
+function maybeAutoResume(
+  vol: VolumeRec,
+  cfg: AppConfig,
+  engine: string,
+  runOpts: RunOpts | undefined,
+  code: number | null,
+  logPath: string
+) {
+  if (code !== 0) return;
+  let stage = "";
+  try {
+    stage = effectiveStage(pythonStatus(vol.workdir).stage, cfg);
+  } catch {
+    return;
+  }
+  if (["done", "review", "error"].includes(stage) || codexDone(vol)) return;
+  const n = autoResume.get(vol.tag) || 0;
+  const note =
+    n >= AUTO_RESUME_MAX
+      ? `\n[watchdog] thoát non ở stage=${stage} nhưng đã tự chạy lại ${n} lần — dừng, cần bấm Chạy thủ công.\n`
+      : `\n[watchdog] tiến trình thoát rc=0 nhưng stage=${stage} chưa xong — tự chạy tiếp (lần ${n + 1}/${AUTO_RESUME_MAX})…\n`;
+  try {
+    const fd = openSync(logPath, "a");
+    writeSync(fd, note);
+    closeSync(fd);
+  } catch {
+    /* ignore */
+  }
+  if (n >= AUTO_RESUME_MAX) return;
+  autoResume.set(vol.tag, n + 1);
+  const t = setTimeout(() => {
+    autoResumeTimers.delete(vol.tag);
+    if (!isVolumeRunning(vol) && !starting.has(vol.tag)) {
+      launchVolume(vol, cfg, engine, runOpts);
+    }
+  }, 5000);
+  autoResumeTimers.set(vol.tag, t);
+}
+
 export function stopVolume(vol: VolumeRec): boolean {
+  // Người dùng chủ động dừng: huỷ cả auto-resume đang chờ, kẻo 5s sau watchdog
+  // lại tự chạy tiếp cái vừa bị dừng.
+  const t = autoResumeTimers.get(vol.tag);
+  if (t) {
+    clearTimeout(t);
+    autoResumeTimers.delete(vol.tag);
+  }
+  autoResume.set(vol.tag, AUTO_RESUME_MAX);
   const r = RUNS.get(vol.tag);
   let pid = r?.proc?.pid;
   if (!pid) {
@@ -244,6 +311,7 @@ function pendingTags(cfg: AppConfig): string[] {
 
 export function batchStart(cfg: AppConfig, limit = 1): boolean {
   if (BATCH.active) return false;
+  autoResume.clear(); // batch mới: cho phép watchdog hoạt động lại trên mọi cuốn
   const gen = ++BATCH.gen;
   BATCH.queue = pendingTags(cfg);
   BATCH.limit = Math.max(1, Math.min(8, Math.floor(limit) || 1));

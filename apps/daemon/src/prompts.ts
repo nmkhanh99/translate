@@ -46,8 +46,16 @@ export function buildClaudePipelinePrompt(
     "Bạn đang chạy pipeline dịch 1 volume CFA sang tiếng Việt (giữ layout). " +
     `Dùng công cụ Workflow với scriptPath "${VOLUME_JS}" và args (JSON) sau:\n` +
     `${JSON.stringify(runArgs)}\n\n` +
-    "CHỜ workflow chạy XONG hoàn toàn rồi báo lại đúng status JSON cuối cùng " +
-    "của nó. KHÔNG kết thúc lượt cho tới khi workflow hoàn tất. Không hỏi lại."
+    "⚠ CHẾ ĐỘ HEADLESS: kết thúc lượt là tiến trình THOÁT và workflow nền BỊ " +
+    "GIẾT giữa chừng. Vì vậy sau khi gọi Workflow, PHẢI giữ lượt sống bằng " +
+    "vòng lặp chờ chủ động:\n" +
+    `1) Bash: sleep 120\n` +
+    `2) Bash: cd "${PYTHON_DIR}" && python3 agent_pipeline.py status "${vol.workdir}"\n` +
+    "3) Nếu nhận được thông báo workflow hoàn tất, HOẶC status có stage " +
+    '"done"/"review" — dừng lặp và báo đúng status JSON cuối cùng. Ngược lại ' +
+    "quay lại bước 1.\n" +
+    "TUYỆT ĐỐI KHÔNG: dùng lịch hẹn/cron/ScheduleWakeup, nói 'sẽ kiểm tra sau', " +
+    "hay kết thúc lượt khi workflow còn chạy. Không hỏi lại."
   );
 }
 
