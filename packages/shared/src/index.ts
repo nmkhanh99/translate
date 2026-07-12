@@ -52,6 +52,8 @@ export interface AppConfig {
   vision?: boolean;
   posture?: "allowlist" | "bypass" | string;
   codex_batch?: number;
+  /** Số agent dịch/soát chạy SONG SONG trong 1 run (pipeline Claude), 1..10. */
+  agents?: number;
 }
 
 export interface Volume {

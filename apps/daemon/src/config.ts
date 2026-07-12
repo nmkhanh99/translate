@@ -10,6 +10,7 @@ export const DEFAULT_CFG: Required<
     | "posture"
     | "vision"
     | "codex_batch"
+    | "agents"
     | "budget"
     | "budget_warn"
   >
@@ -19,6 +20,7 @@ export const DEFAULT_CFG: Required<
   posture: "allowlist",
   vision: true,
   codex_batch: 25,
+  agents: 3,
   budget: 100,
   budget_warn: 90,
 };

@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-07-12 (option "Agent song song" — tăng tốc pipeline)
+
+### Added
+
+- **Cài đặt → "Agent song song (Claude)" (1..10, mặc định 3):** số agent
+  dịch/soát chạy CÙNG LÚC trong một cuốn (mỗi agent = 1 tiến trình `claude -p`
+  xử lý 1 chunk/trang). Nhiều hơn = nhanh hơn, đổi lại dễ chạm rate-limit tài
+  khoản. Áp dụng cho lần chạy kế tiếp; run.log ghi rõ `agents=N` ở dòng đầu.
+- Chuỗi: `AppConfig.agents` → `/api/config` (validate 1..10) → runner
+  `concurrency`. Đo thực tế bằng stub engine: agents=8 → song song đỉnh = 8.
+- Kết hợp với "Song song N cuốn" ở Hàng đợi: tổng tiến trình model ≈
+  N cuốn × agents — cân nhắc quota khi tăng cả hai.
+
+
 ## 2026-07-12 (fix: sập merge-tr vì checkpoint hỏng — pipeline tự lành)
 
 ### Fixed

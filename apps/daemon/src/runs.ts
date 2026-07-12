@@ -109,6 +109,7 @@ export function launchVolume(
         model: cfg.model,
         posture: cfg.posture,
         vision: !!cfg.vision,
+        concurrency: cfg.agents,
         ...(runOpts || {}),
       }),
     ];

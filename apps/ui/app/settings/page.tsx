@@ -33,6 +33,7 @@ export default function Settings() {
         posture: cfg.posture || "allowlist",
         vision: cfg.vision !== false,
         codex_batch: cfg.codex_batch ?? 25,
+        agents: cfg.agents ?? 3,
       });
       toast("Đã lưu cài đặt");
     } catch (e) {
@@ -161,6 +162,25 @@ export default function Settings() {
                   set("codex_batch", parseInt(e.target.value, 10) || 25)
                 }
               />
+            </div>
+            <div className="field">
+              <label>Agent song song (Claude)</label>
+              <input
+                className="input num"
+                type="number"
+                min={1}
+                max={10}
+                value={cfg.agents ?? 3}
+                onChange={(e) => {
+                  const n = parseInt(e.target.value, 10) || 3;
+                  set("agents", Math.max(1, Math.min(10, n)));
+                }}
+              />
+              <span className="hint">
+                Số agent dịch/soát chạy cùng lúc trong MỘT cuốn (pipeline Claude).
+                Nhiều hơn = nhanh hơn, nhưng dễ chạm giới hạn tài khoản. Áp dụng
+                cho lần chạy kế tiếp.
+              </span>
             </div>
           </div>
         </section>

@@ -171,6 +171,9 @@ export function createApp() {
     ) {
       CFG.codex_batch = body.codex_batch;
     }
+    if (typeof body.agents === "number" && body.agents >= 1 && body.agents <= 10) {
+      CFG.agents = Math.floor(body.agents);
+    }
     if (typeof body.budget === "number" && body.budget >= 0) {
       CFG.budget = body.budget;
     }

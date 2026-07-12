@@ -24,7 +24,9 @@ const TOOL = A.tool;
 const WD = A.workdir;
 const CLAUDE = A.claudeBin || process.env.CFA_CLAUDE_BIN || "claude";
 const MODEL = A.model || "sonnet";
-const CONCURRENCY = 3;
+// Số agent (tiến trình `claude -p`) chạy song song — config "agents" trong app
+// (Cài đặt). Nhiều hơn = nhanh hơn, nhưng dễ chạm rate-limit tài khoản hơn.
+const CONCURRENCY = Math.max(1, Math.min(10, Math.floor(A.concurrency) || 3));
 const UNIT_TIMEOUT_MS = 15 * 60 * 1000; // 1 đơn vị việc (chunk/trang) tối đa 15'
 const MAX_FIX_ROUNDS = 2;
 
@@ -162,7 +164,7 @@ async function visionPass(pagesCsv) {
 }
 
 async function main() {
-  log(`bắt đầu: ${A.pdf} -> ${A.out} (model=${MODEL}, only=${A.only || "-"})`);
+  log(`bắt đầu: ${A.pdf} -> ${A.out} (model=${MODEL}, agents=${CONCURRENCY}, only=${A.only || "-"})`);
   const onlyVision = A.only === "vision";
   let st = lastJson(py("status", WD), { stage: "?" });
   if (st.stage === "done" && !onlyVision) {
