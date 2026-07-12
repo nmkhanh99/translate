@@ -111,6 +111,44 @@ Thứ tự sửa engine khuyến nghị (tác động/трang lớn nhất, rủ
 
 MỌI fix ở trên bắt buộc đi qua vòng golden (mục 3).
 
+### Trạng thái fix engine (2026-07-12) — ĐÃ VÀO pdf_core
+
+Đã triển khai + kiểm chứng (extraction-diff sentinel 34 trang × v1+v2, golden
+624+656 trang, 21 agent chấm trực quan src|cũ|mới: 12 better/4 same, các điểm
+trừ còn lại là cache-miss chờ dịch bù):
+
+| Fix | Cơ chế | Kết quả xác nhận |
+|-----|--------|------------------|
+| `_num_cell` strip tiền tệ + − | bảng EUR/USD nhận diện đúng hàng số | p31/p53 bảng thẳng cột ✓ |
+| highlight tier-1 | chỉ xoá annot GIAO vùng redact | p28/p65 highlight công thức trở lại ✓ |
+| `_line_is_heading` theo tỷ lệ ≥0.8 | bold run-in hết bị coi heading | p43/100/195/235 câu nhập lại ✓ |
+| bullet: blk∨tx0−6, clamp left, tx0 bỏ ws-span | hết nuốt đoạn kế/đè glyph/lệch nhãn | p17 ✓, p130 ✓ |
+| `_collect_drawing_lines` + clamp đáy/phải | viền khung/ngoặc vector thành obstacle | p57/p184 hết tràn ✓ |
+| `_line_is_formula_fragment` per-line (7 rule) | mảnh công thức không bị redact/flatten | p28 P̄/E + X̄_H nguyên vẹn ✓ |
+| `_shave_redacts` xuyên block | 'Solution:' hết bị ăn glyph | p84 ✓ |
+
+Còn lại (theo thứ tự giá trị):
+1. **Highlight tier-2**: vẽ lại highlight theo box MỚI khi %-giao đủ lớn
+   (p18/p63 vẫn mất highlight ở đoạn CÓ dịch — tier-1 chỉ cứu vùng giữ nguyên).
+2. **Right-widen khi co chữ** (`max_right` trong layout + fallback trong `_fit`
+   trước khi shrink): cứu cụm co font (p103/135).
+3. **p25 same-y overlap**: mảnh bold nằm cùng hàng nhưng KHÔNG cùng band y-center
+   — điều kiện inline chưa bắt được, trang này chưa đổi.
+4. Bảng nhãn KHÔNG đậm (Exhibit 15 p38) — cần gate như phản biện bang_vo(2).
+5. Mảnh 'and ˆ' (prefix prose + mũ công thức tách dòng) — vụn, hiếm.
+
+### Sau MỘT đợt engine fix (bắt buộc, theo thứ tự)
+
+```bash
+# mỗi volume ĐÃ/ĐANG dịch:
+python3 agent_pipeline.py golden-snap "$OUT" "$WD"   # baseline TRƯỚC apply mới
+python3 agent_pipeline.py chunk  "$SRC" "$WD" --force  # todo = text mới do đổi segmentation
+# (tuỳ chọn: vchunk --force nếu muốn re-verify toàn bộ — thường không cần)
+# rồi chạy pipeline từ app: dịch bù (ít) -> apply -> vision quét lại trang stale
+```
+v1 sau đợt này: 272 text cần dịch bù (7 chunk); v2: ~347 text. Vision sẽ tự
+re-review vì OUT đổi — chấp nhận một lần sau engine change lớn.
+
 ## 4. Kênh POLICY
 
 Hành vi cố ý của engine mà vision cứ flag mãi (vd mất highlight):

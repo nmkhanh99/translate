@@ -1,5 +1,74 @@
 # Changelog
 
+## 2026-07-12 (ENGINE FIX đợt 1 — sửa 7 lớp cơ chế trong pdf_core)
+
+### Fixed
+
+Sửa engine render theo LỚP CƠ CHẾ (áp dụng mọi PDF cùng họ, không vá theo trang;
+mỗi fix theo điều kiện an toàn từ vòng phản biện 15-agent trước đó):
+
+- **Bảng có mã tiền tệ vỡ cột** (`_num_cell`): strip tiền tố EUR/USD + nhận dấu
+  trừ Unicode − → hàng `EUR0/EUR50/EUR1,000` được giữ nguyên cột.
+- **Mất highlight** (tier-1, `apply_translations`): chỉ xoá annotation GIAO vùng
+  redact — highlight trên công thức/vùng giữ-nguyên được GIỮ LẠI.
+- **Nhãn bold run-in tách rời câu** (`_line_is_heading`): phân loại heading theo
+  TỶ LỆ ký tự đậm/lớn (≥0.8) thay vì span trội.
+- **Bullet vỡ hình học** (`_extract_bulleted`): continuation nhận theo (cùng
+  block ∨ thẳng lề text −6) thay vì so cột glyph; clamp left ≥ tx0; tx0 bỏ span
+  toàn whitespace (2 chỗ).
+- **Tràn/đè viền khung & ngoặc nhọn** (`_collect_drawing_lines`): lấy đường kẻ
+  vector từ `page.get_drawings()` (primitive mỏng + 4 cạnh khung stroke + path
+  hẹp-cao) làm obstacle; kẹp đáy (`_clamp_bottom_hlines`: chỉ chặn phần nới thêm,
+  phủ ≥60% bề ngang) + kẹp mép phải (`_clamp_right_vlines`, sàn = rect gốc).
+- **Công thức bị redact nửa vời** (`_line_is_formula_fragment`): guard per-line
+  7 rule (FORMULA_HEAD+mật độ, 'biến =' ngắn ít từ, ký hiệu mạnh+ít từ, dòng
+  toàn glyph gạch/overline, span lệch cỡ ≥60%, ≥2 ZWSP, token mồ côi ≤2 ký tự)
+  ở cả 3 đường đi; mảnh làm boundary kẹp đáy (không đè).
+- **Redact ăn glyph xuyên block** (`_shave_redacts`): shave phần chờm ≤3pt/≤30%
+  vào dòng giữ-nguyên, 2 chiều, guard chống rect lộn ngược.
+
+### Kiểm chứng
+
+- Extraction-diff bộ sentinel 34 trang (v1 + v2): mọi thay đổi truy được về đúng
+  fix; text chỉ merge/giữ-có-chủ-đích, không rớt.
+- Golden pixel-diff: v1 364/624 trang đổi (89/111 trang defect được chạm),
+  v2 386/656; `ok:true` cả hai.
+- 21 agent chấm trực quan (src|cũ|mới): **12 better / 4 same / 3 mixed / 2
+  worse** — mọi điểm trừ là cache-miss chờ dịch bù hoặc highlight tier-2 (chưa
+  làm, có chủ đích); 1 regression thật (`FVt = PVer t.` vẽ đè 2 lớp p57) đã vá
+  bằng rule 'biến = ngắn ít từ' + unit test 4 case biên + render lại xác nhận.
+- `chunk --force` v1: 272 text cần dịch bù (7 chunk) — chạy pipeline là xong.
+
+### Fixed (vòng review thứ 2 — /code-review đa-agent, 10 findings CONFIRMED)
+
+Codex hết quota ("usage limit") nên dùng bộ review đa-agent của Claude thay thế
+(finder theo góc + verifier độc lập, có case verify bằng chạy thật). Sửa cả 10:
+
+- Guard formula per-line quá rộng: `σ`/`±`/`→∞` giữa câu prose, `'Yes.'`,
+  `'of 0.05.'`, `'so'`… bị coi là công thức → siết: strong-math cần mật độ
+  math≥3 + ≤2 từ; orphan-token cần KHÔNG có từ thật nào + có chữ số.
+- Ceiling redact LỘN NGƯỢC khi boundary cùng hàng (3 chỗ) → guard `y1>ceiling>y0`
+  (rect rỗng làm chữ Anh sống sót, vẽ đè 2 lớp).
+- `_line_is_heading` trả True cho dòng toàn whitespace → xé đoạn làm 2 → False.
+- Inline-heading merge nuốt nhầm nhãn side-by-side (`Step 1 | nội dung`) → thêm
+  điều kiện giao ngang thật.
+- Annot trên header vẽ-lại không bị xoá (lệch chỗ) → red_rects gộp cả header.
+- `_shave_redacts` kept-box mỏng NẰM TRỌN trong redact cắt cụt redact → yêu cầu
+  straddle mép thật.
+- `snap_extract` PDF ngắn hơn sentinel → spec rỗng = 'all' âm thầm → dừng rõ.
+
+Sau sửa: 22/22 unit case biên PASS (giữ nguyên mọi true-positive: FVt, n−1, P,
+ZWSP, thanh phân số, ∑(1/Xi); loại hết false-positive), sentinel diff ổn định
+đúng 29 trang đã kiểm chứng.
+
+### Technical
+
+- `snap_extract.py` (mới): snapshot/diff extraction bộ trang sentinel — lưới
+  regression khi sửa pdf_core, dùng kèm golden-diff.
+- OUT thật CHƯA bị ghi đè (apply thử ra /tmp); lần chạy pipeline kế tiếp sẽ
+  dịch bù + apply engine mới + vision quét lại. Playbook cập nhật trạng thái
+  fix + thủ tục sau engine-change.
+
 ## 2026-07-12 (hệ thống sửa layout "cho chuẩn": defect-report + golden + playbook)
 
 ### Added

@@ -28,7 +28,10 @@ _BULLET_CHARS = set("□❑▪■◾◼●◦‣•◻☐∙‚")  # ký tự đ
 _LABEL_RE = re.compile(r"^[A-Za-z0-9]{1,2}[.)]$")  # nhãn đậm ngắn 'A.'/'B.'/'1.' đầu dòng
 _COPYRIGHT_RE = re.compile(
     r"For candidate use only|©\s*CFA|©\s*\d{4}|All rights reserved|\bISBN\b", re.I)
-_NUM_CELL = re.compile(r"^[\$\(\)–—\-\d.,%\s]+$")  # ô số trong bảng
+_NUM_CELL = re.compile(r"^[\$\(\)–—−\-\d.,%\s]+$")  # ô số trong bảng (gồm − U+2212)
+# Mã tiền tệ dán liền số: 'EUR0', 'USD1,000', '−USD1,800' -> strip để _num_cell
+# nhận ra ô số (bảng có tiền tố tiền tệ trước đây bị coi là prose -> vỡ cột).
+_CCY_PREFIX = re.compile(r"(?<![A-Za-z])[A-Z]{2,4}(?=[\d(.])")
 _FORMULA_HEAD = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,4}\s*=")  # 'V0=', 'p1u =' ...
 _MATH_CH = set("=+−-×÷/^()[]{}0123456789.,%$≤≥≠≈∑∫√·•")
 # Ký hiệu HÀM Ý mạnh là toán (tổng, căn, bất đẳng thức, mũi tên, sigma...).
@@ -140,7 +143,12 @@ def _is_code_font(font):
 #  Phân loại / nhận diện
 # ====================================================================
 def _num_cell(t):
-    return bool(_NUM_CELL.match(t)) and any(c.isdigit() for c in t)
+    if bool(_NUM_CELL.match(t)) and any(c.isdigit() for c in t):
+        return True
+    # Ô số mang mã tiền tệ (EUR0 / USD1,000 / −USD1,800): strip cục bộ tiền tố
+    # rồi thử lại — KHÔNG đổi ngữ nghĩa _NUM_CELL toàn cục.
+    t2 = _CCY_PREFIX.sub("", t)
+    return t2 != t and bool(_NUM_CELL.match(t2)) and any(c.isdigit() for c in t2)
 
 
 _TOC_NUM = re.compile(r"^[ivxlcdm\d]{1,4}$", re.I)  # số trang đứng riêng (la mã/ả rập)
@@ -300,7 +308,7 @@ def _col_text(lines):
 
 
 def _extract_label_row(cols, all_boxes, page_bottom, pno, segments, layout, ctr,
-                        next_top=None):
+                        next_top=None, hlines=None):
     """Dịch riêng từng CỘT nội dung của 1 hàng nhãn+cột (mục 6, fix #9) — GIỮ NGUYÊN
     cột nhãn đậm (đúng quy ước 'heading/nhãn in đậm giữ nguyên tiếng Anh'), mỗi cột nội
     dung có khung riêng nên không đè lên cột kế / hàng kế. `next_top`: mép trên hàng
@@ -335,6 +343,7 @@ def _extract_label_row(cols, all_boxes, page_bottom, pno, segments, layout, ctr,
             if ob.x1 <= rect.x0 + 2 or ob.x0 >= rect.x1 - 2:
                 continue
             bottom = min(bottom, ob.y0 - 2)
+        bottom = _clamp_bottom_hlines(rect, bottom, hlines)
         right = rect.x1                            # không tràn sang cột kế bên phải
         if i + 1 < len(content_cols):
             right = max(right, min(ln["bbox"][0] for ln in content_cols[i + 1]) - 4)
@@ -396,9 +405,96 @@ def _label_span_idx(spans):
     return 0
 
 
+def _line_is_formula_fragment(line, body_size):
+    """MẢNH công thức ở mức DÒNG (overline, sub/superscript, tử/mẫu phân số bị
+    PyMuPDF tách rời) -> giữ nguyên, không gom vào run prose để redact/flatten
+    (cụm congthuc_vo). CỐ Ý hẹp hơn _is_formula_like (không dùng rule '<=1 từ,
+    math-ratio' — dòng kết đoạn kiểu 'of 0.05.' sẽ dính oan):
+      - mở đầu 'biến =' (FORMULA_HEAD), hoặc
+      - chứa ký hiệu toán MẠNH (Σ √ ≤ ...), hoặc
+      - dòng CHỈ là glyph overline/macron đứng lẻ (<=2 ký tự; '______' điền-vào-
+        chỗ-trống dài hơn nên không trúng), hoặc
+      - span lệch cỡ >25% thân bài (sub/superscript) chiếm >=60% ký tự dòng,
+        hoặc dòng không có từ tự nhiên nào mà vẫn có span lệch cỡ
+        (footnote ¹ ² giữa câu prose: share nhỏ -> không trúng)."""
+    txt = _span_text(line["spans"]).strip()
+    if not txt:
+        return False
+    # dòng toàn glyph gạch/overline (thanh phân số, overline, fill-in-blank):
+    # không có gì để dịch, redact sẽ phá cấu trúc -> giữ nguyên (mọi độ dài)
+    if all(c in "_‾¯̅" for c in txt):
+        return True
+    letters = sum(c.isalpha() for c in txt)
+    math = sum(c in _MATH_CH for c in txt)
+    longw = sum(1 for w in _WORD_RE.findall(txt) if len(w) >= 4)
+    # 'biến =' phải kèm MẬT ĐỘ toán (như rule 1 _is_formula_like) — dòng chú
+    # giải 'PV = present value of...' là prose định nghĩa, phải được dịch
+    if _FORMULA_HEAD.match(txt) and len(txt) <= 60 and math >= max(2, letters * 0.4):
+        return True
+    # 'biến =' RẤT NGẮN, gần như không có từ tự nhiên ('FVt = PVe^rt' với mũ bị
+    # tách span): mật độ toán thấp vì toàn chữ-biến, nhưng vẫn là công thức —
+    # dịch sẽ vẽ đè 2 lớp lên công thức được giữ. 'A = periodic cash flow' có
+    # >=2 từ tự nhiên nên không trúng.
+    if _FORMULA_HEAD.match(txt) and len(txt) <= 20 and longw <= 1:
+        return True
+    # ký hiệu toán mạnh + RẤT ÍT từ tự nhiên + đủ MẬT ĐỘ toán (math>=3 như rule 3
+    # _is_formula_like) — 'the standard deviation σ is' hay 't → ∞' lẻ trong câu
+    # prose không có ký tự toán nào khác thì vẫn là prose, phải được dịch
+    words_n = len(_WORD_RE.findall(txt))
+    if any(c in _STRONG_MATH for c in txt) and longw <= 2 and math >= 3 and words_n <= 2:
+        return True
+    total = dev = 0
+    for s in line["spans"]:
+        n = len(s["text"].strip().replace(" ", ""))
+        if not n:
+            continue
+        total += n
+        if abs(s["size"] - body_size) > body_size * 0.25:
+            dev += n
+    if total and dev / total >= 0.6:
+        return True
+    if dev > 0 and longw == 0:
+        return True
+    # Bộ typeset công thức của sách nhét ZERO-WIDTH SPACE (U+200B) dày đặc giữa
+    # các token toán ('X ​ H​ = ​', 'Y ​)​ 2​'). >=2 ZWSP mà gần như không có từ
+    # tự nhiên -> mảnh công thức. Prose chỉ có lác đác 1 ZWSP đầu dòng.
+    if txt.count("​") >= 2 and longw <= 1:
+        return True
+    # Token mồ côi cực ngắn ('P' tử phân số, '10') / cụm KHÔNG CÓ từ tự nhiên nào
+    # chỉ vài chữ cái + chữ số ('n − 1' mẫu phân số). PHẢI không chứa từ thật —
+    # 'so', 'Yes.', 'of 0.05.', 'is 5%.' đều có từ (_WORD_RE >=2 chữ cái) nên là
+    # đuôi đoạn văn, phải được dịch (đúng docstring, review finding #4/#7/#8).
+    clean = txt.replace("​", "").strip()
+    words_all = _WORD_RE.findall(clean)
+    if len(clean) <= 2 and not words_all:
+        return True
+    return (not words_all and letters <= 3
+            and any(c.isdigit() for c in clean))
+
+
 def _line_is_heading(line, body_size):
-    sp = _dominant(line["spans"])
-    return sp is None or _heading_font(sp["font"]) or sp["size"] > body_size * 1.12
+    """Heading = TỶ LỆ ký tự heading-style (đậm/italic/lớn hơn thân bài) chiếm
+    >= 0.8 số ký tự non-whitespace của dòng. Trước đây xét theo span TRỘI
+    (_dominant) — câu chứa thuật ngữ bold run-in mà phần chữ thường bị PyMuPDF
+    cắt vụn thành nhiều span nhỏ sẽ bị coi nhầm là heading (share thực ~0.5) ->
+    giữ nguyên tiếng Anh + tách rời khỏi câu (cụm lỗi label_tach_dong).
+    Heading thật ('Solution:'/'Excel') ~100% ký tự đậm -> vẫn đúng."""
+    if not line["spans"]:
+        return True                    # không có span nào (như _dominant None cũ)
+    total = heads = 0
+    for s in line["spans"]:
+        n = len(s["text"].strip().replace(" ", ""))
+        if not n:
+            continue
+        total += n
+        if _heading_font(s["font"]) or s["size"] > body_size * 1.12:
+            heads += n
+    if total == 0:
+        # CÓ span nhưng toàn whitespace: là dòng đệm trong đoạn — coi như
+        # continuation (False), không phải boundary heading (kẻo xé đoạn làm 2
+        # segment + kẹp đáy giữa đoạn — review finding #3).
+        return False
+    return heads / total >= 0.8
 
 
 # ====================================================================
@@ -414,6 +510,85 @@ def _bottom_limit(rect, all_boxes, page_bottom):
             continue
         limit = min(limit, b.y0 - 2)
     return max(limit, rect.y1)
+
+
+def _collect_drawing_lines(page):
+    """Đường KẺ vector của trang -> (hlines, vlines) dạng fitz.Rect. all_boxes chỉ
+    lấy từ get_text('dict') nên viền khung (LEARNING MODULE OVERVIEW, box Example),
+    ngoặc nhọn, cột chart... VÔ HÌNH với extractor -> box dịch nới xuyên viền
+    (cụm tràn_khung/chu_de_chong). Quy tắc (theo phản biện):
+    - primitive MỎNG ('l'/'re' có bbox h<=2.5 & w>=30, hoặc w<=2.5 & h>=30) là
+      đường kẻ bất kể fill/stroke (thanh fill 1pt vẫn là rule line);
+    - 're' DÀY chỉ tách 4 cạnh khi path CÓ STROKE (khung viền); fill-only dày là
+      nền shading -> BỎ (kẻo kẹp đáy giữa đoạn văn có nền);
+    - path stroke tổng thể HẸP-CAO (w<=12, h>=30, vd ngoặc nhọn vẽ bằng curve)
+      -> 1 vline tại bbox."""
+    hl, vl = [], []
+
+    def _classify(x0, y0, x1, y1):
+        w, h = x1 - x0, y1 - y0
+        if h <= 2.5 and w >= 30:
+            hl.append(fitz.Rect(x0, y0, x1, y1))
+        elif w <= 2.5 and h >= 30:
+            vl.append(fitz.Rect(x0, y0, x1, y1))
+
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return hl, vl
+    for d in drawings:
+        stroked = "s" in (d.get("type") or "")
+        for it in d.get("items", []):
+            kind = it[0]
+            if kind == "l":
+                p1, p2 = it[1], it[2]
+                _classify(min(p1.x, p2.x), min(p1.y, p2.y),
+                          max(p1.x, p2.x), max(p1.y, p2.y))
+            elif kind == "re":
+                r = it[1]
+                w, h = r.width, r.height
+                if h <= 2.5 or w <= 2.5:
+                    _classify(r.x0, r.y0, r.x1, r.y1)   # rect mỏng = đường kẻ
+                elif stroked:                             # khung viền -> 4 cạnh
+                    _classify(r.x0, r.y0, r.x1, r.y0)
+                    _classify(r.x0, r.y1, r.x1, r.y1)
+                    _classify(r.x0, r.y0, r.x0, r.y1)
+                    _classify(r.x1, r.y0, r.x1, r.y1)
+        r = d.get("rect")
+        if stroked and r is not None and r.width <= 12 and r.height >= 30:
+            vl.append(fitz.Rect(r.x0, r.y0, r.x0 + 1, r.y1))  # ngoặc nhọn/cột hẹp
+    return hl, vl
+
+
+def _clamp_bottom_hlines(rect, bottom, hlines):
+    """Kẹp đáy theo đường kẻ ngang NẰM DƯỚI text gốc (y0 >= rect.y1 - 2 — chỉ chặn
+    phần NỚI THÊM, không bao giờ kẹp vào trong text: gạch chân/kẻ hàng GIỮA đoạn
+    không được co chữ oan) và PHỦ GẦN HẾT bề ngang item (>= 60% — viền khung luôn
+    rộng hơn text bên trong; underline một cụm từ thì hẹp -> bỏ qua)."""
+    if not hlines:
+        return bottom
+    for ln in hlines:
+        if ln.y0 < rect.y1 - 2 or ln.y0 >= bottom:
+            continue
+        ov = min(ln.x1, rect.x1) - max(ln.x0, rect.x0)
+        if ov >= 0.6 * max(rect.width, 1):
+            bottom = min(bottom, ln.y0 - 2)
+    return max(bottom, rect.y1)
+
+
+def _clamp_right_vlines(rect, right, bottom, vlines):
+    """Kẹp mép PHẢI theo đường kẻ dọc/ngoặc nhọn nằm BÊN PHẢI text gốc
+    (x0 >= rect.x1 - 2) và giao dọc với [rect.y0, bottom]. Sàn: không bao giờ
+    hẹp hơn rect.x1 (viền sát chữ không được làm box hẹp hơn text gốc)."""
+    if not vlines:
+        return right
+    for v in vlines:
+        if v.x0 < rect.x1 - 2 or v.x0 >= right:
+            continue
+        if v.y1 <= rect.y0 or v.y0 >= bottom:
+            continue
+        right = min(right, v.x0 - 3)
+    return max(right, rect.x1)
 
 
 def _int_color_to_rgb(c):
@@ -449,14 +624,56 @@ def extract_segments(doc, pages_spec):
         body = _body_size(pd)
         all_boxes = [fitz.Rect(b["bbox"]) for b in pd["blocks"]]
         page_bottom = page.rect.height - 50
+        hlines, vlines = _collect_drawing_lines(page)
         lines = _collect_lines(pd)
+        start = len(layout)
         if _has_bullets(lines):
             _extract_bulleted(lines, body, all_boxes, page_bottom, pno,
-                              segments, layout, ctr)
+                              segments, layout, ctr, hlines=hlines, vlines=vlines)
         else:
             _extract_blocky(pd, body, all_boxes, page_bottom, pno,
-                            segments, layout, ctr)
+                            segments, layout, ctr, hlines=hlines, vlines=vlines)
+        # Kẹp redact xuyên block theo MỌI dòng giữ-nguyên của trang (heading,
+        # nhãn, mảnh công thức) — xem _shave_redacts.
+        kept = [fitz.Rect(L["bbox"]) for L in lines
+                if _line_is_heading(L, body) or _line_is_formula_fragment(L, body)]
+        if kept:
+            _shave_redacts(layout[start:], kept)
     return segments, layout
+
+
+def _shave_redacts(layout_items, kept_boxes):
+    """Kẹp redact XUYÊN BLOCK: bbox dòng PDF luôn chồm nhẹ ascender/descender
+    sang dòng kề — nếu dòng kề là dòng GIỮ NGUYÊN (heading/nhãn/mảnh công thức ở
+    block khác), redact chờm ~1-2pt sẽ ăn lẹm glyph của nó ('Solution:' mất chữ,
+    cụm khac p84). Chỉ shave khi giao 2D THẬT và phần chờm NHỎ (<=3pt hoặc <=30%
+    chiều cao redact) — kept-line cao (công thức phân số) chờm sâu thì KHÔNG
+    shave kẻo sót chữ Anh của chính đoạn bị redact. Bỏ qua nếu shave làm rect
+    lộn ngược. Idempotent với ceiling-clamp #13/#15 sẵn có (min/max hai lần)."""
+    for it in layout_items:
+        # span bbox có thể là tuple -> chuẩn hoá list để gán được
+        it["redact"] = [list(r) for r in it["redact"]]
+        for r in it["redact"]:
+            rr = fitz.Rect(r)
+            for k in kept_boxes:
+                ox = min(rr.x1, k.x1) - max(rr.x0, k.x0)
+                oy = min(rr.y1, k.y1) - max(rr.y0, k.y0)
+                if ox <= 0 or oy <= 0:
+                    continue
+                if oy > min(3.0, 0.3 * max(rr.height, 1)):
+                    continue
+                # kept box phải VƯỢT RA NGOÀI mép redact (straddle) — kept mỏng
+                # nằm TRỌN TRONG redact (glyph overline ~2pt giữa dòng chữ) mà
+                # shave thì cắt cụt redact tới sát đỉnh, chữ Anh bên dưới sống
+                # sót -> song ngữ đè nhau (review finding #6).
+                if rr.y0 < k.y0 < rr.y1 and k.y1 >= rr.y1:   # chờm TRÊN xuống kept
+                    ny1 = k.y0 - 1
+                    if ny1 > r[1]:
+                        r[3] = min(r[3], ny1)
+                elif rr.y0 < k.y1 < rr.y1 and k.y0 <= rr.y0:  # chờm DƯỚI lên kept
+                    ny0 = k.y1 + 1
+                    if ny0 < r[3]:
+                        r[1] = max(r[1], ny0)
 
 
 def _emit(segments, layout, ctr, pno, text, redact, box, size, color):
@@ -481,8 +698,36 @@ def _heading_split_runs(lines, body):
     in đậm giữ nguyên tiếng Anh), fix cho lỗi 'Solution:' bị dịch dính vào đáp án
     trước đó vì _is_prose_block chỉ xét span CHIẾM ĐA SỐ ký tự của cả block."""
     runs, cur = [], []
-    for ln in lines:
+    n = len(lines)
+    for i, ln in enumerate(lines):
+        # Mảnh công thức CHECK TRƯỚC heading (thứ tự quan trọng — phản biện (5)):
+        # cắt run tại đó, giữ nguyên, dòng này thành boundary kẹp đáy run trước
+        # (tái dùng cơ chế next_heading) -> không redact nửa công thức nữa.
+        if _line_is_formula_fragment(ln, body):
+            if cur:
+                runs.append((cur, ln))
+                cur = []
+            continue
         if _line_is_heading(ln, body):
+            # Heading phải ĐỨNG RIÊNG một hàng thị giác. Mảnh bold/italic nằm
+            # CÙNG HÀNG (y-center rơi vào band dòng prose kề) là run-in fragment
+            # -> nhập vào run (dịch inline), không phải boundary — hết cảnh chữ
+            # Việt vẽ chồng lên glyph tiếng Anh được "giữ nguyên" (p25).
+            cy = (ln["bbox"][1] + ln["bbox"][3]) / 2
+            inline = False
+            for j in (i - 1, i + 1):
+                if 0 <= j < n and not _line_is_heading(lines[j], body):
+                    nb = lines[j]["bbox"]
+                    # cùng hàng thị giác VÀ giao ngang thật — nhãn side-by-side
+                    # ('Step 1' bên trái cột nội dung) x-disjoint nên vẫn là
+                    # boundary, không bị nhập vào run (review finding #9)
+                    if (nb[1] <= cy <= nb[3]
+                            and min(ln["bbox"][2], nb[2]) > max(ln["bbox"][0], nb[0])):
+                        inline = True
+                        break
+            if inline:
+                cur.append(ln)
+                continue
             if cur:
                 runs.append((cur, ln))
                 cur = []
@@ -494,7 +739,7 @@ def _heading_split_runs(lines, body):
 
 
 def _extract_labeled_lines(lines, body, all_boxes, page_bottom, pno,
-                            segments, layout, ctr):
+                            segments, layout, ctr, hlines=None):
     """Dịch riêng các dòng NHÃN ĐẬM+NỘI DUNG ('A. text'/'B. text'...) trong 1 block
     của đường đi blocky, giữ NGUYÊN glyph nhãn (không redact/dịch) — fix #15, tương
     đương _label_span_idx trong _extract_bulleted nhưng cho block không-bullet.
@@ -510,7 +755,10 @@ def _extract_labeled_lines(lines, body, all_boxes, page_bottom, pno,
             if cur:
                 items.append(cur)
             text_spans = [s for k, s in enumerate(ln["spans"]) if k != bidx]
-            tx0 = min((s["bbox"][0] for s in text_spans), default=ln["bbox"][0])
+            # bỏ span TOÀN whitespace (dấu cách đệm sau nhãn '1.\t') khỏi tx0 —
+            # kẻo box dán sát nhãn + cả khối lệch trái (fix cụm bullet_indent p130)
+            tx0 = min((s["bbox"][0] for s in text_spans if s["text"].strip()),
+                      default=ln["bbox"][0])
             cur = {"lines": [ln], "spans": list(text_spans), "left": tx0}
         elif _line_is_heading(ln, body):
             if cur:
@@ -543,13 +791,17 @@ def _extract_labeled_lines(lines, body, all_boxes, page_bottom, pno,
             if ob.x1 <= rect.x0 + 2 or ob.x0 >= rect.x1 - 2:
                 continue
             bottom = min(bottom, ob.y0 - 2)
+        bottom = _clamp_bottom_hlines(rect, bottom, hlines)
         redact = [list(s["bbox"]) for s in it["spans"]]
         if next_line is not None and _line_is_heading(next_line, body):
             # trần redact = mép trên nhãn heading kế (bbox 2 dòng liền kề trong PDF
             # nguồn thường chồng lấn nhẹ theo chiều dọc) -> không ăn lẹm glyph (fix #13)
             ceiling = next_line["bbox"][1] - 1
             for r in redact:
-                if r[3] > ceiling:
+                # chỉ kẹp khi không làm rect LỘN NGƯỢC — boundary cùng hàng
+                # (mảnh công thức tách span ở cùng y) cho ceiling < y0, kẹp sẽ
+                # tạo rect rỗng -> chữ Anh không bị xoá, vẽ đè 2 lớp (finding #2)
+                if r[3] > ceiling > r[1]:
                     r[3] = ceiling
         _emit(segments, layout, ctr, pno, _span_text(it["spans"]),
               redact=redact,
@@ -557,7 +809,8 @@ def _extract_labeled_lines(lines, body, all_boxes, page_bottom, pno,
               size=tsp["size"], color=tsp["color"])
 
 
-def _extract_blocky(pd, body, all_boxes, page_bottom, pno, segments, layout, ctr):
+def _extract_blocky(pd, body, all_boxes, page_bottom, pno, segments, layout, ctr,
+                    hlines=None, vlines=None):
     """Đường đi trang VĂN XUÔI (sách volume)."""
     cands = []
     for b in pd["blocks"]:
@@ -568,7 +821,7 @@ def _extract_blocky(pd, body, all_boxes, page_bottom, pno, segments, layout, ctr
             for ri, cols in enumerate(rows):
                 nt = rows[ri + 1][0][0]["bbox"][1] if ri + 1 < len(rows) else None
                 _extract_label_row(cols, all_boxes, page_bottom, pno, segments, layout, ctr,
-                                    next_top=nt)
+                                    next_top=nt, hlines=hlines)
             continue
         blines = b["lines"]
         if any(_label_span_idx(ln["spans"]) >= 0 for ln in blines):
@@ -581,7 +834,7 @@ def _extract_blocky(pd, body, all_boxes, page_bottom, pno, segments, layout, ctr
             # gộp chung dòng khác) thì dịch PHẲNG cả dòng, mất đậm nhãn 'A./B./C.' (đúng
             # lý do fix #14 xử lý ở _extract_bulleted, nhưng đường blocky chưa có).
             _extract_labeled_lines(blines, body, all_boxes, page_bottom, pno,
-                                    segments, layout, ctr)
+                                    segments, layout, ctr, hlines=hlines)
             continue
         if not _is_prose_block(b, body):
             continue
@@ -610,6 +863,7 @@ def _extract_blocky(pd, body, all_boxes, page_bottom, pno, segments, layout, ctr
             if ob.x1 <= rect.x0 + 2 or ob.x0 >= rect.x1 - 2:
                 continue
             bottom = min(bottom, ob.y0 - 2)
+        bottom = _clamp_bottom_hlines(rect, bottom, hlines)
         # Trần redact = mép trên nhãn heading kế tiếp (nếu có): bbox của các "line"
         # liền kề trong CÙNG 1 block PyMuPDF thường chồng lấn nhẹ theo chiều dọc
         # (ascender/descender) -> nếu redact đúng bbox thô của dòng cuối cùng có
@@ -620,7 +874,9 @@ def _extract_blocky(pd, body, all_boxes, page_bottom, pno, segments, layout, ctr
         redact = []
         for ln in run:
             r = fitz.Rect(ln["bbox"])
-            if redact_ceiling is not None and r.y1 > redact_ceiling:
+            # guard chống rect lộn ngược khi boundary (heading/mảnh công thức)
+            # nằm cùng hàng với dòng redact (finding #2)
+            if redact_ceiling is not None and r.y1 > redact_ceiling > r.y0:
                 r.y1 = redact_ceiling
             redact.append(list(r))
         _emit(segments, layout, ctr, pno, "\n".join(_span_text(ln["spans"]) for ln in run),
@@ -660,7 +916,7 @@ def _merge_orphan_bullets(lines):
 
 
 def _extract_bulleted(lines, body, all_boxes, page_bottom, pno,
-                      segments, layout, ctr):
+                      segments, layout, ctr, hlines=None, vlines=None):
     """Đường đi trang DANH SÁCH bullet — dựng lại từng mục từ DÒNG.
     Giữ glyph bullet (không redact), canh lề treo."""
     lines = _merge_orphan_bullets(lines)
@@ -682,6 +938,13 @@ def _extract_bulleted(lines, body, all_boxes, page_bottom, pno,
         if _is_copyright(txt) or _line_is_heading(L, body):
             close(L)
             continue
+        # Mảnh công thức (overline/sub-superscript bị tách dòng): KHÔNG nối vào
+        # mục, KHÔNG mở mục mới (sẽ bị redact) — đóng mục hiện tại và truyền L
+        # làm boundary để kẹp đáy box (mảnh cùng block nên vòng kẹp all_boxes
+        # mức block không thấy nó — phản biện điều kiện (6)).
+        if _line_is_formula_fragment(L, body):
+            close(L)
+            continue
         bidx = _bullet_idx(L["spans"])
         if bidx < 0:
             bidx = _label_span_idx(L["spans"])
@@ -690,26 +953,40 @@ def _extract_bulleted(lines, body, all_boxes, page_bottom, pno,
         if bidx >= 0:
             close()
             text_spans = [s for k, s in enumerate(L["spans"]) if k != bidx]
-            tx0 = min((s["bbox"][0] for s in text_spans), default=L["bbox"][0])
+            # bỏ span toàn whitespace khỏi tx0 (như _extract_labeled_lines)
+            tx0 = min((s["bbox"][0] for s in text_spans if s["text"].strip()),
+                      default=L["bbox"][0])
             tsp = _dominant(text_spans) or sp
             cur = {"lines": [L], "redact": [s["bbox"] for s in text_spans],
                    "text": [_span_text(text_spans)], "top": L["bbox"][1],
                    "last_y1": L["bbox"][3], "left": tx0,
-                   "bullet_x": L["bbox"][0],
+                   "bullet_x": L["bbox"][0], "tx0": tx0, "src_blk": L["blk"],
                    "size": tsp["size"], "color": tsp["color"]}
-        elif (cur and L["bbox"][0] > cur["bullet_x"] - 6
-              and L["bbox"][1] - cur["last_y1"] < lh * 1.8
-              # dòng KHÔNG-bullet chỉ nối được vào 1 mục KHÔNG-bullet nếu CÙNG block
-              # gốc (khác block = mục/hàng KHÁC đứng gần nhau, vd 2 LOS liền kề
-              # trong bảng LEARNING OUTCOMES không có glyph bullet -> không được
-              # gộp dù đứng gần theo chiều dọc). Mục có bullet giữ nguyên hành vi cũ.
-              and (cur.get("blk") is None or L["blk"] == cur["blk"])):
+        elif (cur and L["bbox"][1] - cur["last_y1"] < lh * 1.8
+              and (
+                  # Mục CÓ bullet/nhãn: nhận dòng CÙNG block gốc HOẶC thẳng lề
+                  # text (>= tx0-6). Trước đây so với bullet_x (cột glyph) nên
+                  # dòng đầu ĐOẠN VĂN KHÁC (block khác, thụt ngang glyph) bị nuốt
+                  # vào mục + min() kéo mép trái box về cột glyph -> chữ Việt đè
+                  # lên glyph ■ và mất hanging indent (cụm bullet_indent p17).
+                  (cur.get("blk") is None
+                   and (L["blk"] == cur.get("src_blk")
+                        or L["bbox"][0] > cur.get("tx0", cur["bullet_x"]) - 6))
+                  # Đoạn văn thường: CÙNG block (fix #11) + nới lề trái -6 -> -20
+                  # để đón cả câu bị tách sau nhãn bold run-in đứng lệch phải
+                  # (cụm label_tach_dong p195) — khác block vẫn bị chặn.
+                  or (cur.get("blk") is not None and L["blk"] == cur["blk"]
+                      and L["bbox"][0] > cur["bullet_x"] - 20)
+              )):
             # dòng tiếp nối của mục hiện tại
             cur["lines"].append(L)
             cur["redact"].extend(s["bbox"] for s in L["spans"])
             cur["text"].append(txt)
             cur["last_y1"] = L["bbox"][3]
             cur["left"] = min(cur["left"], L["bbox"][0])
+            if cur.get("blk") is None:
+                # box của mục có glyph/nhãn không bao giờ trùm lên glyph
+                cur["left"] = max(cur["left"], cur.get("tx0", cur["left"]))
         else:
             # dòng body đứng một mình (đoạn văn không bullet chen giữa các mục, vd
             # đoạn INTRODUCTION ngay sau khối LEARNING OUTCOMES) -> mở mục MỚI làm
@@ -752,6 +1029,7 @@ def _extract_bulleted(lines, body, all_boxes, page_bottom, pno,
             if ob.x1 <= rect.x0 + 2 or ob.x0 >= rect.x1 - 2:
                 continue
             bottom = min(bottom, ob.y0 - 2)
+        bottom = _clamp_bottom_hlines(rect, bottom, hlines)
         if _is_formula_like(" ".join(it["text"])):   # dòng công thức (kể cả có ■) -> giữ
             continue
         # Trần REDACT = mép trên nhãn heading kế (nếu có): bbox các SPAN/dòng liền kề
@@ -764,13 +1042,14 @@ def _extract_bulleted(lines, body, all_boxes, page_bottom, pno,
             redact = []
             for r in it["redact"]:
                 rr = fitz.Rect(r)
-                if rr.y1 > ceiling:
+                # guard chống rect lộn ngược khi boundary cùng hàng (finding #2)
+                if rr.y1 > ceiling > rr.y0:
                     rr.y1 = ceiling
                 redact.append(list(rr))
+        right = _clamp_right_vlines(rect, max(col_right, rect.x1), bottom, vlines)
         _emit(segments, layout, ctr, pno, " ".join(it["text"]),
               redact=redact,
-              box=[it["left"], it["top"], max(col_right, rect.x1),
-                   max(bottom, rect.y1)],
+              box=[it["left"], it["top"], right, max(bottom, rect.y1)],
               size=it["size"], color=it["color"])
 
 
@@ -826,12 +1105,18 @@ def apply_translations(doc, layout, translations, fontfile=None):
     missing = [it["id"] for it in layout if not translations.get(it["id"])]
     for pno, items in by_page.items():
         page = doc[pno]
-        # Xoá markup annotation (Highlight/Underline/StrikeOut/Squiggly): rect cố
-        # định theo chữ Anh, khi chữ Việt reflow sẽ lệch -> đè đoạn khác (artifact).
+        # Xoá markup annotation (Highlight/Underline/StrikeOut/Squiggly) NHƯNG chỉ
+        # khi rect của nó GIAO vùng bị redact: chữ Việt reflow làm annot neo theo
+        # chữ Anh lệch chỗ. Annot phủ vùng GIỮ NGUYÊN (công thức, dòng bị filter
+        # bỏ qua) vẫn đúng vị trí -> GIỮ LẠI (fix cụm 'mất highlight' — trước đây
+        # xoá tất cả trên trang có dịch, mất cả highlight của công thức).
+        hdrs = _header_dups(page)              # dọn header lặp trên trang bị redact
+        red_rects = [fitz.Rect(r) for it, _vi in items for r in it["redact"]]
+        red_rects += [rect for rect, _t, _s, _c in hdrs]  # header cũng bị redact+vẽ lại
         for an in list(page.annots() or []):
             if an.type[1] in ("Highlight", "Underline", "StrikeOut", "Squiggly"):
-                page.delete_annot(an)
-        hdrs = _header_dups(page)              # dọn header lặp trên trang bị redact
+                if any(an.rect.intersects(rr) for rr in red_rects):
+                    page.delete_annot(an)
         for item, _vi in items:
             for r in item["redact"]:
                 page.add_redact_annot(fitz.Rect(r))
