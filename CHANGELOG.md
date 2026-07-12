@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-07-12 (fix: sập merge-tr vì checkpoint hỏng — pipeline tự lành)
+
+### Fixed
+
+- **Runner sập `merge-tr rc=1` (JSONDecodeError).** Nguyên nhân: 39 file
+  checkpoint (out/vout/vis) trên v1/v4/v5/v6 bị HỎNG JSON — di sản các run cũ
+  bị giết giữa lúc agent đang ghi file. `merge-tr` đọc không phòng bị -> sập;
+  `pending` chỉ kiểm tra tồn tại file -> chunk hỏng không bao giờ được làm lại.
+- **Tự lành (self-healing) ở 4 chỗ:** `pending` translate/verify phát hiện
+  output hỏng/sai kiểu -> XOÁ + coi như chưa làm (được làm lại ngay trong run);
+  `merge-tr`/`merge-vr` gặp file hỏng -> xoá + cảnh báo thay vì sập;
+  `vis-pages` verdict hỏng -> xoá để trang được review lại (không còn cảnh
+  trang "đã review" nhưng lỗi biến mất khỏi review_issues).
+- Đã chạy healing trên dữ liệu thật: 39 file hỏng được dọn, các đơn vị việc
+  tương ứng vào lại hàng đợi (v6 +20 chunk, v4/v5 +14 vchunk, v1 vis 2 trang);
+  merge-tr v6 chạy sạch. Không còn file hỏng.
+
+
 ## 2026-07-12 (kiến trúc: runner điều phối pipeline — bỏ hẳn "LLM trông workflow")
 
 ### Changed

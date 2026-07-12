@@ -36,6 +36,16 @@ def _load(p, default):
     return json.load(open(p, encoding="utf-8")) if os.path.exists(p) else default
 
 
+def _load_checkpoint(p):
+    """Đọc file checkpoint (out/vout/vis). Trả None nếu file hỏng (JSON lỗi —
+    di sản của tiến trình bị giết giữa lúc ghi) — caller XOÁ để đơn vị việc đó
+    tự vào lại hàng đợi ở lần quét pending sau (self-healing, không sập merge)."""
+    try:
+        return json.load(open(p, encoding="utf-8"))
+    except Exception:
+        return None
+
+
 def cmd_chunk(pdf, workdir, size=40, force=False):
     """Resume-safe: chỉ tạo chunks/ một lần. KHÔNG xoá out/ (giữ tiến độ dịch).
     Đã có chunks/ -> no-op trừ khi force=True.
@@ -76,14 +86,25 @@ def cmd_chunk(pdf, workdir, size=40, force=False):
 
 def cmd_merge_tr(pdf, workdir):
     text2vi = _load(_wd(workdir, "text2vi.json"), {})
-    n = 0
+    n, bad = 0, 0
     for f in glob.glob(_wd(workdir, "out", "c_*.json")):
+        d = _load_checkpoint(f)
+        if not isinstance(d, dict):
+            os.remove(f)            # hỏng -> xoá để pending re-queue chunk này
+            bad += 1
+            continue
         idx = os.path.basename(f).split("_")[1].split(".")[0]
-        src = {it["id"]: it["text"] for it in json.load(open(_wd(workdir, "chunks", f"c_{idx}.json")))}
-        for cid, vi in json.load(open(f)).items():
+        cf = _wd(workdir, "chunks", f"c_{idx}.json")
+        src_items = _load_checkpoint(cf) if os.path.exists(cf) else None
+        if not isinstance(src_items, list):
+            continue                # chunk nguồn không khớp (đổi chunking) -> bỏ
+        src = {it["id"]: it["text"] for it in src_items}
+        for cid, vi in d.items():
             if cid in src and vi:
                 text2vi[src[cid]] = vi
                 n += 1
+    if bad:
+        print(f"  (xoá {bad} file out hỏng JSON — sẽ dịch lại các chunk đó)")
     json.dump(text2vi, open(_wd(workdir, "text2vi.json"), "w"), ensure_ascii=False)
     doc = fitz.open(pdf)
     segs, _ = pdf_core.extract_segments(doc, "all")
@@ -142,9 +163,9 @@ def cmd_merge_vr(workdir):
     vid2en = _load(_wd(workdir, "vid2en.json"), {})
     n, bad = 0, 0
     for f in glob.glob(_wd(workdir, "vout", "v_*.json")):
-        try:
-            d = json.load(open(f, encoding="utf-8"))
-        except Exception:
+        d = _load_checkpoint(f)
+        if not isinstance(d, dict):
+            os.remove(f)            # hỏng -> xoá để pending re-queue vchunk này
             bad += 1
             continue
         for vid, corrected in d.items():
@@ -152,7 +173,7 @@ def cmd_merge_vr(workdir):
                 text2vi[vid2en[vid]] = corrected
                 n += 1
     if bad:
-        print(f"  (bỏ qua {bad} file vout hỏng JSON)")
+        print(f"  (xoá {bad} file vout hỏng JSON — sẽ verify lại các vchunk đó)")
     json.dump(text2vi, open(_wd(workdir, "text2vi.json"), "w"), ensure_ascii=False)
     print(f"corrections_applied={n}")
     return n
@@ -360,6 +381,11 @@ def cmd_vis_pages(pdf, out, workdir, dpi=130, only=None):
             if stale and os.path.exists(vjson):
                 os.remove(vjson)
                 invalidated += 1
+        # verdict hỏng JSON (tiến trình cũ bị giết giữa lúc ghi) -> xoá để trang
+        # được review lại; nếu để nguyên, _status đếm nó là "đã review" nhưng
+        # merge-vis bỏ qua -> lỗi của trang biến mất khỏi review_issues.
+        if os.path.exists(vjson) and not isinstance(_load_checkpoint(vjson), list):
+            os.remove(vjson)
         if not os.path.exists(vjson):
             todo.append({"page": i, "img": png})
     json.dump(todo, open(_wd(workdir, "vis_todo.json"), "w"), ensure_ascii=False)
@@ -664,8 +690,14 @@ def cmd_pending(workdir, stage, lo=None, hi=None):
     for f in sorted(glob.glob(_wd(workdir, sub, f"{pfx}*.json"))):
         idx = os.path.basename(f)[len(pfx):-5]
         op = _wd(workdir, osub, f"{pfx}{idx}.json")
-        if not os.path.exists(op):
-            out.append({"idx": idx, "in": os.path.abspath(f), "out": os.path.abspath(op)})
+        if os.path.exists(op):
+            # Output tồn tại nhưng HỎNG JSON / sai kiểu (tiến trình cũ bị giết
+            # giữa lúc ghi) -> xoá và coi như CHƯA làm, để được làm lại ngay
+            # trong lần chạy này thay vì sập ở merge.
+            if isinstance(_load_checkpoint(op), dict):
+                continue
+            os.remove(op)
+        out.append({"idx": idx, "in": os.path.abspath(f), "out": os.path.abspath(op)})
     print(json.dumps(out, ensure_ascii=False))
     return out
 
