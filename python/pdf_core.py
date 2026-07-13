@@ -11,9 +11,15 @@ Hai kiểu trang được nhận diện THÍCH NGHI (không hard-code cho riêng
     canh lề treo (hanging indent).
 
 Mỗi mục layout dùng schema THỐNG NHẤT để apply:
-  { id, page, redact:[[x0,y0,x1,y1],...], box:[l,t,r,b], size, color }
+  { id, page, redact:[[x0,y0,x1,y1],...], box:[l,t,r,b], size, color,
+    fx?:[[x0,y0,x1,y1],...], lh?, align? }
   - redact: các ô chữ cần xóa (KHÔNG gồm glyph bullet -> bullet được giữ lại).
   - box: vùng vẽ bản dịch (đã nới đáy tới phần tử kế dưới).
+  - fx: rect nguồn của công thức inline thứ N — text segment chứa marker {vN},
+    khi render được thay bằng ẢNH vùng gốc (sub/superscript/ký hiệu giữ nguyên).
+  - lh/align: giãn dòng + canh đều đo từ đoạn nguồn (mặc định 1.12 / trái).
+Text segment có thể chứa marker <b>/<i>/<sup> (đậm/nghiêng/chỉ số) và {vN};
+bản dịch phải GIỮ NGUYÊN marker (check_markers kiểm + tự sửa dạng lệch).
 
 Heading / công thức / số liệu / bảng / đồ thị / hình -> KHÔNG đụng tới.
 """
@@ -93,6 +99,93 @@ def find_font():
     )
 
 
+# HỌ font 4 mặt (regular/bold/italic/bold-italic) cho render rich-text: giữ được
+# đậm/nghiêng inline khi redraw (kỹ thuật học từ BabelDOC FontMapper). Thiếu mặt
+# nào thì rơi về regular (chấp nhận mất mặt đó, không sập).
+_FAMILY_CANDIDATES = [
+    {   # macOS
+        "regular": "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
+        "bold": "/System/Library/Fonts/Supplemental/Times New Roman Bold.ttf",
+        "italic": "/System/Library/Fonts/Supplemental/Times New Roman Italic.ttf",
+        "bolditalic": "/System/Library/Fonts/Supplemental/Times New Roman Bold Italic.ttf",
+    },
+    {   # Linux (Liberation = metric-compatible Times)
+        "regular": "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+        "bold": "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf",
+        "italic": "/usr/share/fonts/truetype/liberation/LiberationSerif-Italic.ttf",
+        "bolditalic": "/usr/share/fonts/truetype/liberation/LiberationSerif-BoldItalic.ttf",
+    },
+    {   # Windows
+        "regular": "C:/Windows/Fonts/times.ttf",
+        "bold": "C:/Windows/Fonts/timesbd.ttf",
+        "italic": "C:/Windows/Fonts/timesi.ttf",
+        "bolditalic": "C:/Windows/Fonts/timesbi.ttf",
+    },
+]
+
+
+def find_font_family(fontfile=None):
+    """{regular, bold, italic, bolditalic} -> đường dẫn ttf. Ưu tiên env
+    CFA_TRANSLATE_FONT_(BOLD|ITALIC|BOLDITALIC); mặt thiếu rơi về regular."""
+    reg = fontfile or find_font()
+    fam = {"regular": reg, "bold": reg, "italic": reg, "bolditalic": reg}
+    for cand in _FAMILY_CANDIDATES:
+        if cand["regular"] == reg and all(os.path.exists(p) for p in cand.values()):
+            fam.update(cand)
+            break
+    for face in ("bold", "italic", "bolditalic"):
+        env = os.environ.get(f"CFA_TRANSLATE_FONT_{face.upper()}", "")
+        if env and os.path.exists(env):
+            fam[face] = env
+    return fam
+
+
+# ====================================================================
+#  Marker inline: {vN} = công thức giữ chỗ; <b>/<i>/<sup> = đậm/nghiêng/chỉ số
+#  (round-trip qua LLM — kỹ thuật placeholder của BabelDOC ILTranslator)
+# ====================================================================
+_PH_RE = re.compile(r"\{v(\d+)\}")
+# biến thể LLM hay viết lệch: { v1 }, (v1), [v1], （v1）, {V1}
+_PH_FUZZ = re.compile(r"[{(\[（【]\s*[vV]\s*(\d+)\s*[})\]）】]")
+_TAG_RE = re.compile(r"</?(?:b|i|sup)>")
+_TAG_TOKEN = re.compile(r"</?(?:b|i|sup)>|\{v\d+\}")
+
+
+def strip_markers(text):
+    """Bỏ mọi marker -> text trần (đo độ dài / render fallback / phân loại)."""
+    return " ".join(_PH_RE.sub(" ", _TAG_RE.sub("", text)).split())
+
+
+_ESCAPED_TAG = re.compile(r"&lt;(/?)(b|i|sup)&gt;")
+
+
+def check_markers(en, vi):
+    """Kiểm + tự sửa marker trong bản dịch. Trả vi đã chuẩn hoá, hoặc None nếu
+    KHÔNG cứu được (mất/lệch placeholder {vN} -> áp bản này sẽ mất công thức):
+      - thẻ bị LLM escape HTML (&lt;i&gt;) -> unescape về <i> (thấy thật khi
+        agent ghi JSON);
+      - {vN} viết lệch dạng ((v1)/{ v1 }/（v1）) -> chuẩn về {vN};
+      - {vN} phải khớp ĐÚNG tập trong en (thiếu/thừa/trùng -> None);
+      - thẻ <b>/<i>/<sup> hỏng cặp hoặc bịa thêm -> strip thẻ đó (mất định dạng
+        nhưng nội dung vẫn đúng — không chặn bản dịch)."""
+    if not vi:
+        return None
+    vi = _ESCAPED_TAG.sub(r"<\1\2>", vi)
+    need = sorted(_PH_RE.findall(en))
+    if need:
+        fixed = _PH_FUZZ.sub(lambda m: "{v%s}" % m.group(1), vi)
+        if sorted(_PH_RE.findall(fixed)) != need:
+            return None
+        vi = fixed
+    elif _PH_RE.search(vi):
+        vi = _PH_RE.sub("", vi)            # placeholder bịa -> bỏ
+    for tag in ("b", "i", "sup"):
+        o, c = vi.count(f"<{tag}>"), vi.count(f"</{tag}>")
+        if o != c or (o and f"<{tag}>" not in en):
+            vi = vi.replace(f"<{tag}>", "").replace(f"</{tag}>", "")
+    return " ".join(vi.split())
+
+
 # ====================================================================
 #  Tiện ích đọc span / line / block
 # ====================================================================
@@ -137,6 +230,154 @@ def _is_code_font(font):
     dịch sẽ phá cú pháp lệnh (vd 'CHISQ.INV(0.95,4)', 'from scipy.stats import ...')."""
     f = font.lower()
     return "courier" in f or "mono" in f or "consol" in f
+
+
+# ====================================================================
+#  Run công thức/inline-style ở mức SPAN (trong 1 dòng prose)
+# ====================================================================
+def _span_bold(s):
+    f = s["font"].lower()
+    return ("bold" in f or "semibold" in f or "black" in f) or bool(s.get("flags", 0) & 16)
+
+
+def _span_italic(s):
+    f = s["font"].lower()
+    return "italic" in f or "oblique" in f or bool(s.get("flags", 0) & 2)
+
+
+def _span_is_mathish(s, seg_size):
+    """Span 'chắc chắn toán' làm HẠT NHÂN của run công thức inline:
+    superscript-flag, lệch cỡ >25% (sub/superscript thật), hoặc token ngắn
+    nhiều ký hiệu toán mạnh/Hy Lạp/dấu kết hợp (σ², X̄, ≥)."""
+    t = s["text"].strip()
+    if not t:
+        return False
+    if s.get("flags", 0) & 1:                      # superscripted (PyMuPDF)
+        return True
+    if seg_size and abs(s["size"] - seg_size) > seg_size * 0.25:
+        return True
+    strong = sum((c in _STRONG_MATH) or (0x370 <= ord(c) < 0x400)
+                 or (0x300 <= ord(c) <= 0x36F) for c in t)
+    letters = sum(c.isascii() and c.isalpha() for c in t)
+    return strong > 0 and letters <= 2 and len(t) <= 12
+
+
+def _span_attachable(s):
+    """Span 'dính' được vào run công thức kề bên: RẤT ngắn, không chứa từ tự
+    nhiên (>=2 chữ cái liên tiếp) — biến 'P', '(1 +', '= 0.6' dính vào run để
+    ảnh công thức trọn vẹn; 'so.', 'of' là từ -> không dính."""
+    t = s["text"].strip()
+    return bool(t) and len(t) <= 4 and not _WORD_RE.search(t)
+
+
+def _gap(a, b):
+    return b["bbox"][0] - a["bbox"][2]
+
+
+def _line_markup(spans, seg_size, fx):
+    """Dựng text 1 dòng CÓ marker từ spans:
+      - run công thức inline -> '{vN}' + append rect nguồn vào fx (redraw sẽ
+        stamp lại ảnh vùng gốc, hết cảnh sub/superscript/phân số vỡ chữ);
+      - chỉ số trên thuần số (footnote ¹²³) -> <sup>N</sup>;
+      - span đậm/nghiêng -> <b>/<i> (giữ định dạng inline qua bản dịch).
+    Guard: tổng run <60% ký tự dòng (dòng đặc toán hơn đã là boundary ở
+    _line_is_formula_fragment); tối đa 8 run/segment."""
+    vis = [s for s in spans if s["text"].strip()]
+    if not vis:
+        return _span_text(spans)
+    math = [_span_is_mathish(s, seg_size) for s in vis]
+    # nới run: dính span kề RẤT ngắn không-từ khi sát nhau (subscript tách span)
+    changed = True
+    while changed:
+        changed = False
+        for i, s in enumerate(vis):
+            if math[i] or not _span_attachable(s):
+                continue
+            near_prev = i > 0 and math[i - 1] and _gap(vis[i - 1], s) < 1.5
+            near_next = i + 1 < len(vis) and math[i + 1] and _gap(s, vis[i + 1]) < 1.5
+            if near_prev or near_next:
+                math[i] = True
+                changed = True
+    total = sum(len(s["text"].strip()) for s in vis)
+    run_chars = sum(len(s["text"].strip()) for s, m in zip(vis, math) if m)
+    parts = []          # (text, first_span_idx, last_span_idx)
+    i = 0
+    while i < len(vis):
+        s = vis[i]
+        if math[i]:
+            j = i
+            while j + 1 < len(vis) and math[j + 1]:
+                j += 1
+            group = vis[i:j + 1]
+            gtxt = " ".join(_span_text(group).split())
+            # footnote/chỉ số trên thuần số đứng lẻ -> <sup>, không cần ảnh
+            if (len(group) == 1 and (s.get("flags", 0) & 1)
+                    and gtxt.isdigit() and len(gtxt) <= 3):
+                parts.append((f"<sup>{gtxt}</sup>", i, j))
+            elif (run_chars < 0.6 * max(total, 1) and len(fx) < 8
+                    and any(_span_is_mathish(g, seg_size) for g in group)):
+                r = fitz.Rect(group[0]["bbox"])
+                for g in group[1:]:
+                    r |= fitz.Rect(g["bbox"])
+                if r.width > 0.5 and r.height > 0.5:
+                    fx.append([r.x0 - 0.5, r.y0 - 0.5, r.x1 + 0.5, r.y1 + 0.5])
+                    parts.append(("{v%d}" % len(fx), i, j))
+                else:
+                    parts.append((gtxt, i, j))
+            else:
+                parts.append((gtxt, i, j))  # run quá lớn/quá nhiều -> giữ dạng chữ
+            i = j + 1
+            continue
+        # nhóm span thường theo style đậm/nghiêng liên tục
+        j = i
+        b0, i0 = _span_bold(s), _span_italic(s)
+        while (j + 1 < len(vis) and not math[j + 1]
+               and _span_bold(vis[j + 1]) == b0 and _span_italic(vis[j + 1]) == i0):
+            j += 1
+        seg = " ".join(_span_text(vis[i:j + 1]).split())
+        if seg:
+            if b0 and i0:
+                seg = f"<b><i>{seg}</i></b>"
+            elif b0:
+                seg = f"<b>{seg}</b>"
+            elif i0:
+                seg = f"<i>{seg}</i>"
+            parts.append((seg, i, j))
+        i = j + 1
+    # Nối các part: có dấu cách nếu (a) text gốc của span biên CÓ whitespace ở
+    # mép ('rate of ' + italic 'g'), hoặc (b) khoảng cách hình học >= 0.5pt.
+    # Sát nhau và không có whitespace gốc (subscript, punctuation dính) -> dán
+    # liền, tránh '<b>term</b> .' hay 'P {v1}' sai chính tả.
+    out = []
+    for k, (txt, a, b) in enumerate(parts):
+        if k:
+            pa, pb = parts[k - 1][1], parts[k - 1][2]
+            prev_raw = _span_text(vis[pa:pb + 1])
+            cur_raw = _span_text(vis[a:b + 1])
+            if (prev_raw != prev_raw.rstrip() or cur_raw != cur_raw.lstrip()
+                    or _gap(vis[pb], vis[a]) >= 0.5):
+                out.append(" ")
+        out.append(txt)
+    return "".join(out)
+
+
+def _seg_lh(lines, size):
+    """Giãn dòng của đoạn nguồn (median delta-y giữa các dòng / cỡ chữ)."""
+    tops = sorted(ln["bbox"][1] for ln in lines)
+    ds = [b - a for a, b in zip(tops, tops[1:]) if 2 < b - a < size * 3]
+    if not ds or not size:
+        return None
+    return max(1.02, min(1.6, statistics.median(ds) / size))
+
+
+def _seg_align(lines, rect):
+    """'j' nếu đoạn nguồn CANH ĐỀU (justify): >=70% các dòng (trừ dòng cuối)
+    chạm mép phải khung. Đoạn <3 dòng không đủ bằng chứng -> None (canh trái)."""
+    if len(lines) < 3:
+        return None
+    body = lines[:-1]
+    just = sum(1 for ln in body if rect.x1 - ln["bbox"][2] <= 2.5)
+    return "j" if just >= max(2, int(0.7 * len(body))) else None
 
 
 # ====================================================================
@@ -198,6 +439,85 @@ def _is_table_row(block):
                 return True
             prev_x1 = x1
     return num_lines >= 2
+
+
+def _gkey(ln):
+    return (round(ln["bbox"][0]), round(ln["bbox"][1]))
+
+
+def _aligned_clusters(vals, tol=5.0, need=3):
+    """Số CỤM giá trị thẳng hàng: sort rồi gom nhóm cách nhau <= tol, đếm nhóm
+    có >= need phần tử."""
+    vals = sorted(vals)
+    groups, i = 0, 0
+    while i < len(vals):
+        j = i
+        while j + 1 < len(vals) and vals[j + 1] - vals[j] <= tol:
+            j += 1
+        if j - i + 1 >= need:
+            groups += 1
+        i = j + 1
+    return groups
+
+
+def _page_grid_keys(pd):
+    """Nhận diện BẢNG >=3 cột ở mức TRANG (bù cho _is_table_row/_label_rows,
+    không cần nhãn đậm/ô số). Cấu trúc thật trong sách: MỖI Ô là một LINE riêng
+    nằm cùng hàng y (vd Exhibit 'ETF | Time Since Inception | Return...').
+    Thuật toán: gom line theo hàng (y-center +-3pt) -> hàng có >=3 ô (khoảng
+    ngang >=10pt) là ứng viên; vùng >=3 hàng ứng viên liên tiếp (cách <28pt)
+    có >=2 cột THẲNG HÀNG THEO TÂM Ô (cột canh giữa/phải nên x0 không thẳng)
+    -> mọi line trong vùng được giữ nguyên tiếng Anh (dịch phẳng sẽ dồn cột —
+    cụm bang_vo). Prose không trúng: 1 ô/hàng; bullet '■ text': 2 ô."""
+    lines = []
+    for b in pd["blocks"]:
+        if b.get("type") != 0:
+            continue
+        for ln in b.get("lines", []):
+            if _span_text(ln["spans"]).strip():
+                lines.append(ln)
+    if len(lines) < 6:
+        return set()
+    lines.sort(key=lambda ln: ((ln["bbox"][1] + ln["bbox"][3]) / 2, ln["bbox"][0]))
+    rows, cur, cy = [], [], None
+    for ln in lines:
+        c = (ln["bbox"][1] + ln["bbox"][3]) / 2
+        if cy is not None and abs(c - cy) <= 3:
+            cur.append(ln)
+        else:
+            if cur:
+                rows.append(cur)
+            cur, cy = [ln], c
+    if cur:
+        rows.append(cur)
+    cand = []                                    # (y_top, [tâm ô 2..n], lines)
+    for row in rows:
+        row.sort(key=lambda ln: ln["bbox"][0])
+        cells = []
+        for ln in row:
+            if cells and ln["bbox"][0] - cells[-1][1] < 10:
+                cells[-1][1] = max(cells[-1][1], ln["bbox"][2])
+                cells[-1][2].append(ln)
+            else:
+                cells.append([ln["bbox"][0], ln["bbox"][2], [ln]])
+        if len(cells) >= 3:
+            centers = [(c[0] + c[1]) / 2 for c in cells[1:]]
+            cand.append((min(ln["bbox"][1] for ln in row), centers, row))
+    if len(cand) < 3:
+        return set()
+    keys = set()
+    region = [cand[0]]
+    for r in cand[1:] + [(1e9, [], [])]:         # sentinel đóng vùng cuối
+        if r[0] - region[-1][0] < 28:
+            region.append(r)
+            continue
+        if len(region) >= 3:
+            centers = [c for _y, cs, _r in region for c in cs]
+            if _aligned_clusters(centers) >= 2:
+                for _y, _cs, row in region:
+                    keys.update(_gkey(ln) for ln in row)
+        region = [r]
+    return keys
 
 
 def _is_prose_block(block, body_size):
@@ -349,10 +669,13 @@ def _extract_label_row(cols, all_boxes, page_bottom, pno, segments, layout, ctr,
             right = max(right, min(ln["bbox"][0] for ln in content_cols[i + 1]) - 4)
         else:
             right = max(right, row_rect.x1)
-        _emit(segments, layout, ctr, pno, _col_text(col),
+        fx = []
+        marked = "\n".join(_line_markup(ln["spans"], sp["size"], fx) for ln in col)
+        _emit(segments, layout, ctr, pno, marked,
               redact=[list(fitz.Rect(ln["bbox"])) for ln in col],
               box=[rect.x0, rect.y0, right, max(bottom, rect.y1)],
-              size=sp["size"], color=sp["color"])
+              size=sp["size"], color=sp["color"],
+              fx=fx, lh=_seg_lh(col, sp["size"]))
 
 
 def _collect_lines(page_dict):
@@ -460,6 +783,24 @@ def _line_is_formula_fragment(line, body_size):
     # tự nhiên -> mảnh công thức. Prose chỉ có lác đác 1 ZWSP đầu dòng.
     if txt.count("​") >= 2 and longw <= 1:
         return True
+    # Phương trình mà TỪ DÀI duy nhất là NHÃN SUB/SUPERSCRIPT: 'R_weekly =
+    # (1 + R_daily)^5 − 1' — longw đếm cả 'weekly/daily' nên các rule trên
+    # trượt. Sub/superscript của sách chỉ nhỏ hơn ~20% (8pt vs 10pt, DƯỚI
+    # ngưỡng 25% của dev-share) hoặc mang flags superscript. Đếm lại từ dài
+    # CHỈ trong span cỡ thường: bằng 0 + có neo '='/ký hiệu mạnh + đủ mật độ
+    # toán + CÓ span lệch (>15% hay flags&1) -> công thức, giữ nguyên. Prose
+    # thật luôn có từ dài cỡ thường nên không trúng.
+    if ("=" in txt or any(c in _STRONG_MATH for c in txt)) and math >= 3:
+        longw_normal = dev_any = 0
+        for s in line["spans"]:
+            if (abs(s["size"] - body_size) > body_size * 0.15
+                    or s.get("flags", 0) & 1):
+                dev_any += 1
+                continue
+            longw_normal += sum(1 for w in _WORD_RE.findall(s["text"])
+                                if len(w) >= 4)
+        if dev_any and longw_normal == 0:
+            return True
     # Token mồ côi cực ngắn ('P' tử phân số, '10') / cụm KHÔNG CÓ từ tự nhiên nào
     # chỉ vài chữ cái + chữ số ('n − 1' mẫu phân số). PHẢI không chứa từ thật —
     # 'so', 'Yes.', 'of 0.05.', 'is 5%.' đều có từ (_WORD_RE >=2 chữ cái) nên là
@@ -625,18 +966,22 @@ def extract_segments(doc, pages_spec):
         all_boxes = [fitz.Rect(b["bbox"]) for b in pd["blocks"]]
         page_bottom = page.rect.height - 50
         hlines, vlines = _collect_drawing_lines(page)
+        gkeys = _page_grid_keys(pd)
         lines = _collect_lines(pd)
         start = len(layout)
         if _has_bullets(lines):
             _extract_bulleted(lines, body, all_boxes, page_bottom, pno,
-                              segments, layout, ctr, hlines=hlines, vlines=vlines)
+                              segments, layout, ctr, hlines=hlines, vlines=vlines,
+                              gkeys=gkeys)
         else:
             _extract_blocky(pd, body, all_boxes, page_bottom, pno,
-                            segments, layout, ctr, hlines=hlines, vlines=vlines)
+                            segments, layout, ctr, hlines=hlines, vlines=vlines,
+                            gkeys=gkeys)
         # Kẹp redact xuyên block theo MỌI dòng giữ-nguyên của trang (heading,
-        # nhãn, mảnh công thức) — xem _shave_redacts.
+        # nhãn, mảnh công thức, dòng bảng lưới) — xem _shave_redacts.
         kept = [fitz.Rect(L["bbox"]) for L in lines
-                if _line_is_heading(L, body) or _line_is_formula_fragment(L, body)]
+                if _line_is_heading(L, body) or _line_is_formula_fragment(L, body)
+                or _gkey(L) in gkeys]
         if kept:
             _shave_redacts(layout[start:], kept)
     return segments, layout
@@ -676,18 +1021,26 @@ def _shave_redacts(layout_items, kept_boxes):
                         r[1] = max(r[1], ny0)
 
 
-def _emit(segments, layout, ctr, pno, text, redact, box, size, color):
+def _emit(segments, layout, ctr, pno, text, redact, box, size, color,
+          fx=None, lh=None, align=None):
     text = " ".join(text.split()).strip()
-    if len(text) < 3:
-        return
+    if len(strip_markers(text)) < 3:
+        return                    # không có prose thật (toàn marker) -> giữ nguyên
     sid = f"s{ctr[0]}"
     ctr[0] += 1
     segments.append({"id": sid, "text": text})
-    layout.append({"id": sid, "page": pno, "redact": redact,
-                   "box": box, "size": size, "color": color})
+    item = {"id": sid, "page": pno, "redact": redact,
+            "box": box, "size": size, "color": color}
+    if fx:                                   # rect nguồn của từng {vN} (theo thứ tự)
+        item["fx"] = [list(r) for r in fx]
+    if lh:
+        item["lh"] = round(lh, 2)
+    if align:
+        item["align"] = align
+    layout.append(item)
 
 
-def _heading_split_runs(lines, body):
+def _heading_split_runs(lines, body, gkeys=None):
     """Tách dòng heading-like (đậm/lớn hơn thân bài, vd nhãn 'Solution:'/'Excel'/
     'Python' đứng riêng 1 dòng) ra khỏi phần văn xuôi/đáp án bao quanh khi chúng bị
     PyMuPDF gộp CHUNG 1 block (vd đáp án 'C. ...' rồi ngay dòng dưới là 'Solution:'
@@ -703,7 +1056,9 @@ def _heading_split_runs(lines, body):
         # Mảnh công thức CHECK TRƯỚC heading (thứ tự quan trọng — phản biện (5)):
         # cắt run tại đó, giữ nguyên, dòng này thành boundary kẹp đáy run trước
         # (tái dùng cơ chế next_heading) -> không redact nửa công thức nữa.
-        if _line_is_formula_fragment(ln, body):
+        # Dòng BẢNG LƯỚI (>=3 cột thẳng hàng, _page_grid_keys) xử lý y hệt:
+        # giữ nguyên tiếng Anh, làm boundary — dịch phẳng sẽ dồn cột (bang_vo).
+        if _line_is_formula_fragment(ln, body) or (gkeys and _gkey(ln) in gkeys):
             if cur:
                 runs.append((cur, ln))
                 cur = []
@@ -759,7 +1114,8 @@ def _extract_labeled_lines(lines, body, all_boxes, page_bottom, pno,
             # kẻo box dán sát nhãn + cả khối lệch trái (fix cụm bullet_indent p130)
             tx0 = min((s["bbox"][0] for s in text_spans if s["text"].strip()),
                       default=ln["bbox"][0])
-            cur = {"lines": [ln], "spans": list(text_spans), "left": tx0}
+            cur = {"lines": [ln], "spans": list(text_spans),
+                   "span_lines": [list(text_spans)], "left": tx0}
         elif _line_is_heading(ln, body):
             if cur:
                 items.append(cur)
@@ -767,8 +1123,10 @@ def _extract_labeled_lines(lines, body, all_boxes, page_bottom, pno,
         elif cur is not None:
             cur["lines"].append(ln)
             cur["spans"].extend(ln["spans"])
+            cur["span_lines"].append(list(ln["spans"]))
         else:
-            cur = {"lines": [ln], "spans": list(ln["spans"]), "left": ln["bbox"][0]}
+            cur = {"lines": [ln], "spans": list(ln["spans"]),
+                   "span_lines": [list(ln["spans"])], "left": ln["bbox"][0]}
     if cur:
         items.append(cur)
 
@@ -803,14 +1161,18 @@ def _extract_labeled_lines(lines, body, all_boxes, page_bottom, pno,
                 # tạo rect rỗng -> chữ Anh không bị xoá, vẽ đè 2 lớp (finding #2)
                 if r[3] > ceiling > r[1]:
                     r[3] = ceiling
-        _emit(segments, layout, ctr, pno, _span_text(it["spans"]),
+        fx = []
+        marked = "\n".join(_line_markup(sl, tsp["size"], fx)
+                           for sl in it["span_lines"])
+        _emit(segments, layout, ctr, pno, marked,
               redact=redact,
               box=[it["left"], rect.y0, rect.x1, max(bottom, rect.y1)],
-              size=tsp["size"], color=tsp["color"])
+              size=tsp["size"], color=tsp["color"],
+              fx=fx, lh=_seg_lh(it["lines"], tsp["size"]))
 
 
 def _extract_blocky(pd, body, all_boxes, page_bottom, pno, segments, layout, ctr,
-                    hlines=None, vlines=None):
+                    hlines=None, vlines=None, gkeys=None):
     """Đường đi trang VĂN XUÔI (sách volume)."""
     cands = []
     for b in pd["blocks"]:
@@ -838,7 +1200,7 @@ def _extract_blocky(pd, body, all_boxes, page_bottom, pno, segments, layout, ctr
             continue
         if not _is_prose_block(b, body):
             continue
-        for run, next_heading in _heading_split_runs(b["lines"], body):
+        for run, next_heading in _heading_split_runs(b["lines"], body, gkeys):
             if not run:
                 continue
             sp = _dominant([s for ln in run for s in ln["spans"]])
@@ -879,10 +1241,13 @@ def _extract_blocky(pd, body, all_boxes, page_bottom, pno, segments, layout, ctr
             if redact_ceiling is not None and r.y1 > redact_ceiling > r.y0:
                 r.y1 = redact_ceiling
             redact.append(list(r))
-        _emit(segments, layout, ctr, pno, "\n".join(_span_text(ln["spans"]) for ln in run),
+        fx = []
+        marked = "\n".join(_line_markup(ln["spans"], sp["size"], fx) for ln in run)
+        _emit(segments, layout, ctr, pno, marked,
               redact=redact,
               box=[rect.x0, rect.y0, rect.x1, max(bottom, rect.y1)],
-              size=sp["size"], color=sp["color"])
+              size=sp["size"], color=sp["color"],
+              fx=fx, lh=_seg_lh(run, sp["size"]), align=_seg_align(run, rect))
 
 
 def _merge_orphan_bullets(lines):
@@ -916,7 +1281,7 @@ def _merge_orphan_bullets(lines):
 
 
 def _extract_bulleted(lines, body, all_boxes, page_bottom, pno,
-                      segments, layout, ctr, hlines=None, vlines=None):
+                      segments, layout, ctr, hlines=None, vlines=None, gkeys=None):
     """Đường đi trang DANH SÁCH bullet — dựng lại từng mục từ DÒNG.
     Giữ glyph bullet (không redact), canh lề treo."""
     lines = _merge_orphan_bullets(lines)
@@ -942,8 +1307,8 @@ def _extract_bulleted(lines, body, all_boxes, page_bottom, pno,
         # mục, KHÔNG mở mục mới (sẽ bị redact) — đóng mục hiện tại và truyền L
         # làm boundary để kẹp đáy box (mảnh cùng block nên vòng kẹp all_boxes
         # mức block không thấy nó — phản biện điều kiện (6)).
-        if _line_is_formula_fragment(L, body):
-            close(L)
+        if _line_is_formula_fragment(L, body) or (gkeys and _gkey(L) in gkeys):
+            close(L)          # dòng bảng lưới cũng giữ nguyên + làm boundary
             continue
         bidx = _bullet_idx(L["spans"])
         if bidx < 0:
@@ -957,8 +1322,10 @@ def _extract_bulleted(lines, body, all_boxes, page_bottom, pno,
             tx0 = min((s["bbox"][0] for s in text_spans if s["text"].strip()),
                       default=L["bbox"][0])
             tsp = _dominant(text_spans) or sp
+            fx = []
             cur = {"lines": [L], "redact": [s["bbox"] for s in text_spans],
-                   "text": [_span_text(text_spans)], "top": L["bbox"][1],
+                   "text": [_line_markup(text_spans, tsp["size"], fx)],
+                   "fx": fx, "top": L["bbox"][1],
                    "last_y1": L["bbox"][3], "left": tx0,
                    "bullet_x": L["bbox"][0], "tx0": tx0, "src_blk": L["blk"],
                    "size": tsp["size"], "color": tsp["color"]}
@@ -981,7 +1348,7 @@ def _extract_bulleted(lines, body, all_boxes, page_bottom, pno,
             # dòng tiếp nối của mục hiện tại
             cur["lines"].append(L)
             cur["redact"].extend(s["bbox"] for s in L["spans"])
-            cur["text"].append(txt)
+            cur["text"].append(_line_markup(L["spans"], cur["size"], cur["fx"]))
             cur["last_y1"] = L["bbox"][3]
             cur["left"] = min(cur["left"], L["bbox"][0])
             if cur.get("blk") is None:
@@ -999,8 +1366,10 @@ def _extract_bulleted(lines, body, all_boxes, page_bottom, pno,
             # ràng buộc CÙNG block (ở nhánh continuation trên) để không gộp nhầm 2
             # mục/hàng riêng biệt (khác block) chỉ vì đứng gần nhau.
             close()
+            fx = []
             cur = {"lines": [L], "redact": [s["bbox"] for s in L["spans"]],
-                   "text": [txt], "top": L["bbox"][1],
+                   "text": [_line_markup(L["spans"], sp["size"], fx)],
+                   "fx": fx, "top": L["bbox"][1],
                    "last_y1": L["bbox"][3], "left": L["bbox"][0],
                    "bullet_x": L["bbox"][0], "blk": L["blk"],
                    "size": sp["size"], "color": sp["color"]}
@@ -1030,8 +1399,9 @@ def _extract_bulleted(lines, body, all_boxes, page_bottom, pno,
                 continue
             bottom = min(bottom, ob.y0 - 2)
         bottom = _clamp_bottom_hlines(rect, bottom, hlines)
-        if _is_formula_like(" ".join(it["text"])):   # dòng công thức (kể cả có ■) -> giữ
-            continue
+        # phân loại trên text TRẦN (marker {vN} chứa {}/digit làm lệch mật độ toán)
+        if _is_formula_like(strip_markers(" ".join(it["text"]))):
+            continue                                 # dòng công thức (kể cả có ■) -> giữ
         # Trần REDACT = mép trên nhãn heading kế (nếu có): bbox các SPAN/dòng liền kề
         # trong cùng block thường chồng lấn nhẹ theo chiều dọc (ascender/descender)
         # -> redact đúng bbox thô của span cuối có thể ăn lẹm vào phần TRÊN của nhãn
@@ -1050,7 +1420,9 @@ def _extract_bulleted(lines, body, all_boxes, page_bottom, pno,
         _emit(segments, layout, ctr, pno, " ".join(it["text"]),
               redact=redact,
               box=[it["left"], it["top"], right, max(bottom, rect.y1)],
-              size=it["size"], color=it["color"])
+              size=it["size"], color=it["color"],
+              fx=it.get("fx"), lh=_seg_lh(it["lines"], it["size"]),
+              align=_seg_align(it["lines"], rect))
 
 
 # ====================================================================
@@ -1091,10 +1463,120 @@ def _header_dups(page):
     return out
 
 
+# ---- Render v2: rich-text (đậm/nghiêng/sup), đo trước bằng Story, chuẩn hoá
+# scale toàn tài liệu, công thức inline {vN} stamp lại bằng ảnh vùng gốc.
+# (Các kỹ thuật học từ BabelDOC: typesetting scale-loop + mode-normalization,
+#  formula placeholder round-trip, font family mapping.)
+
+_SCALE_LADDER = [1.0, 0.97, 0.94, 0.91, 0.88, 0.85, 0.82, 0.79,
+                 0.76, 0.73, 0.70, 0.66, 0.62, 0.58, 0.55]
+_FX_DPI = 288          # raster công thức inline (4x) — nét ở cỡ chữ sách
+
+
+def _font_css_archive(fam):
+    """CSS @font-face 4 mặt + Archive chứa font (dùng chung cho Story/htmlbox)."""
+    ar = fitz.Archive()
+    seen, css = {}, []
+    for i, face in enumerate(("regular", "bold", "italic", "bolditalic")):
+        path = fam[face]
+        name = seen.get(path)
+        if name is None:
+            name = f"f{i}.ttf"
+            with open(path, "rb") as fh:
+                ar.add(fh.read(), name)
+            seen[path] = name
+        w = " font-weight: bold;" if "bold" in face else ""
+        s = " font-style: italic;" if "italic" in face else ""
+        css.append(f"@font-face {{font-family: vn; src: url({name});{w}{s}}}")
+    # LƯU Ý: engine CSS của Story KHÔNG hỗ trợ selector '*' — phải liệt kê
+    # tường minh, nếu không margin mặc định của body/p (~24pt) phồng mọi phép
+    # đo -> scale tụt đáy oan (bug 'bullet tí hon' đã gặp thật).
+    css.append("body {font-family: vn; margin: 0; padding: 0;}")
+    css.append("p {font-family: vn; margin: 0; padding: 0;}")
+    css.append("sup {font-size: 0.65em; vertical-align: super;}")
+    return "\n".join(css), ar
+
+
+def _esc(t):
+    return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _html_body(text):
+    """Escape toàn bộ text TRỪ các marker hợp lệ (<b>/<i>/<sup>/{vN})."""
+    out, pos = [], 0
+    for m in _TAG_TOKEN.finditer(text):
+        out.append(_esc(text[pos:m.start()]))
+        out.append(m.group(0))
+        pos = m.end()
+    out.append(_esc(text[pos:]))
+    return "".join(out)
+
+
+def _seg_html(vi, size, color, lh, align, fx, scale, img_prefix):
+    """HTML 1 segment ở hệ số scale cho trước. {vN} -> <img> (kích thước gốc
+    nhân scale); thẻ hỏng cặp bị strip để không tràn style sang cả đoạn."""
+    for tag in ("b", "i", "sup"):
+        if vi.count(f"<{tag}>") != vi.count(f"</{tag}>"):
+            vi = vi.replace(f"<{tag}>", "").replace(f"</{tag}>", "")
+    body = _html_body(vi)
+    for n, r in enumerate(fx or [], 1):
+        w = max(r[2] - r[0], 1.0) * scale
+        h = max(r[3] - r[1], 1.0) * scale
+        body = body.replace(
+            "{v%d}" % n,
+            f'<img src="{img_prefix}{n}.png" style="width:{w:.2f}pt;height:{h:.2f}pt"/>')
+    body = _PH_RE.sub("", body)                    # placeholder mồ côi -> bỏ
+    col = "#%06x" % (int(color) & 0xFFFFFF)
+    return (f'<p style="font-size:{size * scale:.2f}pt; line-height:{lh:.2f}; '
+            f'color:{col}; text-align:{"justify" if align == "j" else "left"};">'
+            f"{body}</p>")
+
+
+def _fit_scale(item, vi, css, ar, img_prefix):
+    """Hệ số scale LỚN NHẤT trong thang mà segment vừa khung (đo bằng Story,
+    không vẽ). Không vừa cả ở sàn -> trả sàn (htmlbox scale_low sẽ ép vừa)."""
+    l, t, r, b = item["box"]
+    w = max(r - l, 10.0)
+    h = max(b - t, item["size"])
+    lh = item.get("lh") or 1.12
+    for s in _SCALE_LADDER:
+        html = _seg_html(vi, item["size"], item["color"], lh,
+                         item.get("align"), item.get("fx"), s, img_prefix)
+        try:
+            story = fitz.Story(html, user_css=css, archive=ar)
+            more, filled = story.place((0, 0, w, h))
+        except Exception:
+            return s
+        if not more and filled[3] <= h + 0.5:
+            return s
+    return _SCALE_LADDER[-1]
+
+
+def _mode_scale(pairs):
+    """Scale PHỔ BIẾN nhất (mode, trọng số theo độ dài text, bucket 0.03) của
+    các đoạn thân bài -> chuẩn hoá cỡ chữ toàn tài liệu cho đều mắt."""
+    acc = {}
+    for s, weight in pairs:
+        k = round(s / 0.03)
+        acc[k] = acc.get(k, 0) + weight
+    if not acc:
+        return 1.0
+    best = max(acc.items(), key=lambda kv: (kv[1], kv[0]))[0]
+    return min(1.0, best * 0.03)
+
+
+def _fx_prefix(item):
+    return f"x{item['id']}_"
+
+
 def apply_translations(doc, layout, translations, fontfile=None):
     """Ghi đè bản dịch giữ layout. translations: {id: vi_text}.
-    Trả về (applied, missing_ids)."""
-    fontfile = fontfile or find_font()
+    Trả về (applied, missing_ids).
+    LƯU Ý: `doc` phải còn NGUYÊN BẢN khi gọi (ảnh công thức inline được raster
+    từ chính các trang này TRƯỚC khi redact)."""
+    fam = find_font_family(fontfile)
+    css, ar = _font_css_archive(fam)
+    fallback_font = fam["regular"]
     by_page = {}
     for item in layout:
         vi = translations.get(item["id"])
@@ -1103,6 +1585,33 @@ def apply_translations(doc, layout, translations, fontfile=None):
 
     applied = 0
     missing = [it["id"] for it in layout if not translations.get(it["id"])]
+
+    # B1: raster ảnh công thức inline từ trang CÒN NGUYÊN (trước mọi redact).
+    for pno, items in by_page.items():
+        page = doc[pno]
+        for item, vi in items:
+            if not item.get("fx") or not _PH_RE.search(vi):
+                continue
+            for n, r in enumerate(item["fx"], 1):
+                try:
+                    pm = page.get_pixmap(clip=fitz.Rect(r), dpi=_FX_DPI)
+                    ar.add(pm.tobytes("png"), f"{_fx_prefix(item)}{n}.png")
+                except Exception:
+                    pass                     # thiếu ảnh -> {vN} bị bỏ khi render
+
+    # B2: đo scale vừa khung cho từng segment -> chuẩn hoá theo mode tài liệu.
+    fits = {}
+    weights = []
+    for pno, items in by_page.items():
+        for item, vi in items:
+            s = _fit_scale(item, vi, css, ar, _fx_prefix(item))
+            fits[item["id"]] = s
+            weights.append((s, len(vi)))
+    mode = _mode_scale(weights)
+    # mode >= 0.94: tài liệu về cơ bản vừa -> không ép nhỏ cả cuốn vì chênh nhẹ.
+    # Sàn chuẩn hoá 0.85: không bao giờ ÉP đoạn đã-vừa co quá 15% chỉ để đều.
+    cap = 1.0 if mode >= 0.94 else max(mode, 0.85)
+
     for pno, items in by_page.items():
         page = doc[pno]
         # Xoá markup annotation (Highlight/Underline/StrikeOut/Squiggly) NHƯNG chỉ
@@ -1126,12 +1635,22 @@ def apply_translations(doc, layout, translations, fontfile=None):
                               graphics=fitz.PDF_REDACT_LINE_ART_NONE)
         for item, vi in items:
             l, t, r, b = item["box"]
-            box = fitz.Rect(l, t, r, max(b, t + item["size"]))
-            _fit(page, box, vi, item["size"], _int_color_to_rgb(item["color"]),
-                 fontfile)
+            box = fitz.Rect(l, t, r, max(b, t + item["size"] + 2))
+            s = min(fits.get(item["id"], 1.0), cap)
+            html = _seg_html(vi, item["size"], item["color"],
+                             item.get("lh") or 1.12, item.get("align"),
+                             item.get("fx"), s, _fx_prefix(item))
+            try:
+                # scale_low=0.3: lưới an toàn — nếu đo trước vẫn lệch thì co
+                # thêm cho VỪA, tuyệt đối không tràn đè phần tử giữ nguyên.
+                page.insert_htmlbox(box, html, css=css, archive=ar,
+                                    scale_low=0.3)
+            except Exception:
+                _fit(page, box, strip_markers(vi), item["size"],
+                     _int_color_to_rgb(item["color"]), fallback_font)
             applied += 1
         for rect, txt, sz, col in hdrs:        # vẽ lại 1 bản header sạch
-            _fit(page, rect, txt, sz, _int_color_to_rgb(col), fontfile)
+            _fit(page, rect, txt, sz, _int_color_to_rgb(col), fallback_font)
     return applied, missing
 
 

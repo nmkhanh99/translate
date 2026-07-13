@@ -84,9 +84,20 @@ def cmd_chunk(pdf, workdir, size=40, force=False):
     return nch
 
 
+def _log_marker_drop(workdir, entries):
+    """Ghi các bản dịch bị LOẠI vì hỏng marker {vN} vào marker_drop.json (audit).
+    Đoạn bị loại giữ nguyên tiếng Anh khi apply — không bao giờ mất công thức."""
+    if not entries:
+        return
+    p = _wd(workdir, "marker_drop.json")
+    cur = _load(p, [])
+    cur.extend(entries)
+    json.dump(cur[-500:], open(p, "w"), ensure_ascii=False, indent=1)
+
+
 def cmd_merge_tr(pdf, workdir):
     text2vi = _load(_wd(workdir, "text2vi.json"), {})
-    n, bad = 0, 0
+    n, bad, dropped = 0, 0, []
     for f in glob.glob(_wd(workdir, "out", "c_*.json")):
         d = _load_checkpoint(f)
         if not isinstance(d, dict):
@@ -101,10 +112,21 @@ def cmd_merge_tr(pdf, workdir):
         src = {it["id"]: it["text"] for it in src_items}
         for cid, vi in d.items():
             if cid in src and vi:
-                text2vi[src[cid]] = vi
+                # Marker {vN}/<b>/<i>/<sup> phải sống sót qua bản dịch: tự sửa
+                # dạng lệch; mất/lệch placeholder -> LOẠI (giữ tiếng Anh) thay
+                # vì áp bản mất công thức. Thẻ hỏng chỉ bị strip, không loại.
+                fixed = pdf_core.check_markers(src[cid], vi)
+                if fixed is None:
+                    dropped.append({"chunk": idx, "id": cid,
+                                    "en": src[cid][:160], "vi": str(vi)[:160]})
+                    continue
+                text2vi[src[cid]] = fixed
                 n += 1
     if bad:
         print(f"  (xoá {bad} file out hỏng JSON — sẽ dịch lại các chunk đó)")
+    if dropped:
+        _log_marker_drop(workdir, dropped)
+        print(f"  (loại {len(dropped)} bản dịch hỏng marker — xem marker_drop.json)")
     json.dump(text2vi, open(_wd(workdir, "text2vi.json"), "w"), ensure_ascii=False)
     doc = fitz.open(pdf)
     segs, _ = pdf_core.extract_segments(doc, "all")
@@ -137,7 +159,8 @@ def cmd_vchunk(pdf, workdir, size=25, mode="all", force=False):
     def untranslated(en, vi):
         if not vi:
             return True
-        return sum(1 for c in vi if ord(c) > 0x100) < max(3, len(vi) * 0.02)
+        p = pdf_core.strip_markers(vi)      # marker {vN}/<b>… là ASCII, bỏ khi đo
+        return sum(1 for c in p if ord(c) > 0x100) < max(3, len(p) * 0.02)
 
     seen, uniq = set(), []
     for s in segs:
@@ -161,7 +184,7 @@ def cmd_vchunk(pdf, workdir, size=25, mode="all", force=False):
 def cmd_merge_vr(workdir):
     text2vi = _load(_wd(workdir, "text2vi.json"), {})
     vid2en = _load(_wd(workdir, "vid2en.json"), {})
-    n, bad = 0, 0
+    n, bad, skipped = 0, 0, 0
     for f in glob.glob(_wd(workdir, "vout", "v_*.json")):
         d = _load_checkpoint(f)
         if not isinstance(d, dict):
@@ -170,10 +193,17 @@ def cmd_merge_vr(workdir):
             continue
         for vid, corrected in d.items():
             if vid in vid2en and corrected:
-                text2vi[vid2en[vid]] = corrected
+                # verify sửa hỏng marker -> GIỮ bản dịch cũ (đừng phá công thức)
+                fixed = pdf_core.check_markers(vid2en[vid], corrected)
+                if fixed is None:
+                    skipped += 1
+                    continue
+                text2vi[vid2en[vid]] = fixed
                 n += 1
     if bad:
         print(f"  (xoá {bad} file vout hỏng JSON — sẽ verify lại các vchunk đó)")
+    if skipped:
+        print(f"  (bỏ {skipped} bản sửa hỏng marker — giữ bản dịch trước đó)")
     json.dump(text2vi, open(_wd(workdir, "text2vi.json"), "w"), ensure_ascii=False)
     print(f"corrections_applied={n}")
     return n
@@ -594,6 +624,11 @@ def cmd_merge_fix(workdir):
         for cid, vi in short.items():
             it = items.get(cid)
             if it and vi and vi != it.get("vi", ""):
+                # Bản rút gọn cũng phải giữ marker {vN}/<b>… (rút gọn hay làm
+                # rơi placeholder) — hỏng thì bỏ qua, giữ bản dài còn đúng.
+                vi = pdf_core.check_markers(it.get("en", ""), vi)
+                if vi is None or vi == it.get("vi", ""):
+                    continue
                 # Lưu kèm 'en' để apply xác minh id vẫn trỏ đúng đoạn đó — id sN
                 # đánh theo THỨ TỰ trích xuất, một engine fix đổi segmentation sẽ
                 # dịch chuyển id; entry lệch en bị bỏ qua thay vì dán nhầm chỗ.

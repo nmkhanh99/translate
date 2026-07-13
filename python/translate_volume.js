@@ -31,7 +31,9 @@ function parseList(s) { try { const d = JSON.parse(s); return Array.isArray(d) ?
 const STYLE =
   'Dịch sang tiếng Việt tự nhiên, văn phong học thuật tài chính. ' +
   'GIỮ NGUYÊN thuật ngữ tiếng Anh trong ngoặc đơn ở lần xuất hiện đầu, ví dụ "lãi suất chiết khấu (discount rate)". ' +
-  'GIỮ NGUYÊN mọi con số, ký hiệu, công thức, mã (LOS, §). KHÔNG bỏ sót ý. Không thêm lời bình.'
+  'GIỮ NGUYÊN mọi con số, ký hiệu, công thức, mã (LOS, §). KHÔNG bỏ sót ý. Không thêm lời bình. ' +
+  'Văn bản có thể chứa MARKER phải giữ nguyên vẹn: {v1},{v2}… là công thức giữ chỗ — chép y nguyên đúng dạng {vN}, ' +
+  'KHÔNG dịch/bỏ/thêm; thẻ <b>…</b>, <i>…</i>, <sup>…</sup> giữ thẻ và đặt quanh phần dịch tương ứng, đủ cặp.'
 
 const pad = p => String(p).padStart(3, '0')
 

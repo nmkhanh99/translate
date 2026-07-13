@@ -1,5 +1,44 @@
 # Changelog
 
+## 2026-07-13 (ENGINE RENDER V2 — rich-text, công thức inline, bảng lưới; học từ PDFMathTranslate/BabelDOC)
+
+### Changed
+
+- **Đường vẽ bản dịch viết lại toàn bộ** (`pdf_core.apply_translations`):
+  `insert_textbox` 1-style → **rich-text `insert_htmlbox`** với font 4 mặt
+  Times New Roman. Đậm/nghiêng/chỉ-số-trên inline giữ qua bản dịch (marker
+  `<b>/<i>/<sup>` trong text segment); đoạn nguồn justify → bản dịch justify;
+  giãn dòng đo từ nguồn. **Chuẩn hoá cỡ chữ toàn tài liệu** (đo scale từng đoạn
+  bằng `fitz.Story` trước khi vẽ, ép trần theo mode) → hết cỡ chữ lệch lung tung
+  giữa các đoạn; lưới an toàn `scale_low` → không bao giờ vẽ tràn đè phần tử
+  giữ nguyên. Render vẫn deterministic (golden pixel-hash dùng tiếp được).
+
+### Added
+
+- **Công thức inline trong prose giữ NGUYÊN HÌNH GỐC** (cụm lỗi `congthuc_vo`):
+  run công thức mức span (`σ²`, `X̄`, `P(A|B)`, sub/superscript...) → marker
+  `{vN}` + rect nguồn trong `layout.fx`; khi apply, vùng gốc được raster 288dpi
+  và nhúng lại thành ảnh inline đúng vị trí trong dòng chữ Việt reflow.
+  `check_markers` tự sửa marker LLM viết lệch (`&lt;i&gt;`, `{ v1 }`, `(v1)`);
+  mất/lệch `{vN}` → loại bản dịch (giữ tiếng Anh) + log `marker_drop.json` —
+  không bao giờ mất công thức vì bản dịch ẩu.
+- **Bảng 3+ cột không nhãn đậm được bảo vệ** (cụm `bang_vo`): `_page_grid_keys`
+  nhận diện vùng bảng theo hàng/cột thẳng tâm ở mức trang → giữ nguyên tiếng
+  Anh, không dịch phẳng dồn cột (v1: 127 trang có vùng được bảo vệ, 15/30 trang
+  bang_vo bắt trúng, prose/bullet không dính).
+- **Glossary hook**: `workdir/glossary.json` → tự chèn bảng thuật ngữ vào prompt
+  dịch/verify (≤80 mục).
+- Unit test `python/test_engine_v2.py` (27 case: marker round-trip, markup span,
+  grid detector, HTML builder, mode scale, determinism end-to-end).
+
+### Technical
+
+- Text segment ĐỔI KEY cache với đoạn có style/công thức inline (~27% trên v1)
+  → mỗi volume cần `chunk --force` + dịch bù phần todo trước `apply` (xem
+  PROGRESS.md mục 6 fix #16-19). Prompt translate/verify/fix (pipeline-runner
+  + translate_volume.js) thêm luật giữ marker.
+
+
 ## 2026-07-12 (option "Agent song song" — tăng tốc pipeline)
 
 ### Added

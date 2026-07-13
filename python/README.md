@@ -13,10 +13,17 @@ Claude Code, Claude Desktop, Codex, Cursor, Grok...
 ## Cách hoạt động
 
 Cơ chế: redact (xóa) chữ gốc của từng đoạn văn xuôi rồi vẽ lại bản dịch vào đúng
-ô, tự co cỡ chữ và tràn vào khoảng trắng giữa các đoạn để không đè layout. Các
-phần không phải văn xuôi (heading, công thức, số, bảng, đồ thị, hình) được **giữ
-nguyên** — heuristic thích nghi theo cỡ chữ thân bài của từng trang (không
-hard-code cho riêng bộ PDF nào).
+ô. **Render v2 (2026-07-13, học từ PDFMathTranslate/BabelDOC):** vẽ rich-text
+qua `insert_htmlbox` với font 4 mặt (đậm/nghiêng/chỉ-số-trên inline GIỮ qua bản
+dịch bằng marker `<b>/<i>/<sup>`), canh đều như sách, **đo trước bằng
+`fitz.Story` + chuẩn hoá cỡ chữ toàn tài liệu** (hết cỡ chữ lệch giữa các đoạn),
+lưới an toàn `scale_low` (không vẽ tràn đè phần tử giữ nguyên). **Công thức
+inline trong prose** (σ², X̄, P(A|B), sub/superscript) thành marker `{vN}` và
+được **nhúng lại bằng ảnh vùng gốc** đúng vị trí trong dòng chữ Việt reflow —
+không còn vỡ phân số/chỉ số. Các phần không phải văn xuôi (heading, công thức,
+số, bảng — gồm **bảng ≥3 cột không nhãn** qua detector lưới `_page_grid_keys`,
+đồ thị, hình) được **giữ nguyên** — heuristic thích nghi theo cỡ chữ thân bài
+của từng trang (không hard-code cho riêng bộ PDF nào).
 
 Nhận diện THÍCH NGHI hai kiểu trang:
 - **Trang văn xuôi** (sách volume): gom theo block đoạn văn.

@@ -134,8 +134,36 @@ Còn lại (theo thứ tự giá trị):
    trước khi shrink): cứu cụm co font (p103/135).
 3. **p25 same-y overlap**: mảnh bold nằm cùng hàng nhưng KHÔNG cùng band y-center
    — điều kiện inline chưa bắt được, trang này chưa đổi.
-4. Bảng nhãn KHÔNG đậm (Exhibit 15 p38) — cần gate như phản biện bang_vo(2).
-5. Mảnh 'and ˆ' (prefix prose + mũ công thức tách dòng) — vụn, hiếm.
+4. ~~Bảng nhãn KHÔNG đậm (Exhibit 15 p38)~~ → **ĐÃ FIX** bởi `_page_grid_keys`
+   (render v2, 2026-07-13 — xem mục dưới).
+5. Mảnh 'and ˆ' (prefix prose + mũ công thức tách dòng) — vụn, hiếm; một phần
+   được render v2 xử lý qua run `{vN}` inline.
+
+### ENGINE RENDER V2 (2026-07-13) — học từ PDFMathTranslate/BabelDOC
+
+Đường vẽ viết lại toàn bộ (xem PROGRESS.md fix #16-19). Điểm chạm playbook:
+
+- **Đo trước — vẽ sau**: mỗi segment được đo bằng `fitz.Story` (không vẽ) trên
+  thang scale 1.0→0.55, rồi CHUẨN HOÁ theo mode toàn tài liệu (không ép <0.85).
+  Vẽ bằng `insert_htmlbox` + `scale_low=0.3` → không bao giờ tràn đè phần tử
+  giữ nguyên (đổi "tràn" lấy "co thêm" — vision sẽ thấy `fit` thay vì defect).
+- **Cụm `congthuc_vo`**: công thức inline trong prose giờ là marker `{vN}` +
+  ảnh vùng gốc (`layout.fx`, raster 288dpi từ trang chưa redact). Hạn chế còn
+  lại: ảnh đặt đáy-trên-baseline (Story không hỗ trợ vertical-align cho img)
+  → cụm có subscript nhô cao ~2-4pt: phân loại `fit`, không phải defect.
+- **Cụm `bang_vo`**: `_page_grid_keys` bảo vệ vùng bảng ≥3 cột (line-là-ô,
+  thẳng hàng theo TÂM) → giữ nguyên tiếng Anh. Nếu vision còn báo bảng vỡ,
+  kiểm tra `_page_grid_keys(page_dict)` có bắt vùng đó không trước khi nghĩ
+  cách khác (ngưỡng: ≥3 ô/hàng, ≥3 hàng, cách <28pt, ≥2 cột tâm thẳng ±5pt).
+- **Marker & cache**: text segment chứa `<b>/<i>/<sup>/{vN}` → key cache MỚI
+  (~27% segment trên v1). `check_markers` chặn bản dịch hỏng marker ở mọi
+  merge; bản bị loại ghi `marker_drop.json` (giữ tiếng Anh, không mất công
+  thức). Vòng auto-fix rút gọn giữ nguyên luật marker (fixPrompt đã dặn).
+- **CSS Story KHÔNG hỗ trợ selector `*`** — reset margin phải liệt kê
+  `body{...} p{...}` tường minh; quên là mọi phép đo phồng ~24pt → chữ tí hon
+  (bug đã gặp thật khi phát triển, có unit test + số đo trong test_engine_v2).
+- Unit test: `python3 test_engine_v2.py` (27 case, có determinism end-to-end)
+  — chạy trước MỌI lần sửa render.
 
 ### Sau MỘT đợt engine fix (bắt buộc, theo thứ tự)
 

@@ -15,7 +15,7 @@
 //   { pdf, workdir, out, tool, python, claudeBin?, model?, posture?,
 //     vision?, only?, visPages? }
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const A = JSON.parse(process.argv[2] || "{}");
@@ -33,10 +33,31 @@ const MAX_FIX_ROUNDS = 2;
 const log = (m) => console.log(`[runner ${new Date().toISOString().slice(11, 19)}] ${m}`);
 const pad = (p) => String(p).padStart(3, "0");
 
+const MARKERS =
+  "Văn bản gốc có thể chứa MARKER phải giữ nguyên vẹn trong bản dịch: " +
+  "(1) {v1}, {v2}… là công thức giữ chỗ — chép y nguyên đúng dạng {vN} vào vị trí tương ứng, " +
+  "KHÔNG dịch, KHÔNG bỏ, KHÔNG thêm marker mới; " +
+  "(2) thẻ <b>…</b>, <i>…</i>, <sup>…</sup> đánh dấu đậm/nghiêng/chỉ số trên — giữ thẻ và đặt quanh phần dịch tương ứng, đóng/mở đủ cặp.";
+
 const STYLE =
   "Dịch sang tiếng Việt tự nhiên, văn phong học thuật tài chính. " +
   'GIỮ NGUYÊN thuật ngữ tiếng Anh trong ngoặc đơn ở lần xuất hiện đầu, ví dụ "lãi suất chiết khấu (discount rate)". ' +
-  "GIỮ NGUYÊN mọi con số, ký hiệu, công thức, mã (LOS, §). KHÔNG bỏ sót ý. Không thêm lời bình.";
+  "GIỮ NGUYÊN mọi con số, ký hiệu, công thức, mã (LOS, §). KHÔNG bỏ sót ý. Không thêm lời bình. " +
+  MARKERS;
+
+// Bảng thuật ngữ tuỳ chọn: workdir/glossary.json = {"english term": "bản dịch"}.
+// Có file -> chèn vào prompt dịch/verify để thuật ngữ nhất quán toàn volume.
+const GLOSSARY = (() => {
+  try {
+    const g = JSON.parse(readFileSync(join(A.workdir || ".", "glossary.json"), "utf8"));
+    const lines = Object.entries(g)
+      .slice(0, 80)
+      .map(([en, vi]) => `${en} = ${vi}`);
+    return lines.length ? `\nBảng thuật ngữ BẮT BUỘC dùng nhất quán:\n${lines.join("; ")}\n` : "";
+  } catch {
+    return "";
+  }
+})();
 
 /** Chạy python agent_pipeline, trả stdout (echo vào run.log). */
 function py(...args) {
@@ -123,14 +144,15 @@ async function runUnits(units, mkPrompt, outPath, tag) {
 }
 
 const trPrompt = (u) =>
-  `Đọc file JSON: ${u.in} (mảng các {id, text} tiếng Anh).\n${STYLE}\n` +
+  `Đọc file JSON: ${u.in} (mảng các {id, text} tiếng Anh).\n${STYLE}\n${GLOSSARY}` +
   `Ghi kết quả ra ${u.out} dạng JSON object {id: "bản dịch tiếng Việt"} cho MỌI id. ` +
   `Dùng tool Write. Chỉ ghi file, không in gì khác.`;
 
 const vrPrompt = (u) =>
   `Đọc file JSON: ${u.in} (mảng {id, en, vi}: en = bản gốc tiếng Anh, vi = bản dịch hiện tại).\n` +
-  `Với MỖI mục, đối chiếu vi với en, tập trung: SAI/THIẾU con số, đơn vị, ký hiệu, bỏ sót câu/ý, dịch sai nghĩa. ` +
-  `Nếu cần sửa thì sửa; nếu vi đã đúng thì giữ nguyên. ${STYLE}\n` +
+  `Với MỖI mục, đối chiếu vi với en, tập trung: SAI/THIẾU con số, đơn vị, ký hiệu, bỏ sót câu/ý, dịch sai nghĩa, ` +
+  `marker {vN}/<b>/<i>/<sup> bị mất hay lệch so với en. ` +
+  `Nếu cần sửa thì sửa; nếu vi đã đúng thì giữ nguyên. ${STYLE}\n${GLOSSARY}` +
   `Ghi ra ${u.out} dạng JSON {id: "bản vi đúng nhất"} cho MỌI id. Dùng tool Write. Chỉ ghi file.`;
 
 const visPrompt = (p) =>
@@ -151,7 +173,7 @@ const fixPrompt = (p) =>
   `Đọc file JSON ${WD}/fix/page_${pad(p)}.json (mảng {id, en, vi}).\n` +
   `Với MỖI mục: nếu 'vi' DÀI gây tràn thì RÚT GỌN cho súc tích (~15–25% ngắn hơn, bỏ từ thừa) NHƯNG GIỮ ĐỦ Ý ` +
   `và GIỮ NGUYÊN mọi số/đơn vị/ký hiệu/công thức/thuật ngữ + cụm "(English term)". Nếu 'vi' đã gọn thì GIỮ NGUYÊN. ` +
-  `KHÔNG bịa, KHÔNG bỏ ý.\nGhi ra ${WD}/fixout/page_${pad(p)}.json dạng JSON {id: "bản vi"} cho MỌI id ` +
+  `KHÔNG bịa, KHÔNG bỏ ý. ${MARKERS}\nGhi ra ${WD}/fixout/page_${pad(p)}.json dạng JSON {id: "bản vi"} cho MỌI id ` +
   `(kể cả id giữ nguyên). Dùng tool Write. Chỉ ghi file, không in gì khác.`;
 
 async function visionPass(pagesCsv) {
