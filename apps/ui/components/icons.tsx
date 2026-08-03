@@ -32,6 +32,11 @@ export const IconLibrary = (p: P) => (
     <path d="M14 4h4.5A1.5 1.5 0 0 1 20 5.5v13a1.5 1.5 0 0 1-1.5 1.5H14z" />
   </svg>
 );
+export const IconBookmark = (p: P) => (
+  <svg {...base} {...p}>
+    <path d="M6 4.5A1.5 1.5 0 0 1 7.5 3h9A1.5 1.5 0 0 1 18 4.5V21l-6-4-6 4z" />
+  </svg>
+);
 export const IconQueue = (p: P) => (
   <svg {...base} {...p}>
     <circle cx="6" cy="7" r="2" />

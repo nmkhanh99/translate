@@ -36,8 +36,11 @@ export default function Library() {
 
   async function onRun(tag: string) {
     try {
-      await runVolume(tag);
-      toast("Đã bắt đầu dịch (headless)");
+      // Luôn gửi engine đang hiện trên EngineSwitch (global) — body override
+      // thắng pref cuốn; nếu omit, server resolveEngine ưu tiên pref → UI grok
+      // nhưng chạy codex (lệch silent).
+      await runVolume(tag, engine);
+      toast("Đã bắt đầu dịch bằng " + engine);
     } catch (e) {
       toast("Lỗi: " + (e as Error).message);
     }

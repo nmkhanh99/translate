@@ -24,6 +24,7 @@ bản dịch phải GIỮ NGUYÊN marker (check_markers kiểm + tự sửa dạ
 Heading / công thức / số liệu / bảng / đồ thị / hình -> KHÔNG đụng tới.
 """
 import os
+import math
 import re
 import statistics
 
@@ -42,6 +43,217 @@ _FORMULA_HEAD = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,4}\s*=")  # 'V0=', 'p1u =' .
 _MATH_CH = set("=+−-×÷/^()[]{}0123456789.,%$≤≥≠≈∑∫√·•")
 # Ký hiệu HÀM Ý mạnh là toán (tổng, căn, bất đẳng thức, mũi tên, sigma...).
 _STRONG_MATH = set("∑∫√≤≥≠≈×÷⁄·∞±→∂∏σµ")
+
+DEFAULT_RASTER_MAX_PIXELS = 12_000_000
+PREFLIGHT_RASTER_MAX_PIXELS = 400_000
+
+
+def raster_plan(rect, dpi, max_pixels=DEFAULT_RASTER_MAX_PIXELS):
+    """Return a deterministic scale capped by total raster pixels.
+
+    PDF page boxes can declare enormous physical sizes. Rendering them at a
+    fixed DPI can exhaust desktop memory, so all raster consumers share this
+    coordinate-preserving budget.
+    """
+    rect = fitz.Rect(rect)
+    requested_dpi = max(float(dpi), 1.0)
+    scale = requested_dpi / 72.0
+    width = max(rect.width, 1.0)
+    height = max(rect.height, 1.0)
+    requested_pixels = max(1, math.ceil(width * scale) * math.ceil(height * scale))
+    limited = requested_pixels > max_pixels > 0
+    if limited:
+        scale *= math.sqrt(max_pixels / requested_pixels)
+    pixel_width = max(1, math.ceil(width * scale))
+    pixel_height = max(1, math.ceil(height * scale))
+    if max_pixels > 0 and pixel_width * pixel_height > max_pixels:
+        scale *= math.sqrt(max_pixels / (pixel_width * pixel_height)) * 0.999999
+        pixel_width = max(1, math.ceil(width * scale))
+        pixel_height = max(1, math.ceil(height * scale))
+    return {
+        "requested_dpi": requested_dpi,
+        "effective_dpi": scale * 72.0,
+        "scale": scale,
+        "pixel_width": pixel_width,
+        "pixel_height": pixel_height,
+        "pixels": pixel_width * pixel_height,
+        "max_pixels": int(max_pixels),
+        "limited": limited,
+    }
+
+
+def raster_pixmap(page, dpi, max_pixels=DEFAULT_RASTER_MAX_PIXELS, clip=None,
+                  colorspace=None, alpha=False):
+    """Render one page/clip using :func:`raster_plan`; return (pixmap, plan)."""
+    rect = fitz.Rect(clip) if clip is not None else page.rect
+    plan = raster_plan(rect, dpi, max_pixels)
+    kwargs = {
+        "matrix": fitz.Matrix(plan["scale"], plan["scale"]),
+        "alpha": alpha,
+    }
+    if clip is not None:
+        kwargs["clip"] = rect
+    if colorspace is not None:
+        kwargs["colorspace"] = colorspace
+    return page.get_pixmap(**kwargs), plan
+
+
+def _area_ratio(rects, page_rect):
+    area = max(page_rect.get_area(), 1.0)
+    total = 0.0
+    for value in rects:
+        rect = fitz.Rect(value) & page_rect
+        if not rect.is_empty:
+            total += rect.get_area()
+    return min(1.0, total / area)
+
+
+def _text_removal_probe(doc, pno, span_rects):
+    """Raster comparison after removing PDF text only (images/graphics stay).
+
+    High similarity means the extracted text contributes almost nothing to the
+    visible page, which is a strong signal for an invisible OCR layer over a
+    scan. This is a preflight probe, not a claim of semantic OCR accuracy.
+    """
+    if not span_rects:
+        return None
+    copy = fitz.open()
+    try:
+        copy.insert_pdf(doc, from_page=pno, to_page=pno)
+        page = copy[0]
+        original, plan = raster_pixmap(
+            doc[pno], 54, PREFLIGHT_RASTER_MAX_PIXELS,
+            colorspace=fitz.csGRAY, alpha=False,
+        )
+        for rect in span_rects:
+            clipped = fitz.Rect(rect) & page.rect
+            if not clipped.is_empty:
+                page.add_redact_annot(clipped, fill=False, cross_out=False)
+        page.apply_redactions(
+            images=fitz.PDF_REDACT_IMAGE_NONE,
+            graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+        )
+        removed, _ = raster_pixmap(
+            page, plan["effective_dpi"], PREFLIGHT_RASTER_MAX_PIXELS,
+            colorspace=fitz.csGRAY, alpha=False,
+        )
+        if original.width != removed.width or original.height != removed.height:
+            return None
+        a, b = original.samples, removed.samples
+        # Bound CPU independently of page dimensions while sampling uniformly.
+        step = max(1, len(a) // 200_000)
+        count = 0
+        diff_sum = 0
+        changed = 0
+        for av, bv in zip(a[::step], b[::step]):
+            delta = abs(av - bv)
+            diff_sum += delta
+            changed += delta > 8
+            count += 1
+        if not count:
+            return None
+        mean_delta = diff_sum / (255.0 * count)
+        return {
+            "method": "text-removal-raster",
+            "similarity": round(1.0 - mean_delta, 6),
+            "mean_delta": round(mean_delta, 6),
+            "changed_pixel_ratio": round(changed / count, 6),
+            "effective_dpi": round(plan["effective_dpi"], 2),
+            "pixel_limited": bool(plan["limited"]),
+        }
+    except Exception as exc:
+        return {"method": "text-removal-raster", "error": str(exc)[:200]}
+    finally:
+        copy.close()
+
+
+def preflight_document(doc):
+    """Classify every page before translation using text, image and raster evidence."""
+    pages = []
+    for pno, page in enumerate(doc):
+        data = page.get_text("dict")
+        spans = [
+            span
+            for block in data.get("blocks", []) if block.get("type") == 0
+            for line in block.get("lines", [])
+            for span in line.get("spans", [])
+            if span.get("text", "").strip()
+        ]
+        text = "".join(span.get("text", "") for span in spans)
+        visible_chars = sum(not c.isspace() for c in text)
+        replacement_chars = text.count("�")
+        span_rects = [span["bbox"] for span in spans if span.get("bbox")]
+        image_rects = [
+            block["bbox"] for block in data.get("blocks", [])
+            if block.get("type") == 1 and block.get("bbox")
+        ]
+        text_coverage = _area_ratio(span_rects, page.rect)
+        image_coverage = _area_ratio(image_rects, page.rect)
+        replacement_ratio = replacement_chars / max(visible_chars, 1)
+        suspicious = (
+            visible_chars < 80 or image_coverage >= 0.55 or replacement_ratio >= 0.05
+        )
+        probe = _text_removal_probe(doc, pno, span_rects) if suspicious else None
+        mean_delta = probe.get("mean_delta") if isinstance(probe, dict) else None
+
+        if replacement_ratio >= 0.15 and visible_chars >= 20:
+            classification = "unsupported_text_encoding"
+            confidence = 0.9
+        elif visible_chars < 20 and image_coverage >= 0.50:
+            classification = "scanned"
+            confidence = min(0.99, 0.70 + image_coverage * 0.25)
+        elif (
+            visible_chars >= 20 and image_coverage >= 0.55
+            and mean_delta is not None and mean_delta < 0.002
+        ):
+            classification = "scanned_with_text_layer"
+            confidence = 0.9
+        elif visible_chars >= 20 and image_coverage >= 0.55 and text_coverage < 0.08:
+            classification = "mixed"
+            confidence = 0.75
+        elif visible_chars >= 20:
+            classification = "native_text"
+            confidence = 0.95 if visible_chars >= 80 else 0.8
+        elif image_coverage > 0.05:
+            classification = "image_or_figure"
+            confidence = 0.65
+        else:
+            classification = "empty_or_vector"
+            confidence = 0.6
+
+        pages.append({
+            "page": pno,
+            "classification": classification,
+            "confidence": round(confidence, 3),
+            "text_chars": visible_chars,
+            "text_coverage": round(text_coverage, 6),
+            "image_coverage": round(image_coverage, 6),
+            "replacement_char_ratio": round(replacement_ratio, 6),
+            "roundtrip_probe": probe,
+            "requires_ocr": classification in ("scanned", "scanned_with_text_layer"),
+            "manual_review": classification in (
+                "unsupported_text_encoding", "mixed", "image_or_figure", "empty_or_vector"
+            ),
+        })
+
+    counts = {}
+    for item in pages:
+        key = item["classification"]
+        counts[key] = counts.get(key, 0) + 1
+    ocr_pages = sum(1 for item in pages if item["requires_ocr"])
+    if pages and ocr_pages / len(pages) >= 0.8:
+        mode = "scanned"
+    elif ocr_pages:
+        mode = "mixed"
+    else:
+        mode = "native"
+    return {
+        "version": 1,
+        "document_mode": mode,
+        "page_count": len(pages),
+        "counts": counts,
+        "pages": pages,
+    }
 
 
 def _is_formula_like(txt):
@@ -550,6 +762,114 @@ def _block_text(block):
     return "\n".join(_span_text(ln["spans"]) for ln in block.get("lines", []))
 
 
+def _is_same_y_prefix(prefix, nxt, body_size):
+    """True nếu `prefix` là mảnh non-prose nằm CÙNG HÀNG thị giác với block
+    prose `nxt` kế tiếp. PyMuPDF hay tách 'The bold term, X̄_H, is...' thành
+    prefix='The bold term, ¯' (thất bại _is_prose_block vì dominant bold /
+    <5 từ) + next='X_H, is...' — prefix giữ nguyên EN, next dịch VI → chữ đè
+    (cụm chu_de_chong p25/p101).
+
+    Chỉ gộp khi DÒNG ĐẦU của 2 block giao y thật (không dùng bbox cả block —
+    tránh gộp 2 bullet/Step liền kề chỉ vì block cao chồng nhẹ)."""
+    if not prefix.get("lines") or not nxt.get("lines"):
+        return False
+    pt = _block_text(prefix).strip()
+    nt = _block_text(nxt).strip()
+    if not pt or not nt:
+        return False
+    # không gộp bullet / Step row (2 mục danh sách đứng gần nhau)
+    if any(pt.lstrip().startswith(c) for c in _BULLET_CHARS) or "■" in pt[:4]:
+        return False
+    if any(nt.lstrip().startswith(c) for c in _BULLET_CHARS) or "■" in nt[:4]:
+        return False
+    if _WORD_RE.match(pt) and pt.lower().startswith("step "):
+        return False
+    if _WORD_RE.match(nt) and nt.lower().startswith("step "):
+        return False
+    # dòng đầu có chữ của prefix vs dòng đầu có chữ của next
+    def _first_line_bbox(block):
+        for ln in block["lines"]:
+            if _span_text(ln["spans"]).strip():
+                return ln["bbox"]
+        return None
+    pl, nl = _first_line_bbox(prefix), _first_line_bbox(nxt)
+    if pl is None or nl is None:
+        return False
+    oy = min(pl[3], nl[3]) - max(pl[1], nl[1])
+    if oy < 3:
+        return False
+    # cùng cột (không gộp sidebar/cột trái rời)
+    if pl[2] < nl[0] - 20 or nl[2] < pl[0] - 20:
+        return False
+    spans = [s for ln in prefix["lines"] for s in ln["spans"] if s["text"].strip()]
+    if not spans:
+        return False
+    # từ chối heading section lớn (vd 'The Harmonic Mean' 13pt đứng riêng)
+    if (min(s["size"] for s in spans) > body_size * 1.15
+            and all(_heading_font(s["font"]) for s in spans)):
+        return False
+    # prefix ngắn + có cỡ chữ thân bài (run-in / overline fragment)
+    if len(pt) > 140:
+        return False
+    return any(abs(s["size"] - body_size) < body_size * 0.25
+               or s["size"] < 8.5  # subscript/overline glyph
+               for s in spans)
+
+
+def _merge_same_y_lines(lines):
+    """Gộp các 'line' PyMuPDF cùng hàng thị giác (y-center rơi vào band dòng
+    trước) thành 1 line — nối span theo x. Cần sau khi stitch block prefix+X̄
+    để overline '_' và 'X' thành 1 dòng cho _line_markup gom {vN}."""
+    if not lines:
+        return lines
+    ordered = sorted(lines, key=lambda L: (L["bbox"][1], L["bbox"][0]))
+    out = []
+    for L in ordered:
+        if not out:
+            out.append({"spans": list(L["spans"]), "bbox": list(L["bbox"]),
+                        "wmode": L.get("wmode", 0), "dir": L.get("dir")})
+            continue
+        prev = out[-1]
+        cy = (L["bbox"][1] + L["bbox"][3]) / 2
+        if prev["bbox"][1] - 2 <= cy <= prev["bbox"][3] + 2:
+            spans = sorted(prev["spans"] + list(L["spans"]),
+                           key=lambda s: s["bbox"][0])
+            prev["spans"] = spans
+            prev["bbox"] = [min(prev["bbox"][0], L["bbox"][0]),
+                            min(prev["bbox"][1], L["bbox"][1]),
+                            max(prev["bbox"][2], L["bbox"][2]),
+                            max(prev["bbox"][3], L["bbox"][3])]
+        else:
+            out.append({"spans": list(L["spans"]), "bbox": list(L["bbox"]),
+                        "wmode": L.get("wmode", 0), "dir": L.get("dir")})
+    return out
+
+
+def _stitch_same_y_blocks(blocks, body_size):
+    """Gộp block non-prose prefix vào block prose kế khi chúng cùng hàng
+    (xem _is_same_y_prefix). Trả list block mới (shallow copy khi merge)."""
+    out, i, n = [], 0, len(blocks)
+    while i < n:
+        b = blocks[i]
+        if (b.get("type") == 0 and i + 1 < n and blocks[i + 1].get("type") == 0
+                and not _is_prose_block(b, body_size)
+                and _is_prose_block(blocks[i + 1], body_size)
+                and _is_same_y_prefix(b, blocks[i + 1], body_size)):
+            nxt = blocks[i + 1]
+            merged = dict(nxt)
+            raw_lines = list(b.get("lines", [])) + list(nxt.get("lines", []))
+            merged["lines"] = _merge_same_y_lines(raw_lines)
+            pb, nb = b["bbox"], nxt["bbox"]
+            merged["bbox"] = (min(pb[0], nb[0]), min(pb[1], nb[1]),
+                              max(pb[2], nb[2]), max(pb[3], nb[3]))
+            out.append(merged)
+            i += 2
+            continue
+        out.append(b)
+        i += 1
+    return out
+
+
 def _is_short_bold(spans, txt):
     sp = _dominant(spans)
     if sp is None or not _heading_font(sp["font"]):
@@ -805,12 +1125,22 @@ def _line_is_formula_fragment(line, body_size):
     # chỉ vài chữ cái + chữ số ('n − 1' mẫu phân số). PHẢI không chứa từ thật —
     # 'so', 'Yes.', 'of 0.05.', 'is 5%.' đều có từ (_WORD_RE >=2 chữ cái) nên là
     # đuôi đoạn văn, phải được dịch (đúng docstring, review finding #4/#7/#8).
+    # '3.' / '10.' / '5%.' — số + dấu câu kết dòng (PyMuPDF tách đuôi câu
+    # "…distribution is\n3.") KHÔNG phải mảnh công thức: nếu coi fragment sẽ
+    # cắt bullet/prose, để rơi orphan '3.' trên trang (p100 kurtosis). Tử/mẫu
+    # phân số thật thường là '10'/'n−1' không có '.'/'%' kết thúc câu.
     clean = txt.replace("​", "").strip()
     words_all = _WORD_RE.findall(clean)
     if len(clean) <= 2 and not words_all:
+        # '3.' vẫn 2 ký tự — chấm câu → đuôi prose, không fragment
+        if clean.endswith((".", ",", ";", "%", "!", "?")):
+            return False
         return True
-    return (not words_all and letters <= 3
-            and any(c.isdigit() for c in clean))
+    if (not words_all and letters <= 3 and any(c.isdigit() for c in clean)
+            and not clean.endswith((".", ",", ";", "%", "!", "?"))
+            and len(clean) <= 8):
+        return True
+    return False
 
 
 def _line_is_heading(line, body_size):
@@ -1175,7 +1505,10 @@ def _extract_blocky(pd, body, all_boxes, page_bottom, pno, segments, layout, ctr
                     hlines=None, vlines=None, gkeys=None):
     """Đường đi trang VĂN XUÔI (sách volume)."""
     cands = []
-    for b in pd["blocks"]:
+    # Gộp prefix non-prose cùng hàng với prose kế (X̄ split — chu_de_chong p25/p101)
+    # TRƯỚC khi lọc _is_prose_block, nếu không prefix bị bỏ + next dịch đè EN.
+    blocks = _stitch_same_y_blocks(pd["blocks"], body)
+    for b in blocks:
         if b.get("type") != 0:
             continue
         rows = _label_rows(b)                       # hàng 'Step N | nội dung | dữ liệu'
@@ -1569,7 +1902,19 @@ def _fx_prefix(item):
     return f"x{item['id']}_"
 
 
-def apply_translations(doc, layout, translations, fontfile=None):
+def _review_scale_floor(item):
+    """Human-review floor by block role; rendering still preserves content."""
+    kind = item.get("type", "paragraph")
+    if kind in ("heading", "title"):
+        return 0.85
+    if kind in ("caption", "figure_caption", "table_caption"):
+        return 0.72
+    if kind in ("footnote", "reference"):
+        return 0.80
+    return 0.78
+
+
+def apply_translations(doc, layout, translations, fontfile=None, report=None):
     """Ghi đè bản dịch giữ layout. translations: {id: vi_text}.
     Trả về (applied, missing_ids).
     LƯU Ý: `doc` phải còn NGUYÊN BẢN khi gọi (ảnh công thức inline được raster
@@ -1585,6 +1930,18 @@ def apply_translations(doc, layout, translations, fontfile=None):
 
     applied = 0
     missing = [it["id"] for it in layout if not translations.get(it["id"])]
+    if report is not None:
+        report.clear()
+        report.update({
+            "version": 1,
+            "page_count": doc.page_count,
+            "page_sizes": [[round(p.rect.width, 3), round(p.rect.height, 3)] for p in doc],
+            "applied": 0,
+            "missing_ids": missing,
+            "document_scale_cap": None,
+            "review_count": 0,
+            "segments": [],
+        })
 
     # B1: raster ảnh công thức inline từ trang CÒN NGUYÊN (trước mọi redact).
     for pno, items in by_page.items():
@@ -1594,7 +1951,9 @@ def apply_translations(doc, layout, translations, fontfile=None):
                 continue
             for n, r in enumerate(item["fx"], 1):
                 try:
-                    pm = page.get_pixmap(clip=fitz.Rect(r), dpi=_FX_DPI)
+                    pm, _plan = raster_pixmap(
+                        page, _FX_DPI, max_pixels=2_000_000, clip=fitz.Rect(r)
+                    )
                     ar.add(pm.tobytes("png"), f"{_fx_prefix(item)}{n}.png")
                 except Exception:
                     pass                     # thiếu ảnh -> {vN} bị bỏ khi render
@@ -1611,21 +1970,59 @@ def apply_translations(doc, layout, translations, fontfile=None):
     # mode >= 0.94: tài liệu về cơ bản vừa -> không ép nhỏ cả cuốn vì chênh nhẹ.
     # Sàn chuẩn hoá 0.85: không bao giờ ÉP đoạn đã-vừa co quá 15% chỉ để đều.
     cap = 1.0 if mode >= 0.94 else max(mode, 0.85)
+    if report is not None:
+        report["document_scale_cap"] = round(cap, 4)
 
     for pno, items in by_page.items():
         page = doc[pno]
         # Xoá markup annotation (Highlight/Underline/StrikeOut/Squiggly) NHƯNG chỉ
         # khi rect của nó GIAO vùng bị redact: chữ Việt reflow làm annot neo theo
         # chữ Anh lệch chỗ. Annot phủ vùng GIỮ NGUYÊN (công thức, dòng bị filter
-        # bỏ qua) vẫn đúng vị trí -> GIỮ LẠI (fix cụm 'mất highlight' — trước đây
-        # xoá tất cả trên trang có dịch, mất cả highlight của công thức).
+        # bỏ qua) vẫn đúng vị trí -> GIỮ LẠI (tier-1: cụm 'mất highlight').
+        # Tier-2: nếu highlight GẦN HẾT nằm trên 1 segment bị dịch (≥60% diện
+        # tích annot giao union redact của segment) -> sau khi vẽ VI, vẽ lại
+        # highlight trên box segment mới (chữ đã reflow). Ngưỡng cao để tránh
+        # over-highlight khi annot gốc chỉ phủ vài câu trong segment lớn.
         hdrs = _header_dups(page)              # dọn header lặp trên trang bị redact
         red_rects = [fitz.Rect(r) for it, _vi in items for r in it["redact"]]
         red_rects += [rect for rect, _t, _s, _c in hdrs]  # header cũng bị redact+vẽ lại
+        # Map segment id -> union of its redact rects (for tier-2 matching)
+        seg_redact_union = {}
+        for it, _vi in items:
+            u = fitz.Rect()
+            for r in it["redact"]:
+                u |= fitz.Rect(r)
+            if not u.is_empty:
+                seg_redact_union[it["id"]] = u
+        re_hl = []  # [(box_rect, stroke_rgb_or_None)]
         for an in list(page.annots() or []):
-            if an.type[1] in ("Highlight", "Underline", "StrikeOut", "Squiggly"):
-                if any(an.rect.intersects(rr) for rr in red_rects):
-                    page.delete_annot(an)
+            if an.type[1] not in ("Highlight", "Underline", "StrikeOut", "Squiggly"):
+                continue
+            if not any(an.rect.intersects(rr) for rr in red_rects):
+                continue  # không giao redact -> giữ nguyên (tier-1)
+            # Tier-2: tìm segment mà annot phủ ≥60%
+            ar = an.rect
+            ar_area = max(ar.get_area(), 1e-6)
+            best_id, best_ratio = None, 0.0
+            for sid, u in seg_redact_union.items():
+                inter = ar & u
+                if inter.is_empty:
+                    continue
+                ratio = inter.get_area() / ar_area
+                if ratio > best_ratio:
+                    best_ratio, best_id = ratio, sid
+            if best_id is not None and best_ratio >= 0.60:
+                # Lấy box đích (chỗ chữ Việt sẽ nằm)
+                for it, _vi in items:
+                    if it["id"] == best_id:
+                        l, t, r, b = it["box"]
+                        re_hl.append((
+                            fitz.Rect(l, t, r, max(b, t + it["size"] + 2)),
+                            an.type[1],
+                            (an.colors or {}).get("stroke"),
+                        ))
+                        break
+            page.delete_annot(an)
         for item, _vi in items:
             for r in item["redact"]:
                 page.add_redact_annot(fitz.Rect(r))
@@ -1640,17 +2037,81 @@ def apply_translations(doc, layout, translations, fontfile=None):
             html = _seg_html(vi, item["size"], item["color"],
                              item.get("lh") or 1.12, item.get("align"),
                              item.get("fx"), s, _fx_prefix(item))
+            fallback = None
+            spare_height = None
+            renderer_scale = 1.0
+            overflow = False
             try:
                 # scale_low=0.3: lưới an toàn — nếu đo trước vẫn lệch thì co
                 # thêm cho VỪA, tuyệt đối không tràn đè phần tử giữ nguyên.
-                page.insert_htmlbox(box, html, css=css, archive=ar,
-                                    scale_low=0.3)
+                spare_height, renderer_scale = page.insert_htmlbox(
+                    box, html, css=css, archive=ar, scale_low=0.3
+                )
+                overflow = spare_height < 0
+                if overflow:
+                    fallback = "plain_text"
+                    fallback_size = _fit(
+                        page, box, strip_markers(vi), item["size"],
+                        _int_color_to_rgb(item["color"]), fallback_font,
+                    )
+                    renderer_scale = fallback_size / max(item["size"], 0.1)
             except Exception:
-                _fit(page, box, strip_markers(vi), item["size"],
-                     _int_color_to_rgb(item["color"]), fallback_font)
+                fallback = "plain_text"
+                fallback_size = _fit(
+                    page, box, strip_markers(vi), item["size"],
+                    _int_color_to_rgb(item["color"]), fallback_font,
+                )
+                renderer_scale = fallback_size / max(item["size"], 0.1)
             applied += 1
+            if report is not None:
+                actual_scale = max(0.0, min(
+                    1.0,
+                    float(renderer_scale) if fallback else s * float(renderer_scale),
+                ))
+                review_floor = _review_scale_floor(item)
+                review_required = bool(
+                    actual_scale < review_floor or fallback is not None or overflow
+                )
+                if review_required:
+                    report["review_count"] += 1
+                report["segments"].append({
+                    "id": item["id"],
+                    "page": pno,
+                    "type": item.get("type", "paragraph"),
+                    "box": list(item["box"]),
+                    "optimal_scale": round(fits.get(item["id"], 1.0), 4),
+                    "requested_scale": round(s, 4),
+                    "renderer_scale": round(float(renderer_scale), 4),
+                    "actual_scale": round(actual_scale, 4),
+                    "review_scale_floor": review_floor,
+                    "spare_height": (round(float(spare_height), 3)
+                                     if spare_height is not None else None),
+                    "formula_count": len(item.get("fx") or []),
+                    "fallback": fallback,
+                    "overflow": overflow,
+                    "review_required": review_required,
+                    "status": "review" if review_required else "ok",
+                })
         for rect, txt, sz, col in hdrs:        # vẽ lại 1 bản header sạch
             _fit(page, rect, txt, sz, _int_color_to_rgb(col), fallback_font)
+        # Tier-2: vẽ lại highlight/underline trên box segment đã dịch
+        for box, kind, stroke in re_hl:
+            try:
+                if kind == "Highlight":
+                    ann = page.add_highlight_annot(box)
+                elif kind == "Underline":
+                    ann = page.add_underline_annot(box)
+                elif kind == "StrikeOut":
+                    ann = page.add_strikeout_annot(box)
+                else:
+                    ann = page.add_squiggly_annot(box)
+                if stroke:
+                    ann.set_colors(stroke=stroke)
+                ann.update()
+            except Exception:
+                pass  # annot API khác phiên bản PyMuPDF — bỏ qua, không phá apply
+    if report is not None:
+        report["applied"] = applied
     return applied, missing
 
 
@@ -1664,7 +2125,8 @@ def _fit(page, box, text, size, color, fontfile):
         rc = page.insert_textbox(box, text, fontname="vi", fontfile=fontfile,
                                  fontsize=s, color=color, align=0, lineheight=1.08)
         if rc >= 0:
-            return
+            return s
         s -= 0.25 if s <= 7 else 0.5
     page.insert_textbox(box, text, fontname="vi", fontfile=fontfile,
                         fontsize=5.5, color=color, align=0, lineheight=1.0)
+    return 5.5

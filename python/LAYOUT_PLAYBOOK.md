@@ -22,10 +22,12 @@ từng entry, entry lệch bị bỏ). Khi đó chạy thêm:
 ```bash
 python3 agent_pipeline.py chunk "$SRC" "$WD" --force   # merge out/ cũ rồi re-chunk
 # -> todo mới = CHỈ các text chưa có cache; chạy pipeline để dịch phần đó
-python3 agent_pipeline.py vchunk "$SRC" "$WD" --force  # tương tự cho verify
+# -> đồng thời INVALIDATE verify+vision (vchunks/vout/vis/review_issues) + ghi
+#    workset.chunk_gen mới — status không thể hiện later-stage "xong" khi dịch bù
+python3 agent_pipeline.py vchunk "$SRC" "$WD"          # tự tạo lại nếu stale
 ```
-(`--force` đã an toàn: tự merge tiến độ cũ vào cache TRƯỚC khi xoá output cũ —
-tránh va index giữa chunking cũ/mới.)
+(`chunk --force` đã an toàn: merge tiến độ cũ vào cache TRƯỚC khi xoá out/ +
+invalidate stage sau. `vchunk` no-op chỉ khi `vchunk_gen` khớp `chunk_gen`.)
 
 ## 1. Phân loại defect: `defect-report`
 
@@ -126,14 +128,21 @@ trừ còn lại là cache-miss chờ dịch bù):
 | `_collect_drawing_lines` + clamp đáy/phải | viền khung/ngoặc vector thành obstacle | p57/p184 hết tràn ✓ |
 | `_line_is_formula_fragment` per-line (7 rule) | mảnh công thức không bị redact/flatten | p28 P̄/E + X̄_H nguyên vẹn ✓ |
 | `_shave_redacts` xuyên block | 'Solution:' hết bị ăn glyph | p84 ✓ |
+| same-y prefix stitch (X̄) | gộp block non-prose + prose cùng hàng → hết đè EN/VI | p25 ✓, p101 ✓ |
+| formula fragment ≠ đuôi số câu | `'3.'`/`'10.'` không cắt bullet; `'10'` tử phân số vẫn fragment | p100 kurtosis ✓ |
 
 Còn lại (theo thứ tự giá trị):
-1. **Highlight tier-2**: vẽ lại highlight theo box MỚI khi %-giao đủ lớn
-   (p18/p63 vẫn mất highlight ở đoạn CÓ dịch — tier-1 chỉ cứu vùng giữ nguyên).
+1. ~~**Highlight tier-2**~~ → **ĐÃ FIX** (2026-07-18): nếu highlight giao ≥60%
+   union redact của một segment bị dịch, sau apply vẽ lại highlight trên box
+   VI mới; ngưỡng cao tránh over-highlight. Unit test `t_highlight_tier2` /
+   `t_highlight_tier1_keep` trong `test_engine_v2.py`.
 2. **Right-widen khi co chữ** (`max_right` trong layout + fallback trong `_fit`
    trước khi shrink): cứu cụm co font (p103/135).
-3. **p25 same-y overlap**: mảnh bold nằm cùng hàng nhưng KHÔNG cùng band y-center
-   — điều kiện inline chưa bắt được, trang này chưa đổi.
+3. ~~**p25 same-y overlap**~~ → **ĐÃ FIX** (2026-07-18): `_stitch_same_y_blocks`
+   + `_merge_same_y_lines` gộp prefix non-prose cùng hàng với prose kế (X̄ tách
+   block: "The **harmonic mean**, ¯" + "X_H, is…") trước `_is_prose_block`.
+   Guard: không gộp bullet/Step; chỉ giao y của *dòng đầu*. p25/p101 hết đè
+   EN+VI; unit `t_same_y_stitch` / `t_same_y_stitch_real_pdf`.
 4. ~~Bảng nhãn KHÔNG đậm (Exhibit 15 p38)~~ → **ĐÃ FIX** bởi `_page_grid_keys`
    (render v2, 2026-07-13 — xem mục dưới).
 5. Mảnh 'and ˆ' (prefix prose + mũ công thức tách dòng) — vụn, hiếm; một phần

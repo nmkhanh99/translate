@@ -8,9 +8,10 @@
   },
   "scripts": {
     "dev": "tsx src/cli.ts --no-open",
-    "build": "esbuild src/cli.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/cli.mjs --external:better-sqlite3 --banner:js=\"import{createRequire}from'module';const require=createRequire(import.meta.url);\" && cp src/pipeline-runner.mjs dist/",
+    "build": "esbuild src/cli.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/cli.mjs --external:better-sqlite3 --banner:js=\"import{createRequire as __createRequire}from'module';const require=__createRequire(import.meta.url);\" && cp src/pipeline-runner.mjs dist/",
     "start": "node dist/cli.mjs",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test src/engine-resolve.test.ts src/engine-catalog-daemon.test.ts src/artifact-identity.test.ts src/reading-progress.test.ts src/repair-requests.test.ts src/reader-annotations.test.ts src/selection-translation.test.ts src/pipeline-context.test.mjs"
   },
   "dependencies": {
     "@cfa-translate/agent-adapters": "workspace:*",

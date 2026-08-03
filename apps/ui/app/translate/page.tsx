@@ -22,11 +22,10 @@ export default function Translate() {
     }
     toast("Đang tải “" + f.name + "”…");
     try {
-      await uploadPdf(f);
+      const uploaded = await uploadPdf(f);
       const st = await getStatus();
       const name = f.name.replace(/\.pdf$/i, "");
-      const users = st.volumes.filter((x) => x.user);
-      const v = users.filter((x) => x.display === name)[0] || users.slice(-1)[0];
+      const v = st.volumes.find((x) => x.tag === uploaded.tag);
       if (v) {
         setSelected(v);
         toast("Đã thêm “" + name + "” — bấm Bắt đầu dịch");
@@ -42,8 +41,9 @@ export default function Translate() {
       return;
     }
     try {
-      await runVolume(selected.tag);
-      toast("Đã bắt đầu dịch (headless) — xem ở Hàng đợi");
+      // Gửi engine đang hiện trên EngineSwitch — khớp UI ↔ /api/run (body override).
+      await runVolume(selected.tag, engine);
+      toast("Đã bắt đầu dịch bằng " + engine + " — xem ở Hàng đợi");
     } catch (e) {
       toast("Lỗi: " + (e as Error).message);
     }

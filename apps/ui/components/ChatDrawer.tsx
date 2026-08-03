@@ -18,7 +18,7 @@
 // sessions when it is still the current owner — so switching mid-stream can
 // never mix one conversation's transcript or CLI session into another's.
 import * as React from "react";
-import { ChatDoc, useToast, useEngine } from "./Providers";
+import { ChatDoc, ChatDraft, useToast, useEngine } from "./Providers";
 import type { ChatMessage, ChatRole, Engine } from "../lib/types";
 import { streamChat } from "../lib/chat";
 import {
@@ -69,10 +69,12 @@ const STARTERS: { title: string; prompt: string }[] = [
 
 export function ChatDrawer({
   doc,
+  draft,
   open,
   onClose,
 }: {
   doc: ChatDoc | null;
+  draft: ChatDraft | null;
   open: boolean;
   onClose: () => void;
 }) {
@@ -89,6 +91,7 @@ export function ChatDrawer({
   const [statusLine, setStatusLine] = React.useState<string | null>(null);
   const abortRef = React.useRef<AbortController | null>(null);
   const logRef = React.useRef<HTMLDivElement>(null);
+  const inputRef = React.useRef<HTMLTextAreaElement>(null);
   const tag = doc?.tag || "";
   const tagRef = React.useRef(tag);
   tagRef.current = tag;
@@ -215,6 +218,12 @@ export function ChatDrawer({
     const el = logRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages, open, statusLine]);
+
+  React.useEffect(() => {
+    if (!draft) return;
+    setInput(draft.text);
+    requestAnimationFrame(() => inputRef.current?.focus());
+  }, [draft]);
 
   // Esc closes.
   React.useEffect(() => {
@@ -441,7 +450,7 @@ export function ChatDrawer({
             💬 Trò chuyện về <b>{doc?.display || "tài liệu"}</b>. AI chạy trong thư
             mục <span className="num">translate</span> và biết file nguồn/bản dịch
             của cuốn này — hỏi để dịch, giải thích thuật ngữ, hay soát lỗi trình
-            bày. Mỗi cuốn giữ nhiều hội thoại, tự lưu lại.
+            bày. Chat reader chỉ đọc; mỗi cuốn giữ nhiều hội thoại, tự lưu lại.
           </small>
         </div>
 
@@ -494,6 +503,7 @@ export function ChatDrawer({
 
         <div className="chat-composer">
           <textarea
+            ref={inputRef}
             className="input"
             placeholder={`Nhắn ${engineLabel}… (Enter gửi · Shift+Enter xuống dòng)`}
             value={input}

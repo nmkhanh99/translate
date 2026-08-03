@@ -1,6 +1,16 @@
 # Tiến trình dịch CFA L1 — bản giao để dịch tiếp
 
-Cập nhật: 2026-07-06. File này ghi **đang ở đâu** và **làm gì tiếp**. Chi tiết engine/lệnh xem `README.md`.
+Cập nhật: 2026-07-18. File này ghi **đang ở đâu** và **làm gì tiếp**. Chi tiết engine/lệnh xem `README.md`.
+
+> **2026-07-18 — formula-fragment prose tail:** `_line_is_formula_fragment` không còn bắt `'3.'`/`'10.'` (đuôi câu tách dòng). Hết orphan số p100 kurtosis; test `t_formula_fragment_prose_tail` / `t_kurtosis_tail_real_pdf`. defect 110→109; label_tach_dong 4→3.
+
+> **2026-07-18 — engine same-y stitch:** `_stitch_same_y_blocks` + `_merge_same_y_lines` trong `_extract_blocky` gộp prefix non-prose cùng hàng với prose kế (X̄ tách block). Hết đè EN+VI p25/p101 (`chu_de_chong`). Guard không gộp bullet/Step. Test: `t_same_y_stitch*`. Apply v1 missing=0; defect medium+ 111→110; cụm chu_de_chong 13→11 trang.
+
+> **2026-07-18 — progress honesty:** `status` chỉ đếm checkpoint hợp lệ + gate
+> stage tuần tự (artifact vision cũ sau re-chunk không còn đẩy % gần 100).
+> `overall_pct` 100 chỉ khi `done`. `review_issues` enrich cluster/channel/
+> segments. Engine: highlight tier-2. Test: `test_progress_status.py` +
+> `test_engine_v2.py`.
 
 ## 1. Tổng quan
 

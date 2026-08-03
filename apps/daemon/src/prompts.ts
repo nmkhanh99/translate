@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import type { RepairRequestKind } from "@cfa-translate/shared";
 import type { VolumeRec } from "./volumes.js";
 
 export function chatContextSafe(vol: VolumeRec): string {
@@ -26,6 +27,14 @@ export interface RunOpts {
   vision?: boolean;
   /** CSV chỉ số trang 0-based: CHỈ re-render + soát các trang này (redo theo trang). */
   visPages?: string;
+  /** Internal: distinguishes translation redo from verify/vision cache semantics. */
+  redoStage?: "translate" | "verify" | "vision";
+  /** Xử lý lại đúng một trang từ viewer, không reset bản dịch toàn volume. */
+  repairKind?: RepairRequestKind;
+  /** Mô tả do người dùng nhập; runner chỉ coi đây là dữ liệu tham khảo. */
+  repairNote?: string;
+  /** Khoá nối lifecycle tiến trình với repair_requests.json. */
+  repairRequestId?: string;
 }
 
 // (Pipeline Claude giờ do apps/daemon/src/pipeline-runner.mjs điều phối trực

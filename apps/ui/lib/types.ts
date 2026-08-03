@@ -8,6 +8,18 @@ export type {
   EngineId,
   AgentDetection,
   AgentCapabilities,
+  DocumentBlock,
+  BlockReport,
+  PreflightReport,
+  RepairRequest,
+  RepairRequestKind,
+  RepairRequestStatus,
+  ReaderAnnotation,
+  ReaderAnnotationKind,
+  ReaderAnnotationRect,
+  ReaderAnnotationSide,
+  ReaderTextPage,
+  ReaderTextSpan,
 } from "@cfa-translate/shared";
 
 export type Engine = import("@cfa-translate/shared").EngineId;
@@ -21,4 +33,3 @@ export interface ChatMessage {
   engine?: Engine;
   streaming?: boolean;
 }
-

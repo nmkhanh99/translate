@@ -23,6 +23,7 @@ export const INPUT_DIR = join(REPO_ROOT, "input");
 export const OUTPUT_DIR = join(REPO_ROOT, "output");
 export const USER_WORK = join(TOOL_DIR, "work");
 export const CFG_PATH = join(TOOL_DIR, "dashboard.json");
+export const READING_PROGRESS_PATH = join(TOOL_DIR, "reading-progress.json");
 
 /** In-app UI static export, served by the daemon. Override via CFA_UI_OUT
  *  (packaged → Resources/ui-out). */

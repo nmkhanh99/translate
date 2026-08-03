@@ -20,6 +20,8 @@ const CHAT_TOOLS = [
   "Edit",
 ];
 
+const READ_ONLY_CHAT_TOOLS = ["Read", "Grep", "Glob"];
+
 const PIPELINE_TOOLS = [
   "Bash(cd *)",
   "Bash(python3 *)",
@@ -44,6 +46,14 @@ export const claudeAdapter: AgentAdapter = {
       bin: "claude",
       configDirRel: ".claude",
     });
+  },
+
+  /**
+   * Claude Code does not expose a stable non-interactive "list models" table
+   * (aliases resolve server-side). Empty → UI uses CLI default + free-text.
+   */
+  async listModels(): Promise<string[]> {
+    return [];
   },
 
   capabilities(): AgentCapabilities {
@@ -75,7 +85,7 @@ export const claudeAdapter: AgentAdapter = {
       "--permission-mode",
       "default",
       "--allowedTools",
-      ...CHAT_TOOLS,
+      ...(params.readOnly ? READ_ONLY_CHAT_TOOLS : CHAT_TOOLS),
     ];
     if (params.model) {
       cmd.push("--model", params.model);
@@ -104,8 +114,6 @@ export const claudeAdapter: AgentAdapter = {
       "claude",
       "-p",
       params.prompt,
-      "--model",
-      params.model || "sonnet",
       "--add-dir",
       params.cwd,
       "--output-format",
@@ -114,6 +122,8 @@ export const claudeAdapter: AgentAdapter = {
       "--session-id",
       sid,
     ];
+    // Only pass --model when caller resolved a real id (omit = CLI default).
+    if (params.model) cmd.push("--model", params.model);
     if (params.posture === "bypass") {
       cmd.push("--permission-mode", "bypassPermissions");
     } else {

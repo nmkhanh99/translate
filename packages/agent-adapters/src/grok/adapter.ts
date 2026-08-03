@@ -8,6 +8,7 @@ import { baseDetect } from "../detect.js";
 import { cancelRun, spawnLineStream } from "../spawn-stream.js";
 import { parseGrokLine } from "./stream.js";
 import { isGrokResumeFailure } from "../resume-fail.js";
+import { parseGrokModelsOutput, runCliCapture } from "../list-models.js";
 
 export const grokAdapter: AgentAdapter = {
   id: "grok",
@@ -32,6 +33,12 @@ export const grokAdapter: AgentAdapter = {
     };
   },
 
+  /** Parse `grok models` — live list from installed CLI, not a frozen table. */
+  async listModels(): Promise<string[]> {
+    const text = await runCliCapture("grok", ["models"], 8000);
+    return parseGrokModelsOutput(text);
+  },
+
   async *chat(params: ChatRunParams) {
     // Recent Grok Build CLIs require `-p <PROMPT>` as an argv value (no bare
     // stdin). Keep prompt on argv; open-design stages a --prompt-file for huge
@@ -44,8 +51,17 @@ export const grokAdapter: AgentAdapter = {
       "streaming-json",
       "--cwd",
       params.cwd,
-      "--permission-mode",
-      "auto",
+      ...(params.readOnly
+        ? [
+            "--sandbox",
+            "read-only",
+            "--permission-mode",
+            "dontAsk",
+            "--disable-web-search",
+            "--no-subagents",
+            "--no-memory",
+          ]
+        : ["--permission-mode", "auto"]),
     ];
     if (params.model) {
       cmd.push("--model", params.model);
@@ -65,7 +81,7 @@ export const grokAdapter: AgentAdapter = {
   },
 
   buildPipelineCmd(params: PipelineRunParams): string[] {
-    return [
+    const cmd = [
       "grok",
       "-p",
       params.prompt,
@@ -75,6 +91,8 @@ export const grokAdapter: AgentAdapter = {
       params.cwd,
       "--always-approve",
     ];
+    if (params.model) cmd.push("--model", params.model);
+    return cmd;
   },
 
   cancel(runId: string) {

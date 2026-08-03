@@ -252,8 +252,9 @@ function RunDetail() {
                 </span>
               </div>
               <div className="muted" style={{ fontSize: "var(--text-xs)" }}>
-                Rà soát & Soát layout chạy bằng pipeline <b>Claude</b> (chọn engine ở
-                trên). “Dịch lại” xoá bản dịch cũ và làm lại các bước sau.
+                Chạy lại stage dùng <b>engine đang chọn</b> ở trên (Claude / Codex /
+                Grok) qua pipeline điều phối file — không bắt buộc Claude. “Dịch lại”
+                xoá output stage đó rồi làm lại từ checkpoint.
               </div>
             </div>
           </div>

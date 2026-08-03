@@ -141,6 +141,200 @@ def t_mode():
     check("rỗng -> 1.0", pc._mode_scale([]) == 1.0)
 
 
+# ── highlight tier-2: re-draw highlight on translated box when ≥60% overlap ──
+def t_highlight_tier2():
+    import fitz
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=200)
+    # English-like text in a known rect
+    box = fitz.Rect(50, 50, 300, 80)
+    page.insert_textbox(box, "Sample English sentence for highlight test.",
+                        fontsize=11, fontname="helv")
+    # Highlight covering most of that rect
+    hl = page.add_highlight_annot(fitz.Rect(50, 50, 290, 78))
+    hl.set_colors(stroke=[1, 1, 0])
+    hl.update()
+    # Fake layout item covering same region (as extract would)
+    layout = [{
+        "id": "s0", "page": 0,
+        "redact": [[50, 50, 300, 80]],
+        "box": [50, 50, 300, 95],
+        "size": 11, "color": 0, "lh": 1.12, "align": None, "fx": None,
+    }]
+    before = sum(1 for a in (page.annots() or []) if a.type[1] == "Highlight")
+    check("before apply: 1 highlight", before == 1)
+    applied, _miss = pc.apply_translations(
+        doc, layout, {"s0": "Câu tiếng Việt để kiểm tra highlight tier-2."})
+    check("applied segment", applied == 1)
+    after = [a for a in (page.annots() or []) if a.type[1] == "Highlight"]
+    check("tier-2 redraw: still has ≥1 highlight", len(after) >= 1)
+    if after:
+        inter = after[0].rect & fitz.Rect(layout[0]["box"])
+        check("new highlight overlaps translated box", inter.get_area() > 0)
+
+
+# ── highlight tier-1: annot on non-redacted region is kept ──
+def t_highlight_tier1_keep():
+    import fitz
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=200)
+    page.insert_textbox(fitz.Rect(50, 50, 200, 80), "Translated area",
+                        fontsize=11, fontname="helv")
+    page.insert_textbox(fitz.Rect(220, 50, 380, 80), "Formula kept",
+                        fontsize=11, fontname="helv")
+    # Highlight only on formula region (no overlap with redact)
+    hl = page.add_highlight_annot(fitz.Rect(220, 50, 370, 75))
+    hl.update()
+    layout = [{
+        "id": "s0", "page": 0,
+        "redact": [[50, 50, 200, 80]],
+        "box": [50, 50, 200, 95],
+        "size": 11, "color": 0, "lh": 1.12, "align": None, "fx": None,
+    }]
+    pc.apply_translations(doc, layout, {"s0": "Vùng đã dịch"})
+    after = [a for a in (page.annots() or []) if a.type[1] == "Highlight"]
+    check("tier-1: highlight trên vùng giữ nguyên còn lại", len(after) >= 1)
+
+
+# ── same-y prefix stitch (chu_de_chong p25/p101: bold term + X̄ split) ─────
+def _blk(lines, bbox, typ=0):
+    """Synthetic PyMuPDF-like block for stitch unit tests."""
+    return {"type": typ, "bbox": bbox, "lines": lines}
+
+
+def _ln(spans, bbox):
+    return {"spans": spans, "bbox": bbox, "wmode": 0, "dir": (1, 0)}
+
+
+def t_same_y_stitch():
+    """Pure logic: prefix non-prose on same y as prose next → merged once."""
+    body = 10.0
+    # prefix: "The harmonic mean, _" (bold dominant → not prose)
+    pref_spans = [
+        _sp("The ", 174, 192, size=10, font="WarnockPro-Regular", flags=4,
+            y0=697, y1=712),
+        _sp("harmonic mean", 193, 265, size=10, font="MyriadPro-Bold", flags=20,
+            y0=697, y1=709),
+        _sp(", ", 265, 273, size=10, font="WarnockPro-Regular", flags=4,
+            y0=697, y1=712),
+        _sp("_", 272, 279, size=11.7, font="WarnockPro-Regular", flags=5,
+            y0=689, y1=703),
+    ]
+    # next: "X_H, is another measure of central tendency here enough words."
+    nxt_spans = [
+        _sp("X", 271, 280, size=10, font="WarnockPro-It", flags=6, y0=697, y1=712),
+        _sp("H", 279, 285, size=8, font="WarnockPro-It", flags=6, y0=702, y1=714),
+        _sp(", is another measure of central tendency here enough words ok.",
+            285, 530, size=10, font="WarnockPro-Regular", flags=4, y0=697, y1=712),
+    ]
+    pref = _blk([_ln(pref_spans, [174, 689, 279, 712])], [174, 689, 279, 712])
+    nxt = _blk([_ln(nxt_spans, [271, 697, 530, 712])], [271, 697, 530, 712])
+    # sanity: prefix not prose, next is prose
+    check("prefix synthetic không prose", not pc._is_prose_block(pref, body))
+    check("next synthetic là prose", pc._is_prose_block(nxt, body))
+    check("same-y prefix nhận diện", pc._is_same_y_prefix(pref, nxt, body))
+
+    stitched = pc._stitch_same_y_blocks([pref, nxt], body)
+    check("stitch gộp còn 1 block", len(stitched) == 1)
+    merged_txt = pc._block_text(stitched[0])
+    check("merged chứa prefix 'harmonic mean'", "harmonic mean" in merged_txt)
+    check("merged có continuation 'another measure'", "another measure" in merged_txt)
+    check("merged vẫn prose sau gộp", pc._is_prose_block(stitched[0], body))
+
+    # negative: pure large heading must NOT stitch into next
+    head_spans = [
+        _sp("The Harmonic Mean", 174, 287, size=13, font="MyriadPro-Semibold",
+            flags=20, y0=675, y1=691),
+    ]
+    head = _blk([_ln(head_spans, [174, 675, 287, 691])], [174, 675, 287, 691])
+    check("heading lớn không same-y-prefix",
+          not pc._is_same_y_prefix(head, nxt, body))
+
+    # merge same-y lines: overline + X → 1 line
+    lines = [
+        _ln(pref_spans, [174, 689, 279, 712]),
+        _ln(nxt_spans, [271, 697, 530, 712]),
+    ]
+    merged_lines = pc._merge_same_y_lines(lines)
+    check("merge_same_y_lines gộp 2→1", len(merged_lines) == 1)
+    check("span đã sort theo x",
+          merged_lines[0]["spans"][0]["bbox"][0]
+          <= merged_lines[0]["spans"][-1]["bbox"][0])
+
+
+def t_formula_fragment_prose_tail():
+    """'3.' đuôi câu không phải mảnh công thức; '10' tử phân số vẫn là fragment."""
+    body = 10.0
+    # sentence-ending number on its own line (p100 kurtosis)
+    line_3 = _ln([_sp("3.", 126, 140, size=10, font="WarnockPro-Regular", flags=4,
+                      y0=221, y1=236)], [126, 221, 140, 236])
+    check("'3.' không phải formula fragment",
+          not pc._line_is_formula_fragment(line_3, body))
+    # bare numerator-like token without sentence punctuation
+    line_10 = _ln([_sp("10", 200, 215, size=10, font="WarnockPro-Regular", flags=4,
+                       y0=100, y1=112)], [200, 100, 215, 112])
+    check("'10' vẫn là formula fragment (tử phân số)",
+          pc._line_is_formula_fragment(line_10, body))
+    # overline bar still fragment
+    line_bar = _ln([_sp("_", 272, 279, size=11.7, font="WarnockPro-Regular", flags=5,
+                        y0=689, y1=703)], [272, 689, 279, 703])
+    check("overline '_' vẫn fragment",
+          pc._line_is_formula_fragment(line_bar, body))
+
+
+def t_kurtosis_tail_real_pdf():
+    """p100: kurtosis bullet includes trailing '3.'; no orphan formula cut."""
+    import os
+    src = "/Users/khanhnm/Desktop/translate/2024 CFA L1 Curriculum/2024 L1V1.pdf"
+    if not os.path.exists(src):
+        print("  (bỏ qua kurtosis real-pdf — thiếu PDF nguồn)")
+        return
+    import fitz
+    doc = fitz.open(src)
+    segs, layout = pc.extract_segments(doc, "100")
+    s1 = next((s for s in segs if "Kurtosis measures" in s["text"]), None)
+    check("p100 có segment Kurtosis", s1 is not None)
+    if s1:
+        check("p100 kurtosis kết thúc bằng 'is 3.'",
+              s1["text"].rstrip().endswith("is 3."))
+        lay = next(L for L in layout if L["id"] == s1["id"])
+        # box must cover the '3.' line (~y221-236)
+        check("p100 box.y1 phủ dòng '3.' (~236)", lay["box"][3] >= 230)
+        # no separate short segment that is just '3.'
+        orphans = [s for s in segs if s["text"].strip() in ("3.", "3")]
+        check("p100 không còn segment orphan '3.'", orphans == [])
+
+
+def t_same_y_stitch_real_pdf():
+    """Shipped extract_segments on v1 p25/p101: prefix+X̄ gộp, redact phủ prefix."""
+    import os
+    src = "/Users/khanhnm/Desktop/translate/2024 CFA L1 Curriculum/2024 L1V1.pdf"
+    if not os.path.exists(src):
+        print("  (bỏ qua real-pdf stitch — thiếu PDF nguồn)")
+        return
+    import fitz
+    doc = fitz.open(src)
+    segs, layout = pc.extract_segments(doc, "25")
+    s1 = next((s for s in segs if "harmonic mean" in s["text"].lower()
+               and "another measure" in s["text"].lower()), None)
+    check("p25: segment gộp 'The harmonic mean' + continuation", s1 is not None)
+    if s1:
+        check("p25: có {vN} cho X̄ inline", "{v" in s1["text"])
+        lay = next(L for L in layout if L["id"] == s1["id"])
+        # prefix overline/bold starts ~y688 — box must cover it
+        check("p25: box.y0 phủ vùng prefix (~688)", lay["box"][1] < 692)
+        check("p25: ≥1 redact rect", len(lay["redact"]) >= 1)
+
+    segs, layout = pc.extract_segments(doc, "101")
+    s3 = next((s for s in segs if "Sample Mean Formula" in s["text"]
+               and "X-bar" in s["text"]), None)
+    check("p101: segment gộp Sample Mean Formula + X-bar", s3 is not None)
+    if s3:
+        check("p101: có {vN}", "{v" in s3["text"])
+        lay = next(L for L in layout if L["id"] == s3["id"])
+        check("p101: box.y0 phủ prefix (~483)", lay["box"][1] < 490)
+
+
 # ── determinism end-to-end (2 trang thật) ──────────────────────────────────
 def t_determinism():
     import hashlib

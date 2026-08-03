@@ -36,6 +36,7 @@ export const codexAdapter: AgentAdapter = {
   async *chat(params: ChatRunParams) {
     // Prompt as last argv (Codex `exec` reads it as the user message). Long
     // prompts can still hit OS argv limits; resume path keeps the short form.
+    const sandboxMode = params.readOnly ? "read-only" : "workspace-write";
     let cmd: string[];
     if (params.session) {
       cmd = [
@@ -46,7 +47,7 @@ export const codexAdapter: AgentAdapter = {
         "-c",
         "approval_policy=never",
         "-c",
-        "sandbox_mode=workspace-write",
+        `sandbox_mode=${sandboxMode}`,
         params.session,
         params.prompt,
       ];
@@ -59,7 +60,7 @@ export const codexAdapter: AgentAdapter = {
         "-C",
         params.cwd,
         "-s",
-        "workspace-write",
+        sandboxMode,
         "-c",
         "approval_policy=never",
       ];
@@ -88,6 +89,9 @@ export const codexAdapter: AgentAdapter = {
       "-C",
       params.cwd,
     ];
+    if (params.model) {
+      base.push("-c", `model=${params.model}`);
+    }
     if (params.posture === "bypass") {
       return [...base, "--dangerously-bypass-approvals-and-sandbox"];
     }
@@ -98,6 +102,14 @@ export const codexAdapter: AgentAdapter = {
       "-c",
       "approval_policy=never",
     ];
+  },
+
+  /**
+   * Codex has no stable machine-readable list-models subcommand here.
+   * Empty → UI uses CLI default + free-text (user may type -m ids).
+   */
+  async listModels(): Promise<string[]> {
+    return [];
   },
 
   cancel(runId: string) {

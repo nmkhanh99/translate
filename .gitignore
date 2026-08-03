@@ -52,3 +52,5 @@ output/*
 
 # === Sample/reference projects (không commit) ===
 open-design-main/
+# Local reader state
+tool/reading-progress.json

@@ -18,7 +18,7 @@
     "dist": "pnpm build && pnpm --filter @cfa-translate/desktop run dist",
     "daemon": "pnpm --filter @cfa-translate/daemon dev",
     "test": "pnpm --filter @cfa-translate/agent-adapters test",
-    "typecheck": "pnpm -r --filter @cfa-translate/* typecheck"
+    "typecheck": "pnpm -r --if-present typecheck"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

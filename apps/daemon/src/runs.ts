@@ -1,14 +1,16 @@
 import { mkdirSync, openSync, closeSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { getAdapter, ENGINE_IDS, type EngineId } from "@cfa-translate/agent-adapters";
 import type { AppConfig } from "@cfa-translate/shared";
+import { cliModelArg, normalizeModel } from "@cfa-translate/shared";
 import {
   buildMcpBatchPrompt,
   type RunOpts,
 } from "./prompts.js";
 import { PYTHON_DIR, REPO_ROOT, RUNNER_PATH, pythonBin } from "./paths.js";
+import { finishRepairRequest } from "./repair-requests.js";
 import {
   codexDone,
   effectiveStage,
@@ -22,6 +24,45 @@ import {
   type VolumeRec,
 } from "./volumes.js";
 
+/**
+ * Thứ tự engine thống nhất mọi entry point (run / redo / batch / chat nếu dùng):
+ *   body override → pref.json cuốn → config global → "claude"
+ * Pref/global không hợp lệ bị bỏ (không để getAdapter fail).
+ */
+export function resolveEngine(
+  override: string | undefined | null,
+  pref: string | undefined | null,
+  globalEngine: string | undefined | null
+): EngineId {
+  const pick = (v: string | undefined | null): EngineId | undefined =>
+    v && ENGINE_IDS.includes(v as EngineId) ? (v as EngineId) : undefined;
+  return pick(override) || pick(pref) || pick(globalEngine) || "claude";
+}
+
+/**
+ * Stage redo (translate/verify/vision) và stage=review ("Chạy để sửa") luôn đi
+ * pipeline-runner — Codex/Grok full-run dùng MCP batch (không có autoFixText).
+ * runOpts != null (kể cả {}) → runner. forceRunner=true khi stage=review.
+ */
+export function shouldUsePipelineRunner(
+  engine: EngineId,
+  runOpts?: RunOpts | null,
+  forceRunner = false
+): boolean {
+  if (forceRunner) return true;
+  if (runOpts != null) return true; // mọi stage redo / only=vision / review-fix
+  return engine === "claude";
+}
+
+/** stage=review → phải runner (autoFixText), mọi engine. */
+export function needsReviewFixRunner(workdir: string): boolean {
+  try {
+    return pythonStatus(workdir).stage === "review";
+  } catch {
+    return false;
+  }
+}
+
 export interface RunInfo {
   proc: ChildProcess | null;
   sid: string;
@@ -32,6 +73,61 @@ export interface RunInfo {
 
 const RUNS = new Map<string, RunInfo>();
 const starting = new Set<string>();
+
+const TRANSLATION_PROMPT_VERSION = "cfa-translate-v3";
+
+export interface ArtifactPrepareResult {
+  invalidation: "source" | "translation" | null;
+  removed: string[];
+  source_sha256: string;
+}
+
+/** Run the Python provenance gate before looking at resumable stage state. */
+export function prepareVolumeArtifacts(
+  vol: VolumeRec,
+  context?: {
+    target_language: string;
+    translator: EngineId;
+    model: string;
+    prompt_version: string;
+    profile?: string;
+  }
+): { ok: true; result: ArtifactPrepareResult } | { ok: false; error: string } {
+  const r = spawnSync(
+    pythonBin(),
+    [
+      join(PYTHON_DIR, "agent_pipeline.py"),
+      "prepare",
+      vol.pdf,
+      vol.workdir,
+      JSON.stringify(context ?? null),
+    ],
+    {
+      cwd: PYTHON_DIR,
+      encoding: "utf8",
+      timeout: 120_000,
+      maxBuffer: 4 * 1024 * 1024,
+    }
+  );
+  if (r.status !== 0) {
+    return {
+      ok: false,
+      error: (r.stderr || r.stdout || `prepare rc=${r.status}`).trim(),
+    };
+  }
+  const lines = String(r.stdout || "").trim().split("\n").reverse();
+  for (const line of lines) {
+    try {
+      const parsed = JSON.parse(line) as ArtifactPrepareResult;
+      if (typeof parsed.source_sha256 === "string") {
+        return { ok: true, result: parsed };
+      }
+    } catch {
+      /* skip non-JSON progress lines */
+    }
+  }
+  return { ok: false, error: "prepare không trả artifact manifest hợp lệ" };
+}
 
 // Watchdog "thoát non": CLI headless đôi khi gọi Workflow (chạy nền) rồi KẾT
 // THÚC LƯỢT ("đang chờ workflow...") -> process thoát rc=0, workflow bị giết
@@ -78,13 +174,12 @@ export function launchVolume(
   }
   starting.add(vol.tag);
 
-  // Ưu tiên: engine chỉ định lúc gọi > engine đã chọn riêng cho cuốn (pref.json)
-  // > engine global. Bỏ qua pref không hợp lệ (pref.json hỏng) thay vì để
-  // getAdapter fail. Cho phép mỗi tài liệu dịch bằng CLI khác nhau, song song.
-  const prefRaw = loadEnginePref(vol.workdir);
-  const pref =
-    prefRaw && ENGINE_IDS.includes(prefRaw as EngineId) ? prefRaw : undefined;
-  const engine = (engineOverride || pref || cfg.engine || "claude") as EngineId;
+  // Ưu tiên: override lúc gọi > pref cuốn > global (resolveEngine).
+  const engine = resolveEngine(
+    engineOverride,
+    loadEnginePref(vol.workdir),
+    cfg.engine
+  );
   const adapter = getAdapter(engine);
   if (!adapter) {
     starting.delete(vol.tag);
@@ -93,10 +188,50 @@ export function launchVolume(
 
   const sid = randomUUID();
   let cmd: string[];
-  if (engine === "claude") {
-    // Orchestration nằm ở RUNNER (node) — model chỉ dịch từng đơn vị việc qua
-    // `claude -p` ngắn, KHÔNG còn cảnh model gọi Workflow nền rồi kết thúc lượt
-    // làm workflow bị giết giữa chừng ("chạy 1 lúc lại bị dừng").
+  // Model snapped to selected engine — never pass Claude sonnet/opus to codex/grok.
+  const modelForEngine = normalizeModel(engine, cfg.model);
+  const modelCli = cliModelArg(engine, modelForEngine);
+
+  // Validate source provenance before trusting stage=review/done. Source-only
+  // prepare preserves the translation context until we know this run actually
+  // translates (verify/vision/fix may use another reviewing CLI).
+  const sourcePrepared = prepareVolumeArtifacts(vol);
+  if (!sourcePrepared.ok) {
+    starting.delete(vol.tag);
+    return { ok: false, error: `artifact preflight: ${sourcePrepared.error}` };
+  }
+
+  // "Chạy để sửa" (stage=review) gửi plain runVolume without runOpts — still
+  // must use pipeline-runner so autoFixText runs for codex/grok (MCP batch
+  // is translate-only and would skip the fix loop).
+  let effectiveOpts = runOpts;
+  const reviewFix = needsReviewFixRunner(vol.workdir);
+  if (reviewFix && (effectiveOpts == null)) {
+    effectiveOpts = {}; // truthy runOpts → shouldUsePipelineRunner
+  }
+
+  const translates =
+    !reviewFix &&
+    (effectiveOpts == null || effectiveOpts.redoStage === "translate");
+  let contextPrepared: ArtifactPrepareResult | null = null;
+  if (translates) {
+    const prepared = prepareVolumeArtifacts(vol, {
+      target_language: "vi",
+      translator: engine,
+      model: modelForEngine || "default",
+      prompt_version: TRANSLATION_PROMPT_VERSION,
+      profile: process.env.CFA_PDF_PROFILE || "native",
+    });
+    if (!prepared.ok) {
+      starting.delete(vol.tag);
+      return { ok: false, error: `translation cache preflight: ${prepared.error}` };
+    }
+    contextPrepared = prepared.result;
+  }
+
+  if (shouldUsePipelineRunner(engine, effectiveOpts, reviewFix)) {
+    // Orchestration ở RUNNER (node) — agent chỉ dịch/soát từng đơn vị (file I/O).
+    // engine truyền vào runner để unit call dùng đúng CLI (claude/codex/grok).
     cmd = [
       process.execPath,
       RUNNER_PATH,
@@ -106,11 +241,12 @@ export function launchVolume(
         out: vol.out,
         tool: PYTHON_DIR,
         python: pythonBin(),
-        model: cfg.model,
+        engine,
+        model: modelForEngine,
         posture: cfg.posture,
         vision: !!cfg.vision,
         concurrency: cfg.agents,
-        ...(runOpts || {}),
+        ...(effectiveOpts || {}),
       }),
     ];
   } else {
@@ -120,7 +256,7 @@ export function launchVolume(
       cwd: REPO_ROOT,
       workdir: vol.workdir,
       prompt,
-      model: cfg.model,
+      model: modelCli,
       posture: cfg.posture,
       sessionId: sid,
     });
@@ -130,7 +266,9 @@ export function launchVolume(
   const logPath = join(vol.workdir, "run.log");
   const header =
     `\n===== RUN ${new Date().toISOString()} engine=${engine} model=${cfg.model} ` +
-    `posture=${cfg.posture} vision=${cfg.vision} sid=${sid} =====\n`;
+    `posture=${cfg.posture} vision=${cfg.vision} sid=${sid} =====\n` +
+    `[artifacts] source=${sourcePrepared.result.source_sha256.slice(0, 12)} ` +
+    `invalidation=${contextPrepared?.invalidation || sourcePrepared.result.invalidation || "none"}\n`;
 
   let fd: number;
   try {
@@ -191,6 +329,14 @@ export function launchVolume(
       r.proc = null;
       r.mode = "exited";
     }
+    if (runOpts?.repairRequestId) {
+      finishRepairRequest(
+        vol.workdir,
+        runOpts.repairRequestId,
+        code === 0 ? "completed" : "failed",
+        code === 0 ? undefined : `tiến trình kết thúc với mã ${code ?? "unknown"}`
+      );
+    }
     maybeAutoResume(vol, cfg, engine, runOpts, code, logPath);
   });
 
@@ -219,6 +365,9 @@ export function launchVolume(
     if (r?.proc === proc) {
       r.proc = null;
       r.mode = "error";
+    }
+    if (runOpts?.repairRequestId) {
+      finishRepairRequest(vol.workdir, runOpts.repairRequestId, "failed", msg);
     }
   });
 

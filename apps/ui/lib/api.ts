@@ -7,6 +7,15 @@ import type {
   AgentDetection,
   AgentCapabilities,
   Engine,
+  BlockReport,
+  PreflightReport,
+  RepairRequest,
+  RepairRequestKind,
+  ReaderAnnotation,
+  ReaderAnnotationKind,
+  ReaderAnnotationRect,
+  ReaderAnnotationSide,
+  ReaderTextPage,
 } from "./types";
 
 export const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "";
@@ -42,6 +51,92 @@ export function getPageInfo(tag: string): Promise<PageInfo> {
   return req<PageInfo>("/api/pageinfo?tag=" + encodeURIComponent(tag));
 }
 
+export function saveReadingBookmark(
+  tag: string,
+  page: number
+): Promise<{ ok: boolean; tag: string; bookmark_page: number }> {
+  return post("/api/reading-bookmark", { tag, page });
+}
+
+export function getBlocks(tag: string, page0: number): Promise<BlockReport> {
+  return req<BlockReport>(
+    "/api/blocks?tag=" + encodeURIComponent(tag) + "&page=" + page0
+  );
+}
+
+export function getPageText(
+  tag: string,
+  page: number,
+  side: ReaderAnnotationSide
+): Promise<ReaderTextPage> {
+  return req<ReaderTextPage>(
+    "/api/page-text?tag=" + encodeURIComponent(tag) +
+      "&page=" + page +
+      "&side=" + encodeURIComponent(side)
+  );
+}
+
+export type ReaderTranslationLanguage = "en" | "vi";
+
+export interface ReaderSelectionTranslationResponse {
+  translation: string;
+  detected_language: string | null;
+  target_language: ReaderTranslationLanguage;
+}
+
+export function translateReaderSelection(
+  text: string,
+  target: ReaderTranslationLanguage,
+  signal?: AbortSignal
+): Promise<ReaderSelectionTranslationResponse> {
+  return req("/api/translate-selection", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, target }),
+    signal,
+  });
+}
+
+export function getReaderAnnotations(
+  tag: string,
+  page: number
+): Promise<{ annotations: ReaderAnnotation[] }> {
+  return req(
+    "/api/reader-annotations?tag=" + encodeURIComponent(tag) + "&page=" + page
+  );
+}
+
+export function createReaderAnnotation(body: {
+  tag: string;
+  page: number;
+  side: ReaderAnnotationSide;
+  kind: ReaderAnnotationKind;
+  text: string;
+  note?: string;
+  rects: ReaderAnnotationRect[];
+}): Promise<{ ok: true; annotation: ReaderAnnotation }> {
+  return post("/api/reader-annotations", body);
+}
+
+export function deleteReaderAnnotation(
+  tag: string,
+  id: string
+): Promise<{ ok: boolean }> {
+  return post("/api/reader-annotations/delete", { tag, id });
+}
+
+export function getPreflight(tag: string): Promise<PreflightReport> {
+  return req<PreflightReport>("/api/preflight?tag=" + encodeURIComponent(tag));
+}
+
+export function updateBlock(
+  tag: string,
+  id: string,
+  translation: string
+): Promise<{ ok: boolean; block: import("./types").DocumentBlock }> {
+  return post("/api/blocks/update", { tag, id, translation });
+}
+
 export function getLog(tag: string): Promise<{ tag: string; lines: string[] }> {
   return req("/api/log?tag=" + encodeURIComponent(tag));
 }
@@ -58,6 +153,25 @@ export function getDefectReport(
   tag: string
 ): Promise<{ defect_pages: number; clusters: DefectCluster[] }> {
   return req("/api/defects?tag=" + encodeURIComponent(tag));
+}
+
+export function getRepairRequests(
+  tag: string
+): Promise<{ requests: RepairRequest[] }> {
+  return req("/api/repair-requests?tag=" + encodeURIComponent(tag));
+}
+
+export function submitRepairRequest(
+  tag: string,
+  page: number,
+  kind: RepairRequestKind,
+  note: string,
+  engine: string
+): Promise<{ ok: true; sid: string; engine: string; request: RepairRequest }> {
+  if (!engine || !engine.trim()) {
+    return Promise.reject(new Error("engine bắt buộc khi xử lý lại"));
+  }
+  return post("/api/repair-request", { tag, page, kind, note, engine: engine.trim() });
 }
 
 // ---- Per-document chat conversations (SQLite-persisted on the daemon) ----
@@ -119,11 +233,20 @@ export function post<T = unknown>(path: string, body?: unknown): Promise<T> {
   });
 }
 
+/**
+ * Start (or resume) a volume pipeline.
+ * `engine` is required so the body always matches the engine the UI shows —
+ * server resolveEngine is override → pref → global; omitting override lets a
+ * stale volume pref silently disagree with the EngineSwitch on Library/Translate.
+ */
 export function runVolume(
   tag: string,
-  engine?: string
+  engine: string
 ): Promise<{ ok: boolean; sid?: string; engine?: string }> {
-  return post("/api/run", engine ? { tag, engine } : { tag });
+  if (!engine || !String(engine).trim()) {
+    return Promise.reject(new Error("engine bắt buộc khi chạy volume"));
+  }
+  return post("/api/run", { tag, engine: String(engine).trim() });
 }
 /** Chọn engine riêng cho 1 cuốn mà không chạy ngay. */
 export function setVolEngine(tag: string, engine: string): Promise<{ ok: boolean }> {
@@ -154,12 +277,26 @@ export function stopVolume(tag: string) {
 export function saveConfig(cfg: Partial<AppConfig>) {
   return post("/api/config", cfg);
 }
-export function uploadPdf(file: File) {
-  return fetch(API_BASE + "/api/upload?name=" + encodeURIComponent(file.name), {
+export interface UploadPdfResult {
+  ok: true;
+  name: string;
+  stored_name: string;
+  document_id: string;
+  tag: string;
+}
+
+export async function uploadPdf(file: File): Promise<UploadPdfResult> {
+  const r = await fetch(API_BASE + "/api/upload?name=" + encodeURIComponent(file.name), {
     method: "POST",
     headers: { "Content-Type": "application/pdf" },
     body: file,
   });
+  const data = (await r.json().catch(() => null)) as
+    | UploadPdfResult
+    | { error?: string }
+    | null;
+  if (!r.ok) throw new Error(data && "error" in data && data.error ? data.error : `HTTP ${r.status}`);
+  return data as UploadPdfResult;
 }
 
 export function pageImg(tag: string, which: "source" | "out", page0: number, dpi = 150) {
@@ -193,15 +330,18 @@ export function volClass(
 
 export function volPct(v: Volume): number {
   if (v.stage === "done") return 100;
-  let d = 0,
-    tot = 0;
-  [v.translate, v.verify, v.vision].forEach((a) => {
-    if (a && a[1]) {
-      d += a[0] || 0;
-      tot += a[1];
-    }
-  });
-  return tot ? Math.round((100 * d) / tot) : 0;
+  // Prefer sequential overall from daemon (honest under re-chunk / stale later stages).
+  if (typeof v.overall_pct === "number" && Number.isFinite(v.overall_pct)) {
+    return Math.max(0, Math.min(100, Math.round(v.overall_pct)));
+  }
+  // Fallback: sequential weights matching python _overall_pct / daemon overallPct.
+  const frac = (a?: [number, number]) =>
+    a && a[1] ? Math.max(0, Math.min(1, (a[0] || 0) / a[1])) : 0;
+  if (v.stage === "translate") return Math.round(40 * frac(v.translate));
+  if (v.stage === "verify") return Math.round(40 + 30 * frac(v.verify));
+  if (v.stage === "vision") return Math.round(70 + 25 * frac(v.vision));
+  if (v.stage === "review") return 95;
+  return 0;
 }
 
 export function pagesLabel(v: Volume): string {

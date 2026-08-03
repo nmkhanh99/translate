@@ -10,7 +10,7 @@ import {
 import { basename, extname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import type { AppConfig, Volume } from "@cfa-translate/shared";
+import type { AppConfig, ReaderTextSpan, Volume } from "@cfa-translate/shared";
 import {
   INPUT_DIR,
   MANIFEST,
@@ -38,26 +38,77 @@ function prettyName(pdfPath: string): string {
   return base.replace("2024 CFA level I ", "").replace("2024 ", "");
 }
 
+interface UserDocumentMeta {
+  version: 1;
+  document_id: string;
+  source_sha256: string;
+  original_name: string;
+  stored_name: string;
+}
+
+function userSlug(name: string): string {
+  return (
+    basename(name, extname(name))
+      .normalize("NFC")
+      .replace(/[^A-Za-z0-9]+/g, "_")
+      .replace(/^_|_$/g, "")
+      .toLowerCase()
+      .slice(0, 40) || "doc"
+  );
+}
+
+/** Stable UI/workdir tag: readable stem + filename discriminator + content id. */
+export function userDocumentTag(originalName: string, documentId: string): string {
+  const nameId = createHash("sha256")
+    .update(basename(originalName).normalize("NFC"))
+    .digest("hex")
+    .slice(0, 6);
+  return `user_${userSlug(originalName)}_${nameId}_${documentId.slice(0, 12)}`;
+}
+
+function readUserDocumentMeta(pdfPath: string): UserDocumentMeta | null {
+  const raw = readJson(pdfPath + ".cfa.json") as Partial<UserDocumentMeta> | null;
+  if (
+    raw?.version !== 1 ||
+    typeof raw.document_id !== "string" ||
+    !/^[a-f0-9]{64}$/i.test(raw.document_id) ||
+    typeof raw.source_sha256 !== "string" ||
+    raw.source_sha256 !== raw.document_id ||
+    typeof raw.original_name !== "string" ||
+    basename(raw.original_name) !== raw.original_name ||
+    typeof raw.stored_name !== "string" ||
+    basename(pdfPath) !== raw.stored_name
+  ) {
+    return null;
+  }
+  return raw as UserDocumentMeta;
+}
+
 function discoverUserVolumes(): VolumeRec[] {
   if (!existsSync(INPUT_DIR)) return [];
   return readdirSync(INPUT_DIR)
     .filter((fn) => fn.toLowerCase().endsWith(".pdf"))
     .sort()
     .map((fn) => {
-      const name = basename(fn, ".pdf");
-      const slug =
-        name
-          .replace(/[^A-Za-z0-9]+/g, "_")
-          .replace(/^_|_$/g, "")
-          .toLowerCase()
-          .slice(0, 40) || "doc";
+      const pdf = join(INPUT_DIR, fn);
+      const meta = readUserDocumentMeta(pdf);
+      const originalName = meta?.original_name || fn;
+      const name = basename(originalName, extname(originalName));
+      // Legacy files retain their old tag/workdir. New uploads are immutable
+      // content-addressed records and cannot collide on slug alone.
+      const tag = meta
+        ? userDocumentTag(originalName, meta.document_id)
+        : "user_" + userSlug(fn);
       return {
-        pdf: join(INPUT_DIR, fn),
-        workdir: join(USER_WORK, "user_" + slug),
-        out: join(OUTPUT_DIR, name + "_vi.pdf"),
+        pdf,
+        workdir: join(USER_WORK, tag),
+        out: join(
+          OUTPUT_DIR,
+          meta ? `${name}.${meta.document_id.slice(0, 12)}_vi.pdf` : name + "_vi.pdf"
+        ),
         user: true,
-        tag: "user_" + slug,
-        display: prettyName(fn),
+        tag,
+        display: prettyName(originalName),
       };
     });
 }
@@ -130,6 +181,21 @@ export function resetStage(
     rm(join(workdir, "vout"));
     mkdirSync(join(workdir, "vout"), { recursive: true });
     rm(join(workdir, "vid2en.json"));
+    // Vision chấm trên PDF/segmentation cũ — invalidate giống chunk --force.
+    rm(join(workdir, "vis"));
+    mkdirSync(join(workdir, "vis"), { recursive: true });
+    rm(join(workdir, "review_issues.json"));
+    rm(join(workdir, "vis_todo.json"));
+    // Clear later-stage gens in workset; keep chunk_gen if present.
+    try {
+      const wsPath = join(workdir, "workset.json");
+      const ws = (readJson(wsPath) || {}) as Record<string, unknown>;
+      delete ws.vchunk_gen;
+      delete ws.vision_gen;
+      writeFileSync(wsPath, JSON.stringify(ws, null, 1));
+    } catch {
+      /* ignore */
+    }
   } else if (stage === "verify") {
     // Xoá cả vchunks/vid2en: vchunk chứa snapshot {en, vi} tại thời điểm tạo —
     // giữ lại thì lần verify sau đối chiếu bản vi CŨ thay vì text2vi hiện tại.
@@ -137,6 +203,15 @@ export function resetStage(
     rm(join(workdir, "vout"));
     mkdirSync(join(workdir, "vout"), { recursive: true });
     rm(join(workdir, "vid2en.json"));
+    try {
+      const wsPath = join(workdir, "workset.json");
+      const ws = (readJson(wsPath) || {}) as Record<string, unknown>;
+      delete ws.vchunk_gen;
+      delete ws.vision_gen;
+      writeFileSync(wsPath, JSON.stringify(ws, null, 1));
+    } catch {
+      /* ignore */
+    }
   } else if (stage === "vision") {
     if (pages && pages.length) {
       for (const p of pages) {
@@ -210,6 +285,183 @@ function countFiles(dir: string, re: RegExp): number {
   }
 }
 
+function listIndices(dir: string, re: RegExp): string[] {
+  if (!existsSync(dir)) return [];
+  try {
+    return readdirSync(dir)
+      .filter((f) => re.test(f))
+      .map((f) => {
+        const m = f.match(/_(\d+)\.json$/i);
+        return m ? m[1] : "";
+      })
+      .filter(Boolean)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+function loadJsonFile(path: string): unknown | null {
+  try {
+    if (!existsSync(path)) return null;
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/** Mirror python _is_valid_out: dict covering all chunk ids with non-empty vi. */
+function isValidOut(workdir: string, idx: string): boolean {
+  const items = loadJsonFile(join(workdir, "chunks", `c_${idx}.json`));
+  const d = loadJsonFile(join(workdir, "out", `c_${idx}.json`));
+  if (!Array.isArray(items) || !d || typeof d !== "object" || Array.isArray(d))
+    return false;
+  const map = d as Record<string, unknown>;
+  if (items.length === 0) return true;
+  for (const it of items) {
+    if (!it || typeof it !== "object") continue;
+    const cid = (it as { id?: string }).id;
+    if (!cid) continue;
+    const vi = map[cid];
+    if (vi == null || !String(vi).trim()) return false;
+  }
+  return true;
+}
+
+/** Mirror python _is_valid_vout: dict JSON (empty OK) matching vchunk. */
+function isValidVout(workdir: string, idx: string): boolean {
+  const items = loadJsonFile(join(workdir, "vchunks", `v_${idx}.json`));
+  const d = loadJsonFile(join(workdir, "vout", `v_${idx}.json`));
+  return Array.isArray(items) && !!d && typeof d === "object" && !Array.isArray(d);
+}
+
+/** Mirror python _is_valid_vis: list (empty = clean page, still reviewed). */
+function isValidVis(workdir: string, page: number): boolean {
+  const d = loadJsonFile(
+    join(workdir, "vis", `page_${String(page).padStart(3, "0")}.json`)
+  );
+  return Array.isArray(d);
+}
+
+function countValidOut(workdir: string): [number, number] {
+  const idxs = listIndices(join(workdir, "chunks"), /^c_\d+\.json$/i);
+  return [idxs.filter((i) => isValidOut(workdir, i)).length, idxs.length];
+}
+
+function countValidVout(workdir: string): [number, number] {
+  const idxs = listIndices(join(workdir, "vchunks"), /^v_\d+\.json$/i);
+  return [idxs.filter((i) => isValidVout(workdir, i)).length, idxs.length];
+}
+
+function countValidVis(workdir: string, pages: number | null): [number, number] {
+  if (pages == null || pages <= 0) return [0, 0];
+  let done = 0;
+  for (let i = 0; i < pages; i++) if (isValidVis(workdir, i)) done++;
+  return [done, pages];
+}
+
+function maxMtime(paths: string[]): number {
+  let mt = 0;
+  for (const p of paths) {
+    try {
+      mt = Math.max(mt, statSync(p).mtimeMs);
+    } catch {
+      /* skip */
+    }
+  }
+  return mt;
+}
+
+function listPaths(dir: string, re: RegExp): string[] {
+  if (!existsSync(dir)) return [];
+  try {
+    return readdirSync(dir)
+      .filter((f) => re.test(f))
+      .map((f) => join(dir, f));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Mirror python _chunk_gen — fingerprint of chunks/c_*.json content.
+ * Used with workset.json generation gate so stale vout/vis after re-chunk
+ * never count as complete once outs are refilled.
+ */
+function chunkGen(workdir: string): string {
+  const files = listPaths(join(workdir, "chunks"), /^c_\d+\.json$/i).sort();
+  if (!files.length) return "";
+  const h = createHash("md5");
+  for (const f of files) {
+    h.update(f.split(/[/\\]/).pop() || f);
+    try {
+      h.update(readFileSync(f));
+    } catch {
+      h.update("?");
+    }
+  }
+  return h.digest("hex");
+}
+
+/** Mirror python _verify_matches_chunks */
+function verifyMatchesChunks(workdir: string): boolean {
+  const cg = chunkGen(workdir);
+  if (!cg) return false;
+  const ws = (readJson(join(workdir, "workset.json")) || {}) as Record<
+    string,
+    unknown
+  >;
+  // Explicit key (even empty after force) → must equal chunk_gen; no mtime fallthrough.
+  if (Object.prototype.hasOwnProperty.call(ws, "vchunk_gen")) {
+    const vg = String(ws.vchunk_gen || "");
+    return !!vg && vg === cg;
+  }
+  const vfiles = listPaths(join(workdir, "vchunks"), /^v_\d+\.json$/i);
+  const cfiles = listPaths(join(workdir, "chunks"), /^c_\d+\.json$/i);
+  if (!vfiles.length || !cfiles.length) return false;
+  return maxMtime(vfiles) >= maxMtime(cfiles);
+}
+
+/** Mirror python _vision_matches_chunks */
+function visionMatchesChunks(workdir: string): boolean {
+  const cg = chunkGen(workdir);
+  if (!cg) return false;
+  const ws = (readJson(join(workdir, "workset.json")) || {}) as Record<
+    string,
+    unknown
+  >;
+  if (Object.prototype.hasOwnProperty.call(ws, "vision_gen")) {
+    const vg = String(ws.vision_gen || "");
+    return !!vg && vg === cg;
+  }
+  const ri = join(workdir, "review_issues.json");
+  if (!existsSync(ri)) return false;
+  const vfiles = listPaths(join(workdir, "vis"), /^page_\d+\.json$/i);
+  const cfiles = listPaths(join(workdir, "chunks"), /^c_\d+\.json$/i);
+  if (!vfiles.length || !cfiles.length) return false;
+  const cmt = maxMtime(cfiles);
+  return maxMtime(vfiles) >= cmt && maxMtime([ri]) >= cmt;
+}
+
+/** Sequential overall % — mirror python _overall_pct. */
+export function overallPct(
+  stage: string,
+  translate: [number, number],
+  verify: [number, number],
+  vision: [number, number]
+): number {
+  if (stage === "done") return 100;
+  const frac = (pair: [number, number]) => {
+    if (!pair[1]) return 0;
+    return Math.max(0, Math.min(1, pair[0] / pair[1]));
+  };
+  if (stage === "translate") return Math.round(40 * frac(translate));
+  if (stage === "verify") return Math.round(40 + 30 * frac(verify));
+  if (stage === "vision") return Math.round(70 + 25 * frac(vision));
+  if (stage === "review") return 95;
+  return 0;
+}
+
 const SEV_RANK: Record<string, number> = { high: 3, medium: 2, low: 1 };
 
 /**
@@ -238,6 +490,7 @@ export function defectPages(workdir: string, minSev = "medium"): number[] {
 /**
  * Mirror python agent_pipeline._status — pure filesystem, no Python spawn
  * (fast enough for 3s UI poll of many volumes).
+ * Counts only VALID checkpoints; gates later-stage done when earlier incomplete.
  */
 export function pythonStatus(workdir: string): {
   stage: string;
@@ -245,19 +498,13 @@ export function pythonStatus(workdir: string): {
   verify?: [number, number];
   vision?: [number, number];
   defects?: number;
+  overall_pct?: number;
 } {
-  const c = countFiles(join(workdir, "chunks"), /^c_.*\.json$/i);
-  const co = countFiles(join(workdir, "out"), /^c_.*\.json$/i);
-  const v = countFiles(join(workdir, "vchunks"), /^v_.*\.json$/i);
-  const vo = countFiles(join(workdir, "vout"), /^v_.*\.json$/i);
+  const [co, c] = countValidOut(workdir);
   const pairs = countFiles(join(workdir, "review"), /^pair_.*\.png$/i);
-  const vis = countFiles(join(workdir, "vis"), /^page_.*\.json$/i);
 
-  // Total page count. state.json (written by python cmd_status) is the
-  // authoritative source and is preferred FIRST — layout.json stores a pdf path
-  // relative to the python cwd, so existsSync() on it fails from the daemon and
-  // must not gate the page count. `pairs` is a last resort and can overcount
-  // when stale re-render PNGs linger (would wrongly keep a volume in 'vision').
+  // Total page count. state.json (written by python cmd_status) is preferred —
+  // layout.json pdf path is relative to python cwd and often fails existsSync.
   let pages: number | null = null;
   const cached = readJson(join(workdir, "state.json"));
   if (cached?.vision && Array.isArray(cached.vision) && cached.vision[1]) {
@@ -265,25 +512,87 @@ export function pythonStatus(workdir: string): {
   }
   if (pages == null && pairs > 0) pages = pairs;
 
-  const defects = defectPages(workdir).length;
-  // 'done' chỉ khi review_issues.json đã ghi (merge-vis xong) — thiếu nghĩa là
-  // vision chưa chốt, tránh 'done' giả (mirror python _status).
-  const hasReview = existsSync(join(workdir, "review_issues.json"));
+  const trDone = c > 0 && co >= c;
+  const verifyOk = verifyMatchesChunks(workdir);
+  const visionOk = visionMatchesChunks(workdir);
+  const vTotal = verifyOk
+    ? listIndices(join(workdir, "vchunks"), /^v_\d+\.json$/i).length
+    : 0;
+
+  // Generation gate: after force-rechunk, stale vout/vis must not count even
+  // when outs are fully refilled (criterion 2 / skeptic residual).
+  if (!trDone) {
+    const defects = defectPages(workdir).length;
+    const tr: [number, number] = [co, c];
+    const vr: [number, number] = [0, vTotal];
+    const vis: [number, number] = [0, pages ?? 0];
+    return {
+      stage: "translate",
+      translate: tr,
+      verify: vr,
+      vision: vis,
+      defects,
+      overall_pct: overallPct("translate", tr, vr, vis),
+    };
+  }
+
+  if (!verifyOk) {
+    const defects = defectPages(workdir).length;
+    const tr: [number, number] = [co, c];
+    const vr: [number, number] = [0, 0];
+    const vis: [number, number] = [0, pages ?? 0];
+    return {
+      stage: "verify",
+      translate: tr,
+      verify: vr,
+      vision: vis,
+      defects,
+      overall_pct: overallPct("verify", tr, vr, vis),
+    };
+  }
+
+  const [vo, v] = countValidVout(workdir);
+  const vrDone = v > 0 && vo >= v;
+  if (!vrDone) {
+    const defects = defectPages(workdir).length;
+    const tr: [number, number] = [co, c];
+    const vr: [number, number] = [vo, v];
+    const vis: [number, number] = [0, pages ?? 0];
+    return {
+      stage: "verify",
+      translate: tr,
+      verify: vr,
+      vision: vis,
+      defects,
+      overall_pct: overallPct("verify", tr, vr, vis),
+    };
+  }
+
+  let visRaw = 0;
+  let hasReview = false;
+  let defects = 0;
+  if (visionOk) {
+    [visRaw] = countValidVis(workdir, pages);
+    hasReview = existsSync(join(workdir, "review_issues.json"));
+    defects = defectPages(workdir).length;
+  }
+
   let stage: string;
-  if (c === 0 || co < c) stage = "translate";
-  else if (vo < v || v === 0) stage = "verify";
-  else if (pages != null && (vis < pages || !hasReview)) stage = "vision";
-  else if (c > 0 && co >= c && (v === 0 || vo >= v) && (pages == null || vis >= pages))
-    // Đã review xong mọi trang: 'review' nếu còn defect chưa fix, ngược lại 'done'.
-    stage = defects > 0 ? "review" : "done";
-  else stage = "vision";
+  if (pages != null && (visRaw < pages || !hasReview)) stage = "vision";
+  else if (defects > 0) stage = "review";
+  else stage = "done";
+
+  const tr: [number, number] = [co, c];
+  const vr: [number, number] = [vo, v];
+  const vis: [number, number] = [visRaw, pages ?? 0];
 
   return {
     stage,
-    translate: [co, c],
-    verify: [vo, v],
-    vision: [vis, pages ?? 0],
+    translate: tr,
+    verify: vr,
+    vision: vis,
     defects,
+    overall_pct: overallPct(stage, tr, vr, vis),
   };
 }
 
@@ -312,6 +621,82 @@ except Exception:
   return parseInt((r.stdout || "0").trim(), 10) || 0;
 }
 
+export function extractPageText(
+  path: string,
+  page: number
+): { page_size: [number, number]; spans: ReaderTextSpan[] } | null {
+  if (!existsSync(path) || !Number.isSafeInteger(page) || page < 0) return null;
+  const script = `
+import json, math, sys, fitz
+doc = fitz.open(sys.argv[1])
+page_no = int(sys.argv[2])
+if not (0 <= page_no < doc.page_count):
+  sys.exit(2)
+page = doc[page_no]
+data = page.get_text("dict", sort=True)
+spans = []
+for block in data.get("blocks", []):
+  if block.get("type") != 0:
+    continue
+  for line in block.get("lines", []):
+    for span in line.get("spans", []):
+      text = span.get("text", "")
+      box = span.get("bbox", [])
+      size = span.get("size", 0)
+      if not text.strip() or len(box) != 4:
+        continue
+      values = [float(v) for v in box]
+      if not all(math.isfinite(v) for v in values) or not math.isfinite(float(size)):
+        continue
+      flags = int(span.get("flags", 0))
+      spans.append({
+        "id": "t" + str(len(spans)),
+        "text": text,
+        "box": values,
+        "font_size": float(size),
+        "bold": bool(flags & 16),
+        "italic": bool(flags & 2),
+      })
+print(json.dumps({
+  "page_size": [float(page.rect.width), float(page.rect.height)],
+  "spans": spans,
+}, ensure_ascii=False))
+`;
+  const result = spawnSync(pythonBin(), ["-c", script, path, String(page)], {
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+    timeout: 15_000,
+  });
+  if (result.status !== 0 || !result.stdout) return null;
+  try {
+    const parsed = JSON.parse(result.stdout) as {
+      page_size?: unknown;
+      spans?: unknown;
+    };
+    if (
+      !Array.isArray(parsed.page_size) || parsed.page_size.length !== 2 ||
+      !parsed.page_size.every((value) => typeof value === "number" && Number.isFinite(value) && value > 0) ||
+      !Array.isArray(parsed.spans)
+    ) {
+      return null;
+    }
+    const spans = parsed.spans.filter((value): value is ReaderTextSpan => {
+      if (!value || typeof value !== "object") return false;
+      const span = value as Partial<ReaderTextSpan>;
+      return typeof span.id === "string" && typeof span.text === "string" &&
+        typeof span.font_size === "number" && Number.isFinite(span.font_size) &&
+        Array.isArray(span.box) && span.box.length === 4 &&
+        span.box.every((part) => typeof part === "number" && Number.isFinite(part));
+    });
+    return {
+      page_size: [parsed.page_size[0] as number, parsed.page_size[1] as number],
+      spans,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function renderPagePng(
   path: string,
   page: number,
@@ -326,7 +711,7 @@ export function renderPagePng(
   try {
     const mtime = Math.floor(statSync(path).mtimeMs);
     const key = createHash("sha1")
-      .update(`${path}|${mtime}|${page}|${dpi}`)
+      .update(`raster-v2|${path}|${mtime}|${page}|${dpi}`)
       .digest("hex");
     const dir = join(TOOL_DIR, "pagecache");
     cacheFile = join(dir, key + ".png");
@@ -342,7 +727,13 @@ doc=fitz.open(sys.argv[1])
 page=int(sys.argv[2]); dpi=int(sys.argv[3])
 if not (0<=page<doc.page_count):
   sys.exit(2)
-sys.stdout.buffer.write(doc[page].get_pixmap(dpi=dpi).tobytes("png"))
+p=doc[page]
+scale=dpi/72
+max_pixels=12000000
+requested=max(1, int(p.rect.width*scale+0.999)) * max(1, int(p.rect.height*scale+0.999))
+if requested > max_pixels:
+  scale *= (max_pixels/requested) ** 0.5
+sys.stdout.buffer.write(p.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False).tobytes("png"))
 `;
   const r = spawnSync(pythonBin(), ["-c", script, path, String(page), String(dpi)], {
     encoding: "buffer",
@@ -388,6 +779,7 @@ export function volumeToApi(
     translate: st.translate,
     verify: st.verify,
     vision: st.vision,
+    overall_pct: st.overall_pct,
     out_exists: existsSync(vol.out),
     engine: typeof meta.engine === "string" ? meta.engine : undefined,
     logpath: join(vol.workdir, "run.log"),

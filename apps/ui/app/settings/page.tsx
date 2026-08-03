@@ -2,32 +2,92 @@
 import * as React from "react";
 import { getStatus, getAgents, saveConfig } from "../../lib/api";
 import { useToast } from "../../components/Providers";
-import type { AppConfig, AgentDetection } from "../../lib/types";
+import type { AppConfig, AgentDetection, Engine } from "../../lib/types";
+import {
+  normalizeModel,
+  fieldVisibleForEngine,
+  defaultModel,
+  isCliDefault,
+  modelOptionsForEngine,
+  CLI_DEFAULT_MODEL,
+  type ModelOption,
+} from "@cfa-translate/shared";
 
 export default function Settings() {
   const toast = useToast();
   const [cfg, setCfg] = React.useState<AppConfig | null>(null);
   const [agents, setAgents] = React.useState<AgentDetection[]>([]);
+  /** Discovered model ids per engine from /api/status (runtime CLI, not git). */
+  const [discovered, setDiscovered] = React.useState<
+    Partial<Record<Engine, string[]>>
+  >({});
+  const [modelMode, setModelMode] = React.useState<"default" | "pick" | "custom">(
+    "default"
+  );
 
   React.useEffect(() => {
     Promise.all([getStatus(), getAgents()])
       .then(([s, a]) => {
-        setCfg(s.config || {});
+        const raw = s.config || {};
+        const engine = (raw.engine as Engine) || "claude";
+        const model = normalizeModel(engine, raw.model);
+        setCfg({ ...raw, engine, model });
         setAgents(a.agents || []);
+        const byEng =
+          (s as { models_discovered?: Partial<Record<Engine, string[]>> })
+            .models_discovered || {};
+        // Prefer discovered ids; also merge labels from models_by_engine if present
+        const fromApi = (s as { models_by_engine?: Partial<Record<Engine, ModelOption[]>> })
+          .models_by_engine;
+        const d: Partial<Record<Engine, string[]>> = { ...byEng };
+        if (fromApi) {
+          for (const e of ["claude", "codex", "grok"] as Engine[]) {
+            const ids = (fromApi[e] || [])
+              .map((m) => m.id)
+              .filter((id) => id && id !== CLI_DEFAULT_MODEL);
+            if (ids.length) d[e] = ids;
+          }
+        }
+        setDiscovered(d);
+        const disc = d[engine] || [];
+        if (isCliDefault(model)) setModelMode("default");
+        else if (disc.includes(model)) setModelMode("pick");
+        else setModelMode("custom");
       })
       .catch((e) => toast("Lỗi tải cài đặt: " + e.message));
   }, [toast]);
 
-  function set<K extends keyof AppConfig>(k: K, v: AppConfig[K]) {
-    setCfg((c) => ({ ...(c || {}), [k]: v }));
+  function setEngine(engine: string) {
+    // Match UI "Mặc định CLI": always reset model to CLI default on engine
+    // switch — do NOT keep previous engine's id (e.g. grok-4.5 under claude).
+    setCfg((c) => ({
+      ...(c || {}),
+      engine,
+      model: CLI_DEFAULT_MODEL,
+    }));
+    setModelMode("default");
+  }
+
+  function setModelFromUi(mode: "default" | "pick" | "custom", value?: string) {
+    setModelMode(mode);
+    setCfg((c) => {
+      const engine = (c?.engine as Engine) || "claude";
+      let model = CLI_DEFAULT_MODEL;
+      if (mode === "pick" && value) model = value;
+      if (mode === "custom" && value != null) model = value.trim() || CLI_DEFAULT_MODEL;
+      if (mode === "default") model = CLI_DEFAULT_MODEL;
+      return { ...(c || {}), model: normalizeModel(engine, model) };
+    });
   }
 
   async function save() {
     if (!cfg) return;
+    const engine = (cfg.engine as Engine) || "claude";
+    const model = normalizeModel(engine, cfg.model);
     try {
       await saveConfig({
-        engine: cfg.engine || "claude",
-        model: cfg.model || "sonnet",
+        engine,
+        model,
         budget: cfg.budget ?? 100,
         budget_warn: cfg.budget_warn ?? 90,
         posture: cfg.posture || "allowlist",
@@ -35,6 +95,7 @@ export default function Settings() {
         codex_batch: cfg.codex_batch ?? 25,
         agents: cfg.agents ?? 3,
       });
+      setCfg((c) => ({ ...(c || {}), engine, model }));
       toast("Đã lưu cài đặt");
     } catch (e) {
       toast("Lỗi lưu: " + (e as Error).message);
@@ -43,15 +104,28 @@ export default function Settings() {
 
   async function rescan() {
     try {
-      const a = await getAgents();
+      const [a, s] = await Promise.all([getAgents(), getStatus()]);
       setAgents(a.agents || []);
-      toast("Đã quét lại CLI trên máy");
+      const byEng =
+        (s as { models_discovered?: Partial<Record<Engine, string[]>> })
+          .models_discovered || {};
+      setDiscovered(byEng);
+      toast("Đã quét lại CLI + model trên máy");
     } catch (e) {
       toast("Lỗi quét: " + (e as Error).message);
     }
   }
 
   if (!cfg) return <div className="page">Đang tải…</div>;
+
+  const engine = (cfg.engine as Engine) || "claude";
+  const modelVal = normalizeModel(engine, cfg.model);
+  const modelOpts = modelOptionsForEngine(engine, discovered[engine] || []);
+  const discoveredOpts = modelOpts.filter((m) => m.id !== CLI_DEFAULT_MODEL);
+  const showCodexBatch = fieldVisibleForEngine("codex_batch", engine);
+  const showAgents = fieldVisibleForEngine("agents", engine);
+  const engineLabel =
+    engine === "claude" ? "Claude" : engine === "codex" ? "Codex" : "Grok";
 
   return (
     <>
@@ -105,8 +179,8 @@ export default function Settings() {
           </div>
           <p className="hint">
             Cài <code>claude</code> / <code>codex</code> / <code>grok</code> rồi
-            bấm <b>Quét lại CLI</b>. Dò theo PATH — CLI cài qua nvm/volta/bun vẫn
-            nhận.
+            bấm <b>Quét lại CLI</b>. Model list lấy từ CLI lúc quét — không hard-code
+            trong app.
           </p>
         </section>
 
@@ -114,75 +188,126 @@ export default function Settings() {
           <h2>Engine dịch</h2>
           <div className="grid-2">
             <div className="field">
-              <label>Engine</label>
+              <label>Engine (CLI)</label>
               <select
                 className="input"
-                value={cfg.engine || "claude"}
-                onChange={(e) => set("engine", e.target.value)}
+                value={engine}
+                onChange={(e) => setEngine(e.target.value)}
               >
-                <option value="claude">Claude — Workflow 4-phase</option>
+                <option value="claude">Claude — pipeline runner</option>
                 <option value="codex">Codex — MCP theo lô trang</option>
                 <option value="grok">Grok — MCP + always-approve</option>
               </select>
             </div>
             <div className="field">
-              <label>Model (Claude)</label>
+              <label>Model ({engineLabel})</label>
               <select
                 className="input"
-                value={/opus/i.test(cfg.model || "") ? "opus" : "sonnet"}
-                onChange={(e) => set("model", e.target.value)}
+                value={
+                  modelMode === "default"
+                    ? CLI_DEFAULT_MODEL
+                    : modelMode === "custom"
+                      ? "__custom__"
+                      : modelVal
+                }
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === CLI_DEFAULT_MODEL) setModelFromUi("default");
+                  else if (v === "__custom__")
+                    setModelFromUi(
+                      "custom",
+                      isCliDefault(modelVal) ? "" : modelVal
+                    );
+                  else setModelFromUi("pick", v);
+                }}
               >
-                <option value="sonnet">Sonnet — cân bằng</option>
-                <option value="opus">Opus — chất lượng cao</option>
+                <option value={CLI_DEFAULT_MODEL}>
+                  Mặc định CLI (để {engineLabel} tự chọn)
+                </option>
+                {discoveredOpts.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label}
+                    {m.discovered ? " · từ CLI" : ""}
+                  </option>
+                ))}
+                <option value="__custom__">Nhập tay (id model)…</option>
               </select>
+              {modelMode === "custom" && (
+                <input
+                  className="input"
+                  style={{ marginTop: 8 }}
+                  placeholder={`vd. id model ${engineLabel} (không hard-code trong app)`}
+                  value={isCliDefault(modelVal) ? "" : modelVal}
+                  onChange={(e) => setModelFromUi("custom", e.target.value)}
+                />
+              )}
+              <span className="hint">
+                {discoveredOpts.length
+                  ? `Đã quét ${discoveredOpts.length} model từ CLI ${engineLabel}.`
+                  : `CLI chưa trả list model — dùng mặc định hoặc nhập tay.`}{" "}
+                Không dùng danh sách model cố định trong repo (sẽ lệch khi CLI
+                cập nhật).
+              </span>
             </div>
             <div className="field">
               <label>Quyền (posture)</label>
               <select
                 className="input"
                 value={cfg.posture || "allowlist"}
-                onChange={(e) => set("posture", e.target.value)}
+                onChange={(e) =>
+                  setCfg((c) => ({ ...(c || {}), posture: e.target.value }))
+                }
               >
                 <option value="allowlist">allowlist (an toàn)</option>
                 <option value="bypass">bypass (Codex headless MCP)</option>
               </select>
               <span className="hint">
-                Codex headless cần bypass để MCP tool call không bị auto-cancel.
+                Codex full-run MCP thường cần <b>bypass</b>.
               </span>
             </div>
-            <div className="field">
-              <label>Lô trang (Codex/Grok)</label>
-              <input
-                className="input num"
-                type="number"
-                min={5}
-                max={200}
-                value={cfg.codex_batch ?? 25}
-                onChange={(e) =>
-                  set("codex_batch", parseInt(e.target.value, 10) || 25)
-                }
-              />
-            </div>
-            <div className="field">
-              <label>Agent song song (Claude)</label>
-              <input
-                className="input num"
-                type="number"
-                min={1}
-                max={10}
-                value={cfg.agents ?? 3}
-                onChange={(e) => {
-                  const n = parseInt(e.target.value, 10) || 3;
-                  set("agents", Math.max(1, Math.min(10, n)));
-                }}
-              />
-              <span className="hint">
-                Số agent dịch/soát chạy cùng lúc trong MỘT cuốn (pipeline Claude).
-                Nhiều hơn = nhanh hơn, nhưng dễ chạm giới hạn tài khoản. Áp dụng
-                cho lần chạy kế tiếp.
-              </span>
-            </div>
+            {showCodexBatch && (
+              <div className="field">
+                <label>Lô trang (Codex/Grok full-run)</label>
+                <input
+                  className="input num"
+                  type="number"
+                  min={5}
+                  max={200}
+                  value={cfg.codex_batch ?? 25}
+                  onChange={(e) =>
+                    setCfg((c) => ({
+                      ...(c || {}),
+                      codex_batch: parseInt(e.target.value, 10) || 25,
+                    }))
+                  }
+                />
+              </div>
+            )}
+            {showAgents && (
+              <div className="field">
+                <label>Agent song song (pipeline runner)</label>
+                <input
+                  className="input num"
+                  type="number"
+                  min={1}
+                  max={10}
+                  value={cfg.agents ?? 3}
+                  onChange={(e) => {
+                    const n = parseInt(e.target.value, 10) || 3;
+                    setCfg((c) => ({
+                      ...(c || {}),
+                      agents: Math.max(1, Math.min(10, n)),
+                    }));
+                  }}
+                />
+              </div>
+            )}
           </div>
+          <p className="hint">
+            Engine: <b>{engine}</b> · model:{" "}
+            <b>{isCliDefault(modelVal) ? "CLI default" : modelVal}</b>
+            {modelVal === defaultModel(engine) ? "" : ""}.
+          </p>
         </section>
 
         <section className="card stack-4">
@@ -194,7 +319,12 @@ export default function Settings() {
                 className="input num"
                 type="number"
                 value={cfg.budget ?? 100}
-                onChange={(e) => set("budget", parseFloat(e.target.value) || 100)}
+                onChange={(e) =>
+                  setCfg((c) => ({
+                    ...(c || {}),
+                    budget: parseFloat(e.target.value) || 100,
+                  }))
+                }
               />
             </div>
             <div className="field">
@@ -202,7 +332,12 @@ export default function Settings() {
               <select
                 className="input"
                 value={String(cfg.budget_warn ?? 90)}
-                onChange={(e) => set("budget_warn", parseInt(e.target.value) || 90)}
+                onChange={(e) =>
+                  setCfg((c) => ({
+                    ...(c || {}),
+                    budget_warn: parseInt(e.target.value) || 90,
+                  }))
+                }
               >
                 {[70, 80, 90, 95].map((n) => (
                   <option key={n} value={n}>

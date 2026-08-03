@@ -51,3 +51,26 @@ export async function detectAgents(): Promise<AgentDetection[]> {
 export function capabilitiesOf(id: EngineId) {
   return ADAPTERS[id].capabilities();
 }
+
+/**
+ * Discover model ids from installed CLIs (best-effort, parallel).
+ * Empty list for an engine means: use CLI default + free-text only.
+ */
+export async function listModelsForEngines(): Promise<
+  Record<EngineId, string[]>
+> {
+  const out = {} as Record<EngineId, string[]>;
+  await Promise.all(
+    ENGINE_IDS.map(async (id) => {
+      try {
+        const fn = ADAPTERS[id].listModels;
+        out[id] = fn ? await fn.call(ADAPTERS[id]) : [];
+      } catch {
+        out[id] = [];
+      }
+    })
+  );
+  return out;
+}
+
+export { parseGrokModelsOutput, parseModelIdLines } from "./list-models.js";

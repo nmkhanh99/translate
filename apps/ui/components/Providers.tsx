@@ -34,8 +34,12 @@ export interface ChatDoc {
   display: string;
   pages?: number;
 }
+export interface ChatDraft {
+  id: number;
+  text: string;
+}
 interface ChatCtxValue {
-  openChat: (doc: ChatDoc) => void;
+  openChat: (doc: ChatDoc, draft?: string) => void;
   closeChat: () => void;
   activeDoc: ChatDoc | null;
   open: boolean;
@@ -108,7 +112,9 @@ export function Providers({ children }: { children: React.ReactNode }) {
   const setEngine = React.useCallback(
     (e: Engine) => {
       setEngineState(e);
-      saveConfig({ engine: e })
+      // Same contract as Settings setEngine: engine switch resets model to CLI
+      // default so spawn omits --model (never keep grok-4.5 under claude).
+      saveConfig({ engine: e, model: "default" })
         .then(() => toast("CLI dịch: " + ENGINE_LABEL[e]))
         .catch((err) => toast("Lỗi lưu engine: " + (err as Error).message));
     },
@@ -116,12 +122,20 @@ export function Providers({ children }: { children: React.ReactNode }) {
   );
 
   const [activeDoc, setActiveDoc] = React.useState<ChatDoc | null>(null);
+  const [chatDraft, setChatDraft] = React.useState<ChatDraft | null>(null);
   const [open, setOpen] = React.useState(false);
-  const openChat = React.useCallback((doc: ChatDoc) => {
+  const draftSeq = React.useRef(0);
+  const openChat = React.useCallback((doc: ChatDoc, draft?: string) => {
     setActiveDoc(doc);
+    if (draft) setChatDraft({ id: ++draftSeq.current, text: draft });
     setOpen(true);
   }, []);
   const closeChat = React.useCallback(() => setOpen(false), []);
+
+  React.useEffect(() => {
+    document.body.classList.toggle("chat-open", open);
+    return () => document.body.classList.remove("chat-open");
+  }, [open]);
 
   return (
     <ToastCtx.Provider value={toast}>
@@ -130,7 +144,12 @@ export function Providers({ children }: { children: React.ReactNode }) {
       >
         <ChatCtx.Provider value={{ openChat, closeChat, activeDoc, open }}>
           {children}
-          <ChatDrawer doc={activeDoc} open={open} onClose={closeChat} />
+          <ChatDrawer
+            doc={activeDoc}
+            draft={chatDraft}
+            open={open}
+            onClose={closeChat}
+          />
           <div className={"toast" + (show ? " show" : "")}>{toastMsg}</div>
         </ChatCtx.Provider>
       </EngineCtx.Provider>

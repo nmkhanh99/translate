@@ -10,6 +10,8 @@ export interface ChatRunParams {
   cwd: string;
   /** Full user message (already includes document context on first turn). */
   prompt: string;
+  /** Restrict document-reader chat to non-mutating CLI capabilities. */
+  readOnly?: boolean;
   session?: string | null;
   model?: string;
   posture?: "allowlist" | "bypass" | string;
@@ -36,6 +38,11 @@ export interface AgentAdapter {
   readonly displayName: string;
   detect(): Promise<AgentDetection | null>;
   capabilities(): AgentCapabilities;
+  /**
+   * Best-effort list of model ids from the installed CLI (may be empty).
+   * Never invent product names — empty means UI uses CLI default + free-text.
+   */
+  listModels?(): Promise<string[]>;
   /** Headless chat turn; yields unified AgentEvent stream. */
   chat(params: ChatRunParams): AsyncIterable<AgentEvent>;
   /** Build argv for a pipeline run (daemon may spawn with log redirection). */

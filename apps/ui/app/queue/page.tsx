@@ -96,10 +96,11 @@ export default function Queue() {
   const onEngine = (tag: string, engine: string) =>
     act(() => setVolEngine(tag, engine), "Cuốn này sẽ dịch bằng: " + engine);
 
-  const launch = async (tag: string, ok: string, engine?: string) => {
+  const launch = async (tag: string, ok: string, engine: string) => {
     setStarting((prev) => ({ ...prev, [tag]: { at: Date.now() } }));
     try {
-      const r = await runVolume(tag, engine);
+      // engine bắt buộc — khớp Engine mini / pref / global đang hiện trên card
+      const r = await runVolume(tag, engine || globalEngine || "claude");
       setStarting((prev) =>
         prev[tag] ? { ...prev, [tag]: { at: prev[tag].at, sid: r?.sid } } : prev
       );
@@ -316,7 +317,7 @@ function Job({
   v: Volume;
   kind: Kind;
   act: (fn: () => Promise<unknown>, ok: string) => void;
-  launch: (tag: string, ok: string, engine?: string) => void;
+  launch: (tag: string, ok: string, engine: string) => void;
   onOpen: (tag: string) => void;
   globalEngine: string;
   onEngine: (tag: string, engine: string) => void;

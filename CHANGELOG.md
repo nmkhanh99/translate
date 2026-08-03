@@ -1,5 +1,158 @@
 # Changelog
 
+## 2026-07-18 (Engine: đuôi số câu không còn bị cắt như mảnh công thức)
+
+### Fixed
+
+- **Orphan số cuối câu** (vd kurtosis “…distribution is / 3.” trên p100):
+  `_line_is_formula_fragment` coi `'3.'` là mảnh công thức → cắt bullet sớm,
+  để rơi số “3.” không dịch và mất “is 3.” trong bản Việt. Nay số + dấu câu
+  kết dòng (`.`, `,`, `%`…) không còn là fragment; tử/mẫu thuần (`10`, `n−1`)
+  vẫn giữ nguyên.
+- v1: defect medium+ **110 → 109**; `label_tach_dong` **4 → 3** (p100);
+  apply `missing=0`.
+
+### Technical
+
+- `pdf_core._line_is_formula_fragment` — chặn false-positive đuôi số câu.
+- `test_engine_v2.py`: `t_formula_fragment_prose_tail`, `t_kurtosis_tail_real_pdf`.
+
+## 2026-07-18 (Engine: same-y X̄ prefix stitch — hết đè EN+VI p25/p101)
+
+### Fixed
+
+- **Chữ Việt đè lên mảnh tiếng Anh giữ nguyên** (cụm `chu_de_chong`, p25/p101):
+  PyMuPDF tách `"The bold term, X̄, is…"` thành block prefix non-prose (overline
+  + bold) + block prose kế → prefix không redact, VI vẽ đè. Engine gộp prefix
+  cùng hàng (`_stitch_same_y_blocks` + `_merge_same_y_lines`) trước
+  `_is_prose_block`. Guard: không gộp bullet/Step; chỉ giao y dòng đầu.
+- v1: defect medium+ **111 → 110**; `chu_de_chong` **13 → 11** trang (p25/p101
+  overlap); apply `missing=0`.
+
+### Technical
+
+- `pdf_core.py`: `_is_same_y_prefix`, `_merge_same_y_lines`, `_stitch_same_y_blocks`
+  trong `_extract_blocky`.
+- `test_engine_v2.py`: `t_same_y_stitch`, `t_same_y_stitch_real_pdf`.
+- Cache `text2vi.json` +2…+8 key segment gộp (compose từ bản cũ).
+
+## 2026-07-18 (Defect list nhanh + auto-fix khi stage review)
+
+### Fixed
+
+- **Load cụm lỗi / chi tiết rất chậm** (~60s trên L1V3): `defect-report` không
+  còn extract full PDF mỗi lần — classify light (cluster/channel) + cache
+  `defect_clusters.json`. UI `/api/defects` mở gần như tức thì.
+- **Hàng đợi poll chậm**: `/api/status` không còn `await listModelsForEngines()`
+  mỗi lần (grok models ~2s) — cache 5 phút + refresh nền; list FS-only.
+- **“Chạy để sửa” (stage=review)** luôn vào auto-fix text kể cả khi `vision`
+  tắt config; tách auto-fix khỏi khối vision-only; **mọi engine** (Codex/Grok)
+  force pipeline-runner (không rơi MCP batch translate-only).
+- Segment PDF chỉ khi `page-segments` / `problems rich`, và **chỉ các trang
+  cần** (không `extract_segments(..., "all")`).
+
+### Technical
+
+- `test_defects_perf.py`; pipeline-runner `autoFixText` + `review-resume`.
+
+## 2026-07-18 (Không hard-code model CLI — default + discovery + free-text)
+
+### Changed
+
+- **Bỏ catalog model cố định** trong repo (`sonnet`/`o4-mini`/`grok-4`… làm
+  dropdown). Model = **mặc định CLI** (omit flag) + **list quét từ CLI** (vd
+  `grok models`) + **nhập tay**.
+- Settings: chọn “Mặc định CLI” / model đã quét / free-text.
+- Spawn (runner, chat, adapters): chỉ truyền model khi user/discovery có id;
+  không gán mặc định `sonnet` cứng.
+
+### Technical
+
+- `listModels()` per adapter + `listModelsForEngines()`; Grok parse
+  `grok models`. Claude/Codex: rỗng → free-text.
+- Shared: `CLI_DEFAULT_MODEL`, `normalizeModel`, `cliModelArg`,
+  `modelOptionsForEngine(engine, discovered)`.
+
+## 2026-07-18 (Settings model dropdown theo đúng CLI — hết Grok + Sonnet)
+
+### Fixed
+
+- **Cài đặt**: dropdown Model theo engine — chọn Grok/Codex không còn hiện
+  Sonnet/Opus (Claude). Đổi engine → model snap về catalog engine đó.
+- **Lưu config / load**: `normalizeModel(engine, model)` — không giữ alias
+  Claude khi engine là codex/grok.
+- **Spawn**: pipeline-runner + chat không truyền `sonnet`/`opus` sang Codex/Grok;
+  chat không còn fall-through `ADAPTERS.claude` khi engine sai.
+- **Lô trang (codex_batch)** chỉ hiện khi engine Codex/Grok.
+
+### Technical
+
+- Shared catalog: `packages/shared/src/engine-catalog.ts`
+  (`modelsForEngine`, `normalizeModel`, `cliModelArg`).
+- `/api/status` thêm `models_by_engine`.
+
+## 2026-07-18 (Stage redo mọi engine — hết lỗi “cần engine Claude”)
+
+### Fixed
+
+- **Chạy lại stage (dịch / rà soát / soát layout) không còn 400**
+  `chạy lại stage cần engine Claude` khi pref/global là Codex hoặc Grok.
+  Stage redo luôn đi `pipeline-runner` (Node điều phối + unit Read/Write);
+  full-run Codex/Grok vẫn dùng MCP batch như trước.
+- **Runner multi-engine**: `pipeline-runner.mjs` gọi đúng CLI unit
+  (`claude` / `codex exec` / `grok -p`) theo `engine` đã chọn — không đổi
+  `pref.json` sang Claude chỉ vì bấm “chạy lại”.
+- **Thứ tự engine thống nhất** (`resolveEngine`): body override → pref cuốn →
+  global → claude — dùng cho run/redo/batch.
+
+### Changed
+
+- UI Run “Chạy lại”: ghi chú engine đang chọn (Claude/Codex/Grok), không còn
+  bắt buộc Claude.
+- **Thư viện / Dịch tài liệu**: `runVolume(tag, engine)` luôn gửi engine đang
+  hiện trên EngineSwitch (trước đó omit → server ưu tiên pref cuốn → lệch UI).
+- `runVolume` API UI: `engine` bắt buộc (chống regress omit).
+
+### Technical
+
+- `shouldUsePipelineRunner(engine, runOpts)`: `runOpts != null` → runner (mọi
+  engine); full run chỉ Claude → runner.
+- Test: `apps/daemon` `pnpm test` (`engine-resolve.test.ts`).
+
+## 2026-07-18 (Progress honesty + needs-fix enrich + highlight tier-2)
+
+### Fixed
+
+- **Thanh tiến độ nhảy / gần 100% dù dịch chưa xong**: `_status` / daemon
+  `pythonStatus` / UI `volPct` chỉ đếm checkpoint **hợp lệ** (out đủ id+vi,
+  vout đúng dict khớp vchunk, vis là list); artifact stage sau (vd `vis/` đầy
+  sau `chunk --force` xoá `out/`) **không** còn hiện như đã hoàn tất. `%` tổng
+  tuần tự (`overall_pct`): dịch 0–40 · rà 40–70 · layout 70–95 · review=95 ·
+  **100 chỉ khi `stage=done`**.
+- **Sau re-chunk điền lại out, vout/vis cũ không còn giả done**: `workset.json`
+  generation gate (`chunk_gen` / `vchunk_gen` / `vision_gen`); `chunk --force`
+  invalidate vchunks/vout/vis/review_issues; `vchunk` tự tạo lại khi stale;
+  refill outs + leftover later-stage → stage=`verify`, không `done`/100%.
+- **out rỗng/thiếu id bị tính “đã dịch”**: `pending translate` và status cùng
+  luật — partial/empty `{}` vào lại hàng đợi.
+- **Cần sửa thiếu thông tin**: `merge-vis` / `defect-report` enrich
+  `cluster`+`channel` (+ `segments[{id,en,vi}]` cho text/mixed) vào
+  `review_issues.json`; `problems … rich` và `page-segments` kèm
+  `page_XXX_issues.json` để vòng fix không đoán free-text.
+
+### Added
+
+- **Highlight tier-2** (`pdf_core.apply_translations`): highlight giao ≥60%
+  một segment bị dịch → xoá annot cũ (tier-1) rồi vẽ lại trên box VI mới;
+  annot trên vùng giữ nguyên vẫn giữ (tier-1). Không đụng nội dung bản dịch.
+- Unit test `python/test_progress_status.py` (progress/pending/enrich);
+  bổ sung highlight tier-1/2 trong `test_engine_v2.py`.
+
+### Technical
+
+- `state.json` chỉ là cache của `_status` (filesystem = nguồn sự thật).
+- Daemon mirror cùng luật (valid checkpoint + sequential gate + `overall_pct`).
+
 ## 2026-07-13 (ENGINE RENDER V2 — rich-text, công thức inline, bảng lưới; học từ PDFMathTranslate/BabelDOC)
 
 ### Changed
