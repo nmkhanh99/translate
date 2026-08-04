@@ -22,7 +22,12 @@ import {
 import { useToast, useChat, useEngine } from "../../components/Providers";
 import { IconBookmark, IconChat } from "../../components/icons";
 import {
+  clampReaderSplitRatio,
   clampReaderZoom,
+  readerSplitRatioFromPointer,
+  READER_SPLIT_CENTER,
+  READER_SPLIT_MAX,
+  READER_SPLIT_MIN,
   READER_ZOOM_MAX,
   READER_ZOOM_MIN,
   readerZoomFromWheel,
@@ -144,6 +149,7 @@ function Reader() {
   const [bookmarkPage, setBookmarkPage] = React.useState<number | null>(null);
   const [bookmarkSaving, setBookmarkSaving] = React.useState(false);
   const [mode, setMode] = React.useState<ViewMode>("split");
+  const [splitRatio, setSplitRatio] = React.useState(READER_SPLIT_CENTER);
   const [blockEditMode, setBlockEditMode] = React.useState(false);
   const [blockReport, setBlockReport] = React.useState<BlockReport | null>(null);
   const [selectedBlock, setSelectedBlock] = React.useState<DocumentBlock | null>(null);
@@ -173,6 +179,7 @@ function Reader() {
   const repairStatuses = React.useRef<Map<string, RepairRequest["status"]>>(new Map());
   const localEnglishVoice = React.useRef<SpeechSynthesisVoice | null>(null);
   const selectionMenuRef = React.useRef<HTMLDivElement>(null);
+  const readerRef = React.useRef<HTMLDivElement>(null);
   const translationRequest = React.useRef<AbortController | null>(null);
 
   const volumeStatus = status?.volumes.find((volume) => volume.tag === tag);
@@ -680,6 +687,12 @@ function Reader() {
     setBlockSaveError("");
     setBlockEditMode((active) => !active);
   };
+  const moveSplitDivider = (clientX: number, dividerWidth: number) => {
+    const reader = readerRef.current;
+    if (!reader) return;
+    const rect = reader.getBoundingClientRect();
+    setSplitRatio(readerSplitRatioFromPointer(clientX, rect.left, rect.width, dividerWidth));
+  };
 
   if (!info || !tag) {
     return <div className="page">Đang tải…</div>;
@@ -836,7 +849,14 @@ function Reader() {
           </div>
         </div>
 
-        <div className={"reader reader-" + mode}>
+        <div
+          ref={readerRef}
+          className={"reader reader-" + mode}
+          style={mode === "split" ? {
+            "--reader-left": `${splitRatio}fr`,
+            "--reader-right": `${100 - splitRatio}fr`,
+          } as React.CSSProperties : undefined}
+        >
           {mode !== "translated" && (
             <ReaderPageCanvas
               key="source"
@@ -847,9 +867,63 @@ function Reader() {
               src={pageImg(tag, "source", cur - 1)}
               textPage={textPages.source || null}
               annotations={annotations}
+              report={mode === "split" ? currentBlockReport : null}
+              selectedId={mode === "split" && blockEditMode ? selectedBlock?.id || null : null}
+              onSelect={mode === "split" && blockEditMode ? selectBlock : undefined}
+              blockEditMode={mode === "split" && blockEditMode}
+              blockEditModeDisabled={saving}
               onSelectionReset={dismissSelection}
               onSelection={onPageSelection}
             />
+          )}
+          {mode === "split" && (
+            <div className="reader-split-divider">
+              <button
+                type="button"
+                className="reader-split-reset"
+                disabled={splitRatio === READER_SPLIT_CENTER}
+                onClick={() => setSplitRatio(READER_SPLIT_CENTER)}
+                aria-label="Cân hai tài liệu về giữa"
+                title="Cân hai tài liệu về 50 / 50"
+              >
+                ↔
+              </button>
+              <div
+                className="reader-split-handle"
+                role="separator"
+                tabIndex={0}
+                aria-orientation="vertical"
+                aria-label="Đổi độ rộng bản gốc và bản dịch"
+                aria-valuemin={READER_SPLIT_MIN}
+                aria-valuemax={READER_SPLIT_MAX}
+                aria-valuenow={Math.round(splitRatio)}
+                aria-valuetext={`Bản gốc ${Math.round(splitRatio)}%, bản dịch ${Math.round(100 - splitRatio)}%`}
+                onPointerDown={(event) => {
+                  event.currentTarget.setPointerCapture(event.pointerId);
+                  moveSplitDivider(event.clientX, event.currentTarget.parentElement?.getBoundingClientRect().width || 0);
+                }}
+                onPointerMove={(event) => {
+                  if (!event.currentTarget.hasPointerCapture(event.pointerId)) return;
+                  moveSplitDivider(event.clientX, event.currentTarget.parentElement?.getBoundingClientRect().width || 0);
+                }}
+                onPointerUp={(event) => {
+                  if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                    event.currentTarget.releasePointerCapture(event.pointerId);
+                  }
+                }}
+                onKeyDown={(event) => {
+                  const step = event.shiftKey ? 10 : 2;
+                  let next: number | null = null;
+                  if (event.key === "ArrowLeft") next = splitRatio - step;
+                  else if (event.key === "ArrowRight") next = splitRatio + step;
+                  else if (event.key === "Home") next = READER_SPLIT_MIN;
+                  else if (event.key === "End") next = READER_SPLIT_MAX;
+                  if (next === null) return;
+                  event.preventDefault();
+                  setSplitRatio(clampReaderSplitRatio(next));
+                }}
+              />
+            </div>
           )}
           {mode !== "original" &&
             (info.out_exists ? (
@@ -1855,7 +1929,10 @@ function ReaderPageCanvas({
                   type="button"
                   className="reader-block-hitbox"
                   title={block.id + (block.review_required ? " · cần kiểm tra" : "")}
-                  aria-label={"Chỉnh " + block.id}
+                  aria-label={`Chọn ${block.id} ở ${side === "source" ? "bản gốc" : "bản dịch"}`}
+                  aria-pressed={block.id === selectedId}
+                  data-block-id={block.id}
+                  data-selected={block.id === selectedId ? "true" : "false"}
                   onClick={(event) => {
                     event.stopPropagation();
                     onSelect?.(block);

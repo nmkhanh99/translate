@@ -38,6 +38,7 @@ export interface ChatDraft {
   id: number;
   text: string;
 }
+export type ChatDock = "right" | "bottom";
 interface ChatCtxValue {
   openChat: (doc: ChatDoc, draft?: string) => void;
   closeChat: () => void;
@@ -124,6 +125,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
   const [activeDoc, setActiveDoc] = React.useState<ChatDoc | null>(null);
   const [chatDraft, setChatDraft] = React.useState<ChatDraft | null>(null);
   const [open, setOpen] = React.useState(false);
+  const [chatDock, setChatDock] = React.useState<ChatDock>("bottom");
   const draftSeq = React.useRef(0);
   const openChat = React.useCallback((doc: ChatDoc, draft?: string) => {
     setActiveDoc(doc);
@@ -134,8 +136,10 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
   React.useEffect(() => {
     document.body.classList.toggle("chat-open", open);
-    return () => document.body.classList.remove("chat-open");
-  }, [open]);
+    document.body.classList.toggle("chat-dock-right", open && chatDock === "right");
+    document.body.classList.toggle("chat-dock-bottom", open && chatDock === "bottom");
+    return () => document.body.classList.remove("chat-open", "chat-dock-right", "chat-dock-bottom");
+  }, [chatDock, open]);
 
   return (
     <ToastCtx.Provider value={toast}>
@@ -148,6 +152,8 @@ export function Providers({ children }: { children: React.ReactNode }) {
             doc={activeDoc}
             draft={chatDraft}
             open={open}
+            dock={chatDock}
+            onDockChange={setChatDock}
             onClose={closeChat}
           />
           <div className={"toast" + (show ? " show" : "")}>{toastMsg}</div>

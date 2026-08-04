@@ -18,7 +18,7 @@
 // sessions when it is still the current owner — so switching mid-stream can
 // never mix one conversation's transcript or CLI session into another's.
 import * as React from "react";
-import { ChatDoc, ChatDraft, useToast, useEngine } from "./Providers";
+import { useToast, useEngine, type ChatDoc, type ChatDraft, type ChatDock } from "./Providers";
 import type { ChatMessage, ChatRole, Engine } from "../lib/types";
 import { streamChat } from "../lib/chat";
 import {
@@ -71,11 +71,15 @@ export function ChatDrawer({
   doc,
   draft,
   open,
+  dock,
+  onDockChange,
   onClose,
 }: {
   doc: ChatDoc | null;
   draft: ChatDraft | null;
   open: boolean;
+  dock: ChatDock;
+  onDockChange: (dock: ChatDock) => void;
   onClose: () => void;
 }) {
   const toast = useToast();
@@ -411,7 +415,10 @@ export function ChatDrawer({
   return (
     <>
       <div className={"chat-overlay" + (open ? " open" : "")} onClick={onClose} />
-      <aside className={"chat-drawer" + (open ? " open" : "")} aria-hidden={!open}>
+      <aside
+        className={`chat-drawer chat-drawer-${dock}${open ? " open" : ""}`}
+        aria-hidden={!open}
+      >
         <header className="chat-head">
           <EngineSwitch
             value={engine}
@@ -420,6 +427,26 @@ export function ChatDrawer({
             onRescan={rescanAgents}
             ariaLabel="Chọn CLI cho chat"
           />
+          <div className="chat-dock-picker" role="group" aria-label="Vị trí Chat AI">
+            <button
+              type="button"
+              className="chat-dock-option"
+              aria-pressed={dock === "right"}
+              onClick={() => onDockChange("right")}
+              title="Mở Chat AI dọc bên phải"
+            >
+              <span aria-hidden="true">↕</span> Dọc
+            </button>
+            <button
+              type="button"
+              className="chat-dock-option"
+              aria-pressed={dock === "bottom"}
+              onClick={() => onDockChange("bottom")}
+              title="Mở Chat AI ngang phía dưới"
+            >
+              <span aria-hidden="true">↔</span> Ngang
+            </button>
+          </div>
           <button className="btn btn-icon x" onClick={onClose} aria-label="Đóng">
             <IconClose />
           </button>

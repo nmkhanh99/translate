@@ -1,8 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  clampReaderSplitRatio,
   clampReaderZoom,
+  readerSplitRatioFromPointer,
   readerZoomFromWheel,
+  READER_SPLIT_CENTER,
   setReaderPaneZoom,
   validReaderPage,
 } from "./reader-page.js";
@@ -52,5 +55,21 @@ describe("reader zoom", () => {
     assert.equal(translatedChanged.source, 1.8);
     assert.ok(translatedChanged.translated > 1.4);
     assert.equal(setReaderPaneZoom(translatedChanged, "source", 99).source, 2.5);
+  });
+});
+
+describe("reader split", () => {
+  it("clamps pane ratios while keeping an equal reset point", () => {
+    assert.equal(clampReaderSplitRatio(5), 20);
+    assert.equal(clampReaderSplitRatio(68), 68);
+    assert.equal(clampReaderSplitRatio(95), 80);
+    assert.equal(clampReaderSplitRatio(Number.NaN), READER_SPLIT_CENTER);
+  });
+
+  it("maps the divider center to the available two-pane width", () => {
+    assert.equal(readerSplitRatioFromPointer(500, 0, 1000, 28), 50);
+    assert.equal(readerSplitRatioFromPointer(208.4, 0, 1000, 28), 20);
+    assert.equal(readerSplitRatioFromPointer(791.6, 0, 1000, 28), 80);
+    assert.equal(readerSplitRatioFromPointer(500, 0, 20, 28), 50);
   });
 });

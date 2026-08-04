@@ -9,6 +9,9 @@ export function validReaderPage(value: unknown, total: number): number | null {
 
 export const READER_ZOOM_MIN = 0.5;
 export const READER_ZOOM_MAX = 2.5;
+export const READER_SPLIT_MIN = 20;
+export const READER_SPLIT_MAX = 80;
+export const READER_SPLIT_CENTER = 50;
 
 export type ReaderZoomSide = "source" | "translated";
 export type ReaderZoomBySide = Record<ReaderZoomSide, number>;
@@ -32,4 +35,29 @@ export function setReaderPaneZoom(
 ): ReaderZoomBySide {
   const next = clampReaderZoom(value);
   return next === current[side] ? current : { ...current, [side]: next };
+}
+
+export function clampReaderSplitRatio(value: number): number {
+  if (!Number.isFinite(value)) return READER_SPLIT_CENTER;
+  return Math.min(READER_SPLIT_MAX, Math.max(READER_SPLIT_MIN, value));
+}
+
+/** Map the splitter's center point to the source pane's share of available width. */
+export function readerSplitRatioFromPointer(
+  clientX: number,
+  containerLeft: number,
+  containerWidth: number,
+  dividerWidth: number
+): number {
+  const availableWidth = containerWidth - dividerWidth;
+  if (
+    !Number.isFinite(clientX) ||
+    !Number.isFinite(containerLeft) ||
+    !Number.isFinite(availableWidth) ||
+    availableWidth <= 0
+  ) {
+    return READER_SPLIT_CENTER;
+  }
+  const position = clientX - containerLeft - dividerWidth / 2;
+  return clampReaderSplitRatio((position / availableWidth) * 100);
 }
