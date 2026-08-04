@@ -144,6 +144,7 @@ function Reader() {
   const [bookmarkPage, setBookmarkPage] = React.useState<number | null>(null);
   const [bookmarkSaving, setBookmarkSaving] = React.useState(false);
   const [mode, setMode] = React.useState<ViewMode>("split");
+  const [blockEditMode, setBlockEditMode] = React.useState(false);
   const [blockReport, setBlockReport] = React.useState<BlockReport | null>(null);
   const [selectedBlock, setSelectedBlock] = React.useState<DocumentBlock | null>(null);
   const [blockDrafts, setBlockDrafts] = React.useState<Record<string, string>>({});
@@ -256,6 +257,8 @@ function Reader() {
       setInfo(null);
       setPreflight(null);
       setBookmarkPage(null);
+      setBlockEditMode(false);
+      setSelectedBlock(null);
       setBlockDrafts({});
       setBlockSaveError("");
       setRepairRequests([]);
@@ -325,9 +328,7 @@ function Reader() {
         if (!alive) return;
         setBlockReport(report);
         setSelectedBlock((old) => (
-          (old && report.blocks.find((block) => block.id === old.id)) ||
-          report.blocks[0] ||
-          null
+          old ? report.blocks.find((block) => block.id === old.id) || null : null
         ));
         setBlockSaveError("");
       })
@@ -416,6 +417,8 @@ function Reader() {
   const goToPage = (page: number) => {
     const next = validReaderPage(page, total);
     if (!next) return;
+    setSelectedBlock(null);
+    setBlockSaveError("");
     setCur(next);
     setPageInput(String(next));
   };
@@ -666,9 +669,16 @@ function Reader() {
     : "";
   const blockDirty = !!selectedBlock && draft.trim() !== selectedBlock.translation.trim();
   const selectBlock = (block: DocumentBlock) => {
-    if (saving) return;
+    if (!blockEditMode || saving) return;
     setSelectedBlock(block);
     setBlockSaveError("");
+  };
+  const toggleBlockEditMode = () => {
+    if (saving) return;
+    dismissSelection();
+    setSelectedBlock(null);
+    setBlockSaveError("");
+    setBlockEditMode((active) => !active);
   };
 
   if (!info || !tag) {
@@ -854,8 +864,11 @@ function Reader() {
                 textPage={textPages.translated || null}
                 annotations={annotations}
                 report={currentBlockReport}
-                selectedId={selectedBlock?.id || null}
-                onSelect={selectBlock}
+                selectedId={blockEditMode ? selectedBlock?.id || null : null}
+                onSelect={blockEditMode ? selectBlock : undefined}
+                blockEditMode={blockEditMode}
+                blockEditModeDisabled={saving}
+                onBlockEditModeToggle={toggleBlockEditMode}
                 onSelectionReset={dismissSelection}
                 onSelection={onPageSelection}
               />
@@ -1136,7 +1149,7 @@ function Reader() {
           </section>
         )}
 
-        {blocks.length > 0 && selectedBlock && (
+        {blockEditMode && mode !== "original" && blocks.length > 0 && selectedBlock && selectedBlockIndex >= 0 && (
           <section className="card stack-3" aria-label="Chỉnh block dịch">
             <div className="row-between wrap" style={{ gap: "var(--space-3)" }}>
               <div>
@@ -1466,6 +1479,9 @@ interface ReaderPageCanvasProps {
   report?: BlockReport | null;
   selectedId?: string | null;
   onSelect?: (block: DocumentBlock) => void;
+  blockEditMode?: boolean;
+  blockEditModeDisabled?: boolean;
+  onBlockEditModeToggle?: () => void;
   onSelectionReset: () => void;
   onSelection: (payload: PageSelectionPayload) => void;
 }
@@ -1482,6 +1498,9 @@ function ReaderPageCanvas({
   report,
   selectedId,
   onSelect,
+  blockEditMode = false,
+  blockEditModeDisabled = false,
+  onBlockEditModeToggle,
   onSelectionReset,
   onSelection,
 }: ReaderPageCanvasProps) {
@@ -1648,7 +1667,7 @@ function ReaderPageCanvas({
   };
 
   const selectBlockAt = (event: React.MouseEvent<HTMLDivElement>) => {
-    if (!onSelect || !report?.blocks.length || !mediaRef.current) return;
+    if (!blockEditMode || !onSelect || !report?.blocks.length || !mediaRef.current) return;
     // A text span sits above the legacy transparent block buttons. Preserve
     // click-to-edit by resolving the clicked point back to the smallest block.
     const rect = mediaRef.current.getBoundingClientRect();
@@ -1675,42 +1694,59 @@ function ReaderPageCanvas({
           style={{ color: accent ? "var(--accent)" : undefined, fontSize: "var(--text-xs)" }}
         >
           {cap}
-          {report?.blocks.length && onSelect ? " · bấm block để chỉnh; bôi đen để thao tác" : " · bôi đen để thao tác"}
+          {blockEditMode && report?.blocks.length && onSelect
+            ? " · bấm block để chỉnh; bôi đen để thao tác"
+            : " · bôi đen để thao tác"}
         </div>
-        <div
-          className="reader-zoom-controls"
-          role="group"
-          aria-label={`Thu phóng ${side === "source" ? "bản gốc" : "bản dịch"}`}
-        >
-          <button
-            type="button"
-            className="btn btn-secondary btn-sm"
-            disabled={zoom <= READER_ZOOM_MIN}
-            onClick={() => zoomFromCenter((current) => clampReaderZoom(current - 0.1))}
-            aria-label={`Thu nhỏ ${side === "source" ? "bản gốc" : "bản dịch"}`}
-            title="Thu nhỏ trong khung"
+        <div className="reader-page-actions">
+          {onBlockEditModeToggle && (blockEditMode || !!report?.blocks.length) && (
+            <button
+              type="button"
+              className={`btn btn-sm ${blockEditMode ? "btn-primary" : "btn-secondary"}`}
+              disabled={blockEditModeDisabled}
+              aria-pressed={blockEditMode}
+              data-block-edit-toggle
+              title={blockEditMode ? "Tắt chế độ chỉnh block" : "Hiện vùng block để chỉnh"}
+              onClick={onBlockEditModeToggle}
+            >
+              Chỉnh block
+            </button>
+          )}
+          <div
+            className="reader-zoom-controls"
+            role="group"
+            aria-label={`Thu phóng ${side === "source" ? "bản gốc" : "bản dịch"}`}
           >
-            −
-          </button>
-          <button
-            type="button"
-            className="btn btn-ghost btn-sm num"
-            onClick={() => zoomFromCenter(1)}
-            aria-label={`Đặt lại ${side === "source" ? "bản gốc" : "bản dịch"} về 100%, hiện tại ${Math.round(zoom * 100)}%`}
-            title="Đặt lại 100% · có thể pinch bằng trackpad trong khung"
-          >
-            {Math.round(zoom * 100)}%
-          </button>
-          <button
-            type="button"
-            className="btn btn-secondary btn-sm"
-            disabled={zoom >= READER_ZOOM_MAX}
-            onClick={() => zoomFromCenter((current) => clampReaderZoom(current + 0.1))}
-            aria-label={`Phóng to ${side === "source" ? "bản gốc" : "bản dịch"}`}
-            title="Phóng to trong khung"
-          >
-            +
-          </button>
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              disabled={zoom <= READER_ZOOM_MIN}
+              onClick={() => zoomFromCenter((current) => clampReaderZoom(current - 0.1))}
+              aria-label={`Thu nhỏ ${side === "source" ? "bản gốc" : "bản dịch"}`}
+              title="Thu nhỏ trong khung"
+            >
+              −
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm num"
+              onClick={() => zoomFromCenter(1)}
+              aria-label={`Đặt lại ${side === "source" ? "bản gốc" : "bản dịch"} về 100%, hiện tại ${Math.round(zoom * 100)}%`}
+              title="Đặt lại 100% · có thể pinch bằng trackpad trong khung"
+            >
+              {Math.round(zoom * 100)}%
+            </button>
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              disabled={zoom >= READER_ZOOM_MAX}
+              onClick={() => zoomFromCenter((current) => clampReaderZoom(current + 0.1))}
+              aria-label={`Phóng to ${side === "source" ? "bản gốc" : "bản dịch"}`}
+              title="Phóng to trong khung"
+            >
+              +
+            </button>
+          </div>
         </div>
       </div>
       <div
@@ -1736,7 +1772,7 @@ function ReaderPageCanvas({
             onMouseDown={onSelectionReset}
             onMouseUp={captureSelection}
             onKeyUp={captureSelection}
-            onClick={selectBlockAt}
+            onClick={blockEditMode ? selectBlockAt : undefined}
           >
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
@@ -1807,7 +1843,7 @@ function ReaderPageCanvas({
               </div>
             )}
 
-            {report?.blocks.map((block) => {
+            {blockEditMode && onSelect && report?.blocks.map((block) => {
               const [x0, y0, x1, y1] = block.box;
               const left = Math.max(0, Math.min(100, (x0 / pageWidth) * 100));
               const top = Math.max(0, Math.min(100, (y0 / pageHeight) * 100));
@@ -1833,7 +1869,7 @@ function ReaderPageCanvas({
                       ? "2px solid var(--accent)"
                       : block.review_required
                         ? "1px dashed #d97706"
-                        : "1px solid transparent",
+                        : "1px solid color-mix(in oklab, var(--accent), transparent 65%)",
                     background: block.id === selectedId ? "rgba(37, 99, 235, .12)" : "transparent",
                   }}
                 />

@@ -482,6 +482,7 @@ select.input { appearance: none; cursor: pointer;
 }
 .reader-page-toolbar .sheet-cap { min-width: 0; line-height: 1.4; }
 .reader-page-toolbar .reader-zoom-controls { flex: none; }
+.reader-page-actions { display: flex; align-items: center; justify-content: flex-end; gap: var(--space-2); }
 .reader-page-viewport {
   width: 100%;
   overflow: auto;
@@ -550,6 +551,11 @@ select.input { appearance: none; cursor: pointer;
   background: transparent;
 }
 .reader-block-hitbox:hover { background: color-mix(in oklab, var(--accent), transparent 90%); }
+.reader-block-hitbox:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  background: var(--accent-wash);
+}
 .reader-block-nav {
   display: grid;
   grid-template-columns: auto minmax(220px, 1fr) auto;
