@@ -470,19 +470,43 @@ select.input { appearance: none; cursor: pointer;
 .reader-zoom-controls .btn:first-child { border-radius: var(--radius-sm) 0 0 var(--radius-sm); }
 .reader-zoom-controls .btn:last-child { border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
 .reader-zoom-controls .btn + .btn { margin-left: -1px; }
-.reader-zoom-viewport { width: 100%; overflow-x: auto; overscroll-behavior-x: contain; }
-.reader-zoom-viewport > .reader { margin-inline: auto; }
 .reader-page-column { min-width: 0; }
+.reader-page-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  min-width: 0;
+  margin-bottom: 8px;
+}
+.reader-page-toolbar .sheet-cap { min-width: 0; line-height: 1.4; }
+.reader-page-toolbar .reader-zoom-controls { flex: none; }
+.reader-page-viewport {
+  width: 100%;
+  overflow: auto;
+  overscroll-behavior-x: contain;
+  overscroll-behavior-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--row-hover);
+}
+.reader-page-viewport:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.reader-page-zoom-content {
+  position: relative;
+  margin-inline: auto;
+  background: var(--surface);
+}
 .reader-page-media {
   position: relative;
+  width: 100%;
+  height: 100%;
   container-type: inline-size;
   line-height: 0;
   overflow: hidden;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
   background: var(--surface);
 }
-.reader-page-image { width: 100%; display: block; height: auto; }
+.reader-page-image { width: 100%; height: 100%; display: block; object-fit: fill; }
 .reader-annotation-mark {
   position: absolute;
   z-index: 1;

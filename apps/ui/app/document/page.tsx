@@ -26,7 +26,9 @@ import {
   READER_ZOOM_MAX,
   READER_ZOOM_MIN,
   readerZoomFromWheel,
+  setReaderPaneZoom,
   validReaderPage,
+  type ReaderZoomBySide,
 } from "../../lib/reader-page";
 import {
   buildAskAiDraft,
@@ -163,19 +165,14 @@ function Reader() {
   const [selectionTranslation, setSelectionTranslation] = React.useState<SelectionTranslationState | null>(null);
   const [selectionMenuPosition, setSelectionMenuPosition] = React.useState<SelectionMenuPosition | null>(null);
   const [isFullscreen, setIsFullscreen] = React.useState(false);
-  const [viewerZoom, setViewerZoom] = React.useState(1);
+  const [viewerZoom, setViewerZoom] = React.useState<ReaderZoomBySide>({
+    source: 1,
+    translated: 1,
+  });
   const repairStatuses = React.useRef<Map<string, RepairRequest["status"]>>(new Map());
   const localEnglishVoice = React.useRef<SpeechSynthesisVoice | null>(null);
   const selectionMenuRef = React.useRef<HTMLDivElement>(null);
   const translationRequest = React.useRef<AbortController | null>(null);
-  const zoomViewportRef = React.useRef<HTMLDivElement>(null);
-  const zoomContentRef = React.useRef<HTMLDivElement>(null);
-  const zoomAnchorRef = React.useRef<{
-    clientX: number;
-    clientY: number;
-    xRatio: number;
-    yRatio: number;
-  } | null>(null);
 
   const volumeStatus = status?.volumes.find((volume) => volume.tag === tag);
   const volumeRunning = !!volumeStatus?.running;
@@ -458,51 +455,16 @@ function Reader() {
     clearBrowserSelection();
   }, [cancelSelectionTranslation, clearBrowserSelection]);
 
-  React.useEffect(() => {
-    const viewport = zoomViewportRef.current;
-    if (!viewport || !info) return;
-    const onWheel = (event: WheelEvent) => {
-      // Electron/Chromium reports a macOS trackpad pinch as ctrl+wheel.
-      if (!event.ctrlKey) return;
-      event.preventDefault();
-      dismissSelection();
-      const content = zoomContentRef.current;
-      if (content) {
-        const rect = content.getBoundingClientRect();
-        zoomAnchorRef.current = {
-          clientX: event.clientX,
-          clientY: event.clientY,
-          xRatio: rect.width > 0
-            ? Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width))
-            : 0.5,
-          yRatio: rect.height > 0
-            ? Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height))
-            : 0.5,
-        };
-      }
-      setViewerZoom((current) => {
-        return readerZoomFromWheel(current, event.deltaY);
-      });
-    };
-    viewport.addEventListener("wheel", onWheel, { passive: false });
-    return () => viewport.removeEventListener("wheel", onWheel);
-  }, [dismissSelection, info]);
-
-  React.useLayoutEffect(() => {
-    const anchor = zoomAnchorRef.current;
-    const viewport = zoomViewportRef.current;
-    const content = zoomContentRef.current;
-    if (!anchor || !viewport || !content) return;
-    const rect = content.getBoundingClientRect();
-    const pointX = rect.left + rect.width * anchor.xRatio;
-    viewport.scrollLeft += pointX - anchor.clientX;
-    const main = viewport.closest<HTMLElement>(".main");
-    if (main) {
-      const pointY = rect.top + rect.height * anchor.yRatio;
-      main.scrollTop += pointY - anchor.clientY;
-    }
-    zoomAnchorRef.current = null;
-  }, [viewerZoom]);
+  const updatePaneZoom = React.useCallback((
+    side: ReaderSide,
+    next: React.SetStateAction<number>
+  ) => {
+    setViewerZoom((current) => setReaderPaneZoom(
+      current,
+      side,
+      typeof next === "function" ? next(current[side]) : next
+    ));
+  }, []);
 
   React.useEffect(() => {
     dismissSelection();
@@ -818,49 +780,6 @@ function Reader() {
             </button>
           </div>
           <div className="row wrap" style={{ gap: "var(--space-2)" }}>
-            <div className="reader-zoom-controls" role="group" aria-label="Thu phóng tài liệu">
-              <button
-                type="button"
-                className="btn btn-secondary btn-sm"
-                disabled={viewerZoom <= READER_ZOOM_MIN}
-                onClick={() => {
-                  zoomAnchorRef.current = null;
-                  dismissSelection();
-                  setViewerZoom((current) => clampReaderZoom(current - 0.1));
-                }}
-                aria-label="Thu nhỏ tài liệu"
-                title="Thu nhỏ"
-              >
-                −
-              </button>
-              <button
-                type="button"
-                className="btn btn-ghost btn-sm num"
-                onClick={() => {
-                  zoomAnchorRef.current = null;
-                  dismissSelection();
-                  setViewerZoom(1);
-                }}
-                aria-label={`Đặt lại mức thu phóng, hiện tại ${Math.round(viewerZoom * 100)}%`}
-                title="Đặt lại 100% · có thể pinch bằng trackpad trong tài liệu"
-              >
-                {Math.round(viewerZoom * 100)}%
-              </button>
-              <button
-                type="button"
-                className="btn btn-secondary btn-sm"
-                disabled={viewerZoom >= READER_ZOOM_MAX}
-                onClick={() => {
-                  zoomAnchorRef.current = null;
-                  dismissSelection();
-                  setViewerZoom((current) => clampReaderZoom(current + 0.1));
-                }}
-                aria-label="Phóng to tài liệu"
-                title="Phóng to"
-              >
-                +
-              </button>
-            </div>
             {bookmarkPage && bookmarkPage !== cur && (
               <button
                 type="button"
@@ -907,53 +826,50 @@ function Reader() {
           </div>
         </div>
 
-        <div ref={zoomViewportRef} className="reader-zoom-viewport">
-          <div
-            ref={zoomContentRef}
-            className={"reader reader-" + mode}
-            style={{
-              width: `${viewerZoom * 100}%`,
-              maxWidth: mode === "split" ? undefined : `${920 * viewerZoom}px`,
-            }}
-          >
-            {mode !== "translated" && (
+        <div className={"reader reader-" + mode}>
+          {mode !== "translated" && (
+            <ReaderPageCanvas
+              key="source"
+              cap={"English · trang " + cur}
+              side="source"
+              zoom={viewerZoom.source}
+              onZoomChange={updatePaneZoom}
+              src={pageImg(tag, "source", cur - 1)}
+              textPage={textPages.source || null}
+              annotations={annotations}
+              onSelectionReset={dismissSelection}
+              onSelection={onPageSelection}
+            />
+          )}
+          {mode !== "original" &&
+            (info.out_exists ? (
               <ReaderPageCanvas
-                cap={"English · trang " + cur}
-                side="source"
-                src={pageImg(tag, "source", cur - 1)}
-                textPage={textPages.source || null}
+                key="translated"
+                cap={"Tiếng Việt · trang " + cur}
+                side="translated"
+                accent
+                zoom={viewerZoom.translated}
+                onZoomChange={updatePaneZoom}
+                src={pageImg(tag, "out", cur - 1) + (renderVersion ? `&v=${renderVersion}` : "")}
+                textPage={textPages.translated || null}
                 annotations={annotations}
+                report={currentBlockReport}
+                selectedId={selectedBlock?.id || null}
+                onSelect={selectBlock}
                 onSelectionReset={dismissSelection}
                 onSelection={onPageSelection}
               />
-            )}
-            {mode !== "original" &&
-              (info.out_exists ? (
-                <ReaderPageCanvas
-                  cap={"Tiếng Việt · trang " + cur}
-                  side="translated"
-                  accent
-                  src={pageImg(tag, "out", cur - 1) + (renderVersion ? `&v=${renderVersion}` : "")}
-                  textPage={textPages.translated || null}
-                  annotations={annotations}
-                  report={currentBlockReport}
-                  selectedId={selectedBlock?.id || null}
-                  onSelect={selectBlock}
-                  onSelectionReset={dismissSelection}
-                  onSelection={onPageSelection}
-                />
-              ) : (
-                <div className="page-sheet">
-                  <div className="sheet-cap" style={{ color: "var(--accent)" }}>
-                    Tiếng Việt
-                  </div>
-                  <p className="muted">
-                    Chưa có bản dịch cho cuốn này. Dịch ở trang{" "}
-                    <Link href="/library">Thư viện</Link>.
-                  </p>
+            ) : (
+              <div className="page-sheet">
+                <div className="sheet-cap" style={{ color: "var(--accent)" }}>
+                  Tiếng Việt
                 </div>
-              ))}
-          </div>
+                <p className="muted">
+                  Chưa có bản dịch cho cuốn này. Dịch ở trang{" "}
+                  <Link href="/library">Thư viện</Link>.
+                </p>
+              </div>
+            ))}
         </div>
 
         {annotations.length > 0 && (
@@ -1541,6 +1457,8 @@ function EditableSheet({
 interface ReaderPageCanvasProps {
   cap: string;
   side: ReaderSide;
+  zoom: number;
+  onZoomChange: (side: ReaderSide, next: React.SetStateAction<number>) => void;
   src: string;
   accent?: boolean;
   textPage: ReaderTextPage | null;
@@ -1555,6 +1473,8 @@ interface ReaderPageCanvasProps {
 function ReaderPageCanvas({
   cap,
   side,
+  zoom,
+  onZoomChange,
   src,
   accent,
   textPage,
@@ -1565,9 +1485,18 @@ function ReaderPageCanvas({
   onSelectionReset,
   onSelection,
 }: ReaderPageCanvasProps) {
+  const viewportRef = React.useRef<HTMLDivElement>(null);
+  const zoomContentRef = React.useRef<HTMLDivElement>(null);
   const mediaRef = React.useRef<HTMLDivElement>(null);
   const textLayerRef = React.useRef<HTMLDivElement>(null);
-  const pageSize = textPage?.page_size || report?.page_size || [595, 842];
+  const [imagePageSize, setImagePageSize] = React.useState<[number, number] | null>(null);
+  const zoomAnchorRef = React.useRef<{
+    clientX: number;
+    clientY: number;
+    xRatio: number;
+    yRatio: number;
+  } | null>(null);
+  const pageSize = textPage?.page_size || report?.page_size || imagePageSize || [595, 842];
   const [pageWidth, pageHeight] = pageSize;
   const pageAnnotations = annotations.filter((item) => item.side === side);
 
@@ -1602,6 +1531,59 @@ function ReaderPageCanvas({
       observer?.disconnect();
     };
   }, [pageWidth, pageHeight, textPage]);
+
+  const rememberZoomAnchor = React.useCallback((clientX: number, clientY: number) => {
+    const content = zoomContentRef.current;
+    if (!content) return;
+    const rect = content.getBoundingClientRect();
+    zoomAnchorRef.current = {
+      clientX,
+      clientY,
+      xRatio: rect.width > 0
+        ? Math.max(0, Math.min(1, (clientX - rect.left) / rect.width))
+        : 0.5,
+      yRatio: rect.height > 0
+        ? Math.max(0, Math.min(1, (clientY - rect.top) / rect.height))
+        : 0.5,
+    };
+  }, []);
+
+  React.useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const onWheel = (event: WheelEvent) => {
+      // Electron/Chromium reports a macOS trackpad pinch as ctrl+wheel.
+      // A normal two-finger wheel remains native scrolling inside this pane.
+      if (!event.ctrlKey) return;
+      event.preventDefault();
+      onSelectionReset();
+      rememberZoomAnchor(event.clientX, event.clientY);
+      onZoomChange(side, (current) => readerZoomFromWheel(current, event.deltaY));
+    };
+    viewport.addEventListener("wheel", onWheel, { passive: false });
+    return () => viewport.removeEventListener("wheel", onWheel);
+  }, [onSelectionReset, onZoomChange, rememberZoomAnchor, side]);
+
+  React.useLayoutEffect(() => {
+    const anchor = zoomAnchorRef.current;
+    const viewport = viewportRef.current;
+    const content = zoomContentRef.current;
+    if (!anchor || !viewport || !content) return;
+    const rect = content.getBoundingClientRect();
+    viewport.scrollLeft += rect.left + rect.width * anchor.xRatio - anchor.clientX;
+    viewport.scrollTop += rect.top + rect.height * anchor.yRatio - anchor.clientY;
+    zoomAnchorRef.current = null;
+  }, [zoom]);
+
+  const zoomFromCenter = (next: React.SetStateAction<number>) => {
+    const viewport = viewportRef.current;
+    if (viewport) {
+      const rect = viewport.getBoundingClientRect();
+      rememberZoomAnchor(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    }
+    onSelectionReset();
+    onZoomChange(side, next);
+  };
 
   const findTextLayer = (node: Node | null): HTMLElement | null => {
     const el = node?.nodeType === Node.ELEMENT_NODE
@@ -1686,110 +1668,179 @@ function ReaderPageCanvas({
   };
 
   return (
-    <div className="reader-page-column">
-      <div
-        className="sheet-cap"
-        style={{ color: accent ? "var(--accent)" : undefined, marginBottom: 8, fontSize: "var(--text-xs)" }}
-      >
-        {cap}
-        {report?.blocks.length && onSelect ? " · bấm block để chỉnh; bôi đen để thao tác" : " · bôi đen để thao tác"}
+    <div className="reader-page-column" data-reader-side={side}>
+      <div className="reader-page-toolbar">
+        <div
+          className="sheet-cap"
+          style={{ color: accent ? "var(--accent)" : undefined, fontSize: "var(--text-xs)" }}
+        >
+          {cap}
+          {report?.blocks.length && onSelect ? " · bấm block để chỉnh; bôi đen để thao tác" : " · bôi đen để thao tác"}
+        </div>
+        <div
+          className="reader-zoom-controls"
+          role="group"
+          aria-label={`Thu phóng ${side === "source" ? "bản gốc" : "bản dịch"}`}
+        >
+          <button
+            type="button"
+            className="btn btn-secondary btn-sm"
+            disabled={zoom <= READER_ZOOM_MIN}
+            onClick={() => zoomFromCenter((current) => clampReaderZoom(current - 0.1))}
+            aria-label={`Thu nhỏ ${side === "source" ? "bản gốc" : "bản dịch"}`}
+            title="Thu nhỏ trong khung"
+          >
+            −
+          </button>
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm num"
+            onClick={() => zoomFromCenter(1)}
+            aria-label={`Đặt lại ${side === "source" ? "bản gốc" : "bản dịch"} về 100%, hiện tại ${Math.round(zoom * 100)}%`}
+            title="Đặt lại 100% · có thể pinch bằng trackpad trong khung"
+          >
+            {Math.round(zoom * 100)}%
+          </button>
+          <button
+            type="button"
+            className="btn btn-secondary btn-sm"
+            disabled={zoom >= READER_ZOOM_MAX}
+            onClick={() => zoomFromCenter((current) => clampReaderZoom(current + 0.1))}
+            aria-label={`Phóng to ${side === "source" ? "bản gốc" : "bản dịch"}`}
+            title="Phóng to trong khung"
+          >
+            +
+          </button>
+        </div>
       </div>
       <div
-        ref={mediaRef}
-        className="reader-page-media"
-        onMouseDown={onSelectionReset}
-        onMouseUp={captureSelection}
-        onKeyUp={captureSelection}
-        onClick={selectBlockAt}
+        ref={viewportRef}
+        className="reader-page-viewport"
+        style={{ aspectRatio: `${pageWidth} / ${pageHeight}` }}
+        data-reader-zoom-viewport={side}
+        role="region"
+        tabIndex={0}
+        aria-label={`Khung tài liệu ${side === "source" ? "bản gốc" : "bản dịch"}`}
       >
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img className="reader-page-image" src={src} alt={cap} />
-
-        {pageAnnotations.flatMap((annotation) =>
-          annotation.rects.map((rect, index) => {
-            const x = rect.x * 100;
-            const y = rect.y * 100;
-            const width = rect.width * 100;
-            const height = rect.height * 100;
-            return (
-              <span
-                key={`${annotation.id}-${index}`}
-                className={"reader-annotation-mark " + (annotation.kind === "note" ? "note" : "highlight")}
-                style={{ left: `${x}%`, top: `${y}%`, width: `${width}%`, height: `${height}%` }}
-                title={annotation.note || annotation.text}
-                aria-label={annotation.note || annotation.text}
-              />
-            );
-          })
-        )}
-
-        {textPage && (
+        <div
+          ref={zoomContentRef}
+          className="reader-page-zoom-content"
+          style={{
+            width: `${zoom * 100}%`,
+            aspectRatio: `${pageWidth} / ${pageHeight}`,
+          }}
+        >
           <div
-            ref={textLayerRef}
-            className="reader-text-layer"
-            data-reader-text-layer
-            data-side={side}
-            aria-label={`Lớp chữ ${side === "source" ? "bản gốc" : "bản dịch"}`}
+            ref={mediaRef}
+            className="reader-page-media"
+            onMouseDown={onSelectionReset}
+            onMouseUp={captureSelection}
+            onKeyUp={captureSelection}
+            onClick={selectBlockAt}
           >
-            {textPage.spans.map((span) => {
-              const [x0, y0, x1, y1] = span.box;
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              className="reader-page-image"
+              src={src}
+              alt={cap}
+              onLoad={(event) => {
+                const { naturalWidth, naturalHeight } = event.currentTarget;
+                if (naturalWidth <= 0 || naturalHeight <= 0) return;
+                setImagePageSize((current) =>
+                  current?.[0] === naturalWidth && current[1] === naturalHeight
+                    ? current
+                    : [naturalWidth, naturalHeight]
+                );
+              }}
+            />
+
+            {pageAnnotations.flatMap((annotation) =>
+              annotation.rects.map((rect, index) => {
+                const x = rect.x * 100;
+                const y = rect.y * 100;
+                const width = rect.width * 100;
+                const height = rect.height * 100;
+                return (
+                  <span
+                    key={`${annotation.id}-${index}`}
+                    className={"reader-annotation-mark " + (annotation.kind === "note" ? "note" : "highlight")}
+                    style={{ left: `${x}%`, top: `${y}%`, width: `${width}%`, height: `${height}%` }}
+                    title={annotation.note || annotation.text}
+                    aria-label={annotation.note || annotation.text}
+                  />
+                );
+              })
+            )}
+
+            {textPage && (
+              <div
+                ref={textLayerRef}
+                className="reader-text-layer"
+                data-reader-text-layer
+                data-side={side}
+                aria-label={`Lớp chữ ${side === "source" ? "bản gốc" : "bản dịch"}`}
+              >
+                {textPage.spans.map((span) => {
+                  const [x0, y0, x1, y1] = span.box;
+                  const left = Math.max(0, Math.min(100, (x0 / pageWidth) * 100));
+                  const top = Math.max(0, Math.min(100, (y0 / pageHeight) * 100));
+                  const width = Math.max(0.1, Math.min(100 - left, ((x1 - x0) / pageWidth) * 100));
+                  const height = Math.max(0.1, Math.min(100 - top, ((y1 - y0) / pageHeight) * 100));
+                  return (
+                    <span
+                      key={span.id}
+                      className="reader-text-span"
+                      style={{
+                        left: `${left}%`,
+                        top: `${top}%`,
+                        width: `${width}%`,
+                        height: `${height}%`,
+                        fontSize: `${Math.max(1, span.font_size) / pageWidth * 100}cqw`,
+                        fontWeight: span.bold ? 700 : 400,
+                        fontStyle: span.italic ? "italic" : "normal",
+                      }}
+                    >
+                      <span className="reader-text-glyph">{span.text}</span>
+                    </span>
+                  );
+                })}
+              </div>
+            )}
+
+            {report?.blocks.map((block) => {
+              const [x0, y0, x1, y1] = block.box;
               const left = Math.max(0, Math.min(100, (x0 / pageWidth) * 100));
               const top = Math.max(0, Math.min(100, (y0 / pageHeight) * 100));
-              const width = Math.max(0.1, Math.min(100 - left, ((x1 - x0) / pageWidth) * 100));
-              const height = Math.max(0.1, Math.min(100 - top, ((y1 - y0) / pageHeight) * 100));
+              const width = Math.max(0.5, Math.min(100 - left, ((x1 - x0) / pageWidth) * 100));
+              const height = Math.max(0.5, Math.min(100 - top, ((y1 - y0) / pageHeight) * 100));
               return (
-                <span
-                  key={span.id}
-                  className="reader-text-span"
+                <button
+                  key={block.id}
+                  type="button"
+                  className="reader-block-hitbox"
+                  title={block.id + (block.review_required ? " · cần kiểm tra" : "")}
+                  aria-label={"Chỉnh " + block.id}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onSelect?.(block);
+                  }}
                   style={{
                     left: `${left}%`,
                     top: `${top}%`,
                     width: `${width}%`,
                     height: `${height}%`,
-                    fontSize: `${Math.max(1, span.font_size) / pageWidth * 100}cqw`,
-                    fontWeight: span.bold ? 700 : 400,
-                    fontStyle: span.italic ? "italic" : "normal",
+                    border: block.id === selectedId
+                      ? "2px solid var(--accent)"
+                      : block.review_required
+                        ? "1px dashed #d97706"
+                        : "1px solid transparent",
+                    background: block.id === selectedId ? "rgba(37, 99, 235, .12)" : "transparent",
                   }}
-                >
-                  <span className="reader-text-glyph">{span.text}</span>
-                </span>
+                />
               );
             })}
           </div>
-        )}
-
-        {report?.blocks.map((block) => {
-          const [x0, y0, x1, y1] = block.box;
-          const left = Math.max(0, Math.min(100, (x0 / pageWidth) * 100));
-          const top = Math.max(0, Math.min(100, (y0 / pageHeight) * 100));
-          const width = Math.max(0.5, Math.min(100 - left, ((x1 - x0) / pageWidth) * 100));
-          const height = Math.max(0.5, Math.min(100 - top, ((y1 - y0) / pageHeight) * 100));
-          return (
-            <button
-              key={block.id}
-              type="button"
-              className="reader-block-hitbox"
-              title={block.id + (block.review_required ? " · cần kiểm tra" : "")}
-              aria-label={"Chỉnh " + block.id}
-              onClick={(event) => {
-                event.stopPropagation();
-                onSelect?.(block);
-              }}
-              style={{
-                left: `${left}%`,
-                top: `${top}%`,
-                width: `${width}%`,
-                height: `${height}%`,
-                border: block.id === selectedId
-                  ? "2px solid var(--accent)"
-                  : block.review_required
-                    ? "1px dashed #d97706"
-                    : "1px solid transparent",
-                background: block.id === selectedId ? "rgba(37, 99, 235, .12)" : "transparent",
-              }}
-            />
-          );
-        })}
+        </div>
       </div>
       {textPage && textPage.spans.length === 0 && (
         <small className="muted reader-no-text">Trang này không có lớp chữ để bôi đen (có thể là bản scan).</small>

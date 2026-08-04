@@ -10,6 +10,9 @@ export function validReaderPage(value: unknown, total: number): number | null {
 export const READER_ZOOM_MIN = 0.5;
 export const READER_ZOOM_MAX = 2.5;
 
+export type ReaderZoomSide = "source" | "translated";
+export type ReaderZoomBySide = Record<ReaderZoomSide, number>;
+
 export function clampReaderZoom(value: number): number {
   if (!Number.isFinite(value)) return 1;
   return Math.min(READER_ZOOM_MAX, Math.max(READER_ZOOM_MIN, value));
@@ -19,4 +22,14 @@ export function clampReaderZoom(value: number): number {
 export function readerZoomFromWheel(current: number, deltaY: number): number {
   if (!Number.isFinite(deltaY)) return clampReaderZoom(current);
   return clampReaderZoom(current * Math.exp(-deltaY * 0.002));
+}
+
+/** Update one document pane without coupling its zoom to the other pane. */
+export function setReaderPaneZoom(
+  current: Readonly<ReaderZoomBySide>,
+  side: ReaderZoomSide,
+  value: number
+): ReaderZoomBySide {
+  const next = clampReaderZoom(value);
+  return next === current[side] ? current : { ...current, [side]: next };
 }

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   clampReaderZoom,
   readerZoomFromWheel,
+  setReaderPaneZoom,
   validReaderPage,
 } from "./reader-page.js";
 
@@ -35,5 +36,21 @@ describe("reader zoom", () => {
     assert.ok(readerZoomFromWheel(1, 20) < 1);
     assert.equal(readerZoomFromWheel(2.5, -200), 2.5);
     assert.equal(readerZoomFromWheel(0.5, 200), 0.5);
+  });
+
+  it("updates source and translated pane zoom independently", () => {
+    const initial = { source: 1, translated: 1.4 };
+    const sourceChanged = setReaderPaneZoom(initial, "source", 1.8);
+    assert.deepEqual(sourceChanged, { source: 1.8, translated: 1.4 });
+    assert.deepEqual(initial, { source: 1, translated: 1.4 });
+
+    const translatedChanged = setReaderPaneZoom(
+      sourceChanged,
+      "translated",
+      readerZoomFromWheel(sourceChanged.translated, -20)
+    );
+    assert.equal(translatedChanged.source, 1.8);
+    assert.ok(translatedChanged.translated > 1.4);
+    assert.equal(setReaderPaneZoom(translatedChanged, "source", 99).source, 2.5);
   });
 });
