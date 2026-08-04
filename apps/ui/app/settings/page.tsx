@@ -88,8 +88,6 @@ export default function Settings() {
       await saveConfig({
         engine,
         model,
-        budget: cfg.budget ?? 100,
-        budget_warn: cfg.budget_warn ?? 90,
         posture: cfg.posture || "allowlist",
         vision: cfg.vision !== false,
         codex_batch: cfg.codex_batch ?? 25,
@@ -310,44 +308,6 @@ export default function Settings() {
           </p>
         </section>
 
-        <section className="card stack-4">
-          <h2>Ngân sách (theo dõi)</h2>
-          <div className="grid-2">
-            <div className="field">
-              <label>Ngân sách tháng (USD)</label>
-              <input
-                className="input num"
-                type="number"
-                value={cfg.budget ?? 100}
-                onChange={(e) =>
-                  setCfg((c) => ({
-                    ...(c || {}),
-                    budget: parseFloat(e.target.value) || 100,
-                  }))
-                }
-              />
-            </div>
-            <div className="field">
-              <label>Cảnh báo khi đạt (%)</label>
-              <select
-                className="input"
-                value={String(cfg.budget_warn ?? 90)}
-                onChange={(e) =>
-                  setCfg((c) => ({
-                    ...(c || {}),
-                    budget_warn: parseInt(e.target.value) || 90,
-                  }))
-                }
-              >
-                {[70, 80, 90, 95].map((n) => (
-                  <option key={n} value={n}>
-                    {n}%
-                  </option>
-                ))}
-              </select>
-            </div>
-          </div>
-        </section>
       </div>
     </>
   );

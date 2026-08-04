@@ -270,7 +270,6 @@ export function createApp() {
       if (body.agents < 1 || body.agents > 10) delete patch.agents;
       else patch.agents = Math.floor(body.agents);
     }
-    if (typeof body.budget === "number" && body.budget < 0) delete patch.budget;
     if (typeof body.posture === "string" && !POSTURES.includes(body.posture)) {
       delete patch.posture;
     }

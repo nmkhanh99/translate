@@ -102,6 +102,16 @@ describe("normalizeConfig", () => {
     const c = normalizeConfig({ engine: "claude", model: "claude-opus-4-6" });
     assert.equal(c.model, "claude-opus-4-6");
   });
+  it("drops removed budget fields from legacy config and patch payloads", () => {
+    const legacy = { ...DEFAULT_CFG, budget: 250, budget_warn: 95 };
+    const normalized = normalizeConfig(legacy);
+    assert.equal("budget" in normalized, false);
+    assert.equal("budget_warn" in normalized, false);
+
+    const patched = applyConfigPatch(legacy, { budget: 500, budget_warn: 70 });
+    assert.equal("budget" in patched, false);
+    assert.equal("budget_warn" in patched, false);
+  });
 });
 
 describe("applyConfigPatch engine-only POST (EngineSwitch + /api/config)", () => {

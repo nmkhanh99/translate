@@ -17,8 +17,6 @@ export const DEFAULT_CFG: Required<
     | "vision"
     | "codex_batch"
     | "agents"
-    | "budget"
-    | "budget_warn"
   >
 > = {
   engine: "claude",
@@ -27,8 +25,6 @@ export const DEFAULT_CFG: Required<
   vision: true,
   codex_batch: 25,
   agents: 3,
-  budget: 100,
-  budget_warn: 90,
 };
 
 export const ENGINES: EngineId[] = ["claude", "codex", "grok"];
@@ -53,9 +49,12 @@ export function modelsByEngine(
 export function normalizeConfig(cfg: AppConfig): AppConfig {
   const engine = isEngineId(cfg.engine) ? cfg.engine : DEFAULT_CFG.engine;
   return {
-    ...cfg,
     engine,
     model: normalizeModel(engine, cfg.model),
+    posture: cfg.posture,
+    vision: cfg.vision,
+    codex_batch: cfg.codex_batch,
+    agents: cfg.agents,
   };
 }
 
@@ -85,8 +84,6 @@ export function applyConfigPatch(
   if ("vision" in body) next.vision = !!body.vision;
   if (typeof body.codex_batch === "number") next.codex_batch = body.codex_batch;
   if (typeof body.agents === "number") next.agents = body.agents;
-  if (typeof body.budget === "number") next.budget = body.budget;
-  if (typeof body.budget_warn === "number") next.budget_warn = body.budget_warn;
   return normalizeConfig(next);
 }
 

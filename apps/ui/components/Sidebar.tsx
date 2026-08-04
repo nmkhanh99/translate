@@ -9,7 +9,6 @@ import {
   IconQueue,
   IconSettings,
 } from "./icons";
-import { UsageWidget } from "./UsageWidget";
 
 const WORK = [
   { href: "/", label: "Trang chủ", Icon: IconHome },
@@ -63,9 +62,6 @@ export function Sidebar() {
           </Link>
         ))}
       </nav>
-      <div className="side-foot">
-        <UsageWidget />
-      </div>
     </aside>
   );
 }

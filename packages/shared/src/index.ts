@@ -156,8 +156,6 @@ export type ChatSseEvent =
 export interface AppConfig {
   engine?: EngineId | string;
   model?: string;
-  budget?: number;
-  budget_warn?: number;
   vision?: boolean;
   posture?: "allowlist" | "bypass" | string;
   codex_batch?: number;
