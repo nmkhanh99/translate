@@ -15,12 +15,15 @@ Quy trình 1 volume:
 Cache text2vi.json đặt trong workdir, có thể tái dùng giữa các bước/đổi tool.
 """
 import glob
+import fcntl
 import hashlib
 import json
 import os
 import re
+import signal
 import shutil
 import sys
+import time
 
 import fitz
 import pdf_core
@@ -181,6 +184,22 @@ def _ensure_artifact_manifest(pdf, workdir, translation_context=None):
     }
     _write_json_atomic(path, manifest)
     return {"invalidation": invalidation, "removed": removed, "manifest": manifest}
+
+
+def _assert_artifact_source_current(pdf, workdir):
+    """Read-only provenance gate for an edit of an existing rendered baseline.
+
+    Unlike `_ensure_artifact_manifest`, this must never invalidate artifacts:
+    a rejected block edit is not authority to delete the last usable report.
+    """
+    pdf = os.path.abspath(pdf)
+    manifest = _load(_wd(workdir, "artifact-manifest.json"), {})
+    old_source = manifest.get("source", {}) if isinstance(manifest, dict) else {}
+    expected = old_source.get("sha256")
+    if not isinstance(expected, str) or not expected:
+        raise _partial_render_error("artifact manifest thiếu SHA-256 của PDF nguồn")
+    if _sha256_file(pdf) != expected:
+        raise _partial_render_error("PDF nguồn đã thay đổi")
 
 
 def cmd_prepare(pdf, workdir, context_json="{}"):
@@ -571,7 +590,17 @@ def _fix_lookup(fixes, sid, en):
     return None  # id đã trỏ sang đoạn khác -> override hết hiệu lực
 
 
-def cmd_apply(pdf, workdir, out):
+def cmd_apply(pdf, workdir, out, fixes_override=None, report_out=None):
+    """Whole-document apply, serialized with partial-page writers."""
+    handle = _acquire_block_update_lock(workdir)
+    try:
+        _recover_block_update_transaction(workdir, out)
+        return _cmd_apply(pdf, workdir, out, fixes_override, report_out)
+    finally:
+        _release_block_update_lock(workdir, handle)
+
+
+def _cmd_apply(pdf, workdir, out, fixes_override=None, report_out=None):
     prepared = _ensure_artifact_manifest(pdf, workdir)
     if prepared["invalidation"]:
         print(f"  (artifact invalidation={prepared['invalidation']} before apply)")
@@ -580,7 +609,8 @@ def cmd_apply(pdf, workdir, out):
     # id (không phải EN) nên chỉ đổi đúng đoạn trên trang bị lỗi — các trang khác
     # dùng cùng chuỗi EN KHÔNG bị ảnh hưởng (điều kiện để only-vision hợp lệ) — và
     # sống sót qua merge-tr/merge-vr/apply-all vì các bước đó chỉ ghi text2vi.
-    fixes = _load(_wd(workdir, "fixes.json"), {})
+    fixes = (fixes_override if fixes_override is not None
+             else _load(_wd(workdir, "fixes.json"), {}))
     doc = fitz.open(pdf)
     segs, layout = pdf_core.extract_segments(doc, "all")
     trans = {l["id"]: (_fix_lookup(fixes, l["id"], s["text"])
@@ -590,9 +620,13 @@ def cmd_apply(pdf, workdir, out):
                if not (_fix_lookup(fixes, l["id"], s["text"])
                        or text2vi.get(s["text"])))
     render_report = {}
+    layout_generation = hashlib.sha256(
+        f"{os.getpid()}-{time.time_ns()}".encode("ascii")
+    ).hexdigest()[:24]
     applied, m = pdf_core.apply_translations(
         doc, layout, trans, report=render_report
     )
+    render_report["layout_generation"] = layout_generation
     # Persist source/translation alongside fit telemetry for the block editor.
     source_by_id = {l["id"]: s["text"] for s, l in zip(segs, layout)}
     translation_by_id = {l["id"]: trans.get(l["id"], "") for l in layout}
@@ -600,56 +634,875 @@ def cmd_apply(pdf, workdir, out):
         sid = entry["id"]
         entry["source"] = source_by_id.get(sid, "")
         entry["translation"] = translation_by_id.get(sid, "")
-    _write_json_atomic(_wd(workdir, "render_report.json"), render_report)
     out_dir = os.path.dirname(out) or "."
     os.makedirs(out_dir, exist_ok=True)
     # Never leave a half-written PDF visible to the renderer after cancellation.
     tmp_out = f"{out}.tmp-{os.getpid()}"
-    doc.save(tmp_out, garbage=4, deflate=True)
-    os.replace(tmp_out, out)
-    print(f"applied={applied} missing={miss} fixes={len(fixes)} -> {out}")
-
-
-def _clear_visual_artifacts(workdir):
-    """A changed translation invalidates only visual review, not translation."""
-    removed = _remove_generated(
-        workdir,
-        ("vis", "review"),
-        ("review_issues.json", "vis_todo.json", "state.json", "render_report.json"),
+    try:
+        doc.save(tmp_out, garbage=4, deflate=True)
+        render_report["output_identity"] = _pdf_identity(tmp_out)
+        render_report["partial_render_state"] = {
+            "base_size": render_report["output_identity"]["size"],
+            "edits_since_compaction": 0,
+        }
+        os.replace(tmp_out, out)
+    finally:
+        doc.close()
+        if os.path.exists(tmp_out):
+            os.remove(tmp_out)
+    # Keep the previous report visible until its matching PDF is safely in place.
+    _write_json_atomic(report_out or _wd(workdir, "render_report.json"), render_report)
+    # `cmd_apply` re-extracts with the current engine. Keep the persisted global
+    # ID/geometry baseline in lock-step with that output; otherwise a later
+    # one-page edit could combine a fresh report with stale pre-upgrade layout.
+    _write_json_atomic(
+        _wd(workdir, "layout.json"),
+        {
+            "pdf": os.path.abspath(pdf),
+            "layout_generation": layout_generation,
+            "layout": layout,
+        },
     )
-    ws = _load_workset(workdir)
-    ws.pop("vision_gen", None)
-    _write_json_atomic(_wd(workdir, "workset.json"), ws)
+    print(f"applied={applied} missing={miss} fixes={len(fixes)} -> {out}")
+    return render_report
+
+
+def _partial_render_error(detail):
+    return RuntimeError(
+        "partial_render_unavailable: " + detail
+        + "; hãy tạo lại tách đoạn (chunk) rồi Apply để có baseline mới"
+    )
+
+
+def _pdf_identity(path):
+    """Strong identity coupling report state to one concrete PDF revision."""
+    doc = fitz.open(path)
+    try:
+        kind, trailer_id = doc.xref_get_key(-1, "ID")
+        if kind != "array" or not trailer_id:
+            raise _partial_render_error("PDF không có trailer ID")
+        return {
+            "trailer_id": trailer_id,
+            "size": os.path.getsize(path),
+            "sha256": _sha256_file(path),
+        }
+    finally:
+        doc.close()
+
+
+def _rects_match(left, right, tolerance=0.05):
+    if not isinstance(left, (list, tuple)) or not isinstance(right, (list, tuple)):
+        return False
+    if len(left) != 4 or len(right) != 4:
+        return False
+    try:
+        return all(abs(float(a) - float(b)) <= tolerance for a, b in zip(left, right))
+    except (TypeError, ValueError):
+        return False
+
+
+def _layout_values_match(left, right, tolerance=0.05):
+    """Tolerant recursive equality for JSON-like render geometry."""
+    if isinstance(left, bool) or isinstance(right, bool):
+        return left is right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return abs(float(left) - float(right)) <= tolerance
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        return len(left) == len(right) and all(
+            _layout_values_match(a, b, tolerance) for a, b in zip(left, right)
+        )
+    if isinstance(left, dict) and isinstance(right, dict):
+        return set(left) == set(right) and all(
+            _layout_values_match(left[key], right[key], tolerance) for key in left
+        )
+    return left == right
+
+
+def _load_partial_page_state(pdf, workdir, out, segment_id):
+    """Load the existing full-apply baseline without extracting every page.
+
+    `layout.json` owns the stable global segment IDs and render geometry;
+    `render_report.json` owns the exact translations currently visible in
+    `out`. Any disagreement is a fail-closed migration case, never a reason to
+    silently fall back to a whole-document apply.
+    """
+    _assert_artifact_source_current(pdf, workdir)
+
+    layout_path = _wd(workdir, "layout.json")
+    report_path = _wd(workdir, "render_report.json")
+    missing = [path for path in (out, layout_path, report_path) if not os.path.exists(path)]
+    if missing:
+        raise _partial_render_error(
+            "thiếu baseline " + ", ".join(os.path.basename(path) for path in missing)
+        )
+    try:
+        layout_doc = _load(layout_path, {})
+        report = _load(report_path, {})
+    except (OSError, json.JSONDecodeError, TypeError) as exc:
+        raise _partial_render_error("artifact baseline không đọc được") from exc
+    layout = layout_doc.get("layout") if isinstance(layout_doc, dict) else None
+    segments = report.get("segments") if isinstance(report, dict) else None
+    if not isinstance(layout, list) or not isinstance(segments, list):
+        raise _partial_render_error("layout/report không đúng schema")
+    missing_ids = report.get("missing_ids")
+    if not isinstance(missing_ids, list):
+        raise _partial_render_error("report thiếu missing_ids")
+    layout_ids = [item.get("id") for item in layout if isinstance(item, dict)]
+    report_ids = [entry.get("id") for entry in segments if isinstance(entry, dict)]
+    if (any(not isinstance(sid, str) or not sid
+            for sid in layout_ids + report_ids + missing_ids)
+            or len(layout_ids) != len(layout) or len(set(layout_ids)) != len(layout_ids)
+            or None in layout_ids or len(report_ids) != len(segments)
+            or len(set(report_ids)) != len(report_ids) or None in report_ids
+            or len(set(missing_ids)) != len(missing_ids)):
+        raise _partial_render_error("ID trong layout/report bị thiếu hoặc trùng")
+    applied_ids, missing_set = set(report_ids), set(missing_ids)
+    if (applied_ids & missing_set
+            or set(layout_ids) != applied_ids | missing_set
+            or report.get("applied") != len(segments)):
+        raise _partial_render_error("applied/missing_ids không phủ đúng layout")
+    layout_pdf = layout_doc.get("pdf")
+    if not isinstance(layout_pdf, str) or os.path.abspath(layout_pdf) != os.path.abspath(pdf):
+        raise _partial_render_error("layout không thuộc PDF nguồn hiện tại")
+    layout_generation = layout_doc.get("layout_generation")
+    report_generation = report.get("layout_generation")
+    if (not isinstance(layout_generation, str) or not layout_generation
+            or not isinstance(report_generation, str) or not report_generation
+            or layout_generation != report_generation):
+        raise _partial_render_error("layout/report không cùng generation")
+    expected_output = report.get("output_identity")
+    current_output_identity = _pdf_identity(out)
+    if not isinstance(expected_output, dict) or current_output_identity != expected_output:
+        raise _partial_render_error("render report không thuộc output PDF hiện tại")
+
+    selected = [entry for entry in segments if entry.get("id") == segment_id]
+    if len(selected) != 1:
+        raise _partial_render_error("segment không duy nhất trong render report")
+    target = selected[0]
+    try:
+        page_number = int(target["page"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise _partial_render_error("segment không có số trang hợp lệ") from exc
+    if page_number < 0:
+        raise _partial_render_error("số trang âm")
+
+    page_layout = [item for item in layout if item.get("page") == page_number]
+    page_segments = [entry for entry in segments if entry.get("page") == page_number]
+    layout_by_id = {item.get("id"): item for item in page_layout if item.get("id")}
+    report_by_id = {entry.get("id"): entry for entry in page_segments if entry.get("id")}
+    if (not page_layout or not page_segments
+            or len(layout_by_id) != len(page_layout)
+            or len(report_by_id) != len(page_segments)):
+        raise _partial_render_error("segment/layout của trang bị thiếu hoặc trùng ID")
+    for sid, entry in report_by_id.items():
+        item = layout_by_id.get(sid)
+        if item is None or not _rects_match(item.get("box"), entry.get("box")):
+            raise _partial_render_error(f"layout của {sid} không khớp report")
+        if not isinstance(entry.get("source"), str) or not entry["source"].strip():
+            raise _partial_render_error(f"report của {sid} thiếu source")
+        if not isinstance(entry.get("translation"), str) or not entry["translation"].strip():
+            raise _partial_render_error(f"report của {sid} thiếu translation")
+
+    cap = report.get("document_scale_cap")
+    if not isinstance(cap, (int, float)) or isinstance(cap, bool) or not 0 < cap <= 1:
+        raise _partial_render_error("document_scale_cap không hợp lệ")
+    verified_layout = None
+    source_by_id = None
+    try:
+        source_doc = fitz.open(pdf)
+        output_doc = fitz.open(out)
+        if (source_doc.page_count != output_doc.page_count
+                or source_doc.page_count != report.get("page_count")
+                or page_number >= source_doc.page_count):
+            raise _partial_render_error("page count của source/output/report không khớp")
+        source_rect = source_doc[page_number].rect
+        output_rect = output_doc[page_number].rect
+        if any(abs(a - b) > 0.05 for a, b in zip(source_rect, output_rect)):
+            raise _partial_render_error("kích thước trang source/output không khớp")
+
+        # Re-extract this page only. This independently verifies every
+        # render-critical field and source string while preserving global IDs
+        # from the full baseline. It catches stale/tampered redact/fx geometry
+        # without paying the cost of extracting the rest of the document.
+        fresh_segments, fresh_layout = pdf_core.extract_segments(source_doc, str(page_number))
+        if (len(fresh_segments) != len(fresh_layout)
+                or len(fresh_layout) != len(page_layout)):
+            raise _partial_render_error("segmentation của trang không còn khớp baseline")
+        verified_layout = []
+        source_by_id = {}
+        for saved, fresh_segment, fresh_item in zip(
+                page_layout, fresh_segments, fresh_layout):
+            sid = saved.get("id")
+            saved_shape = {key: value for key, value in saved.items()
+                           if key not in ("id", "page")}
+            fresh_shape = {key: value for key, value in fresh_item.items()
+                           if key not in ("id", "page")}
+            if not sid or not _layout_values_match(saved_shape, fresh_shape):
+                raise _partial_render_error("render geometry của trang không còn khớp baseline")
+            source_text = fresh_segment.get("text")
+            if not isinstance(source_text, str) or not source_text.strip():
+                raise _partial_render_error(f"source của {sid} không hợp lệ")
+            old_entry = report_by_id.get(sid)
+            if old_entry is not None and old_entry.get("source") != source_text:
+                raise _partial_render_error(f"source của {sid} không khớp report")
+            markers = re.findall(r"\{v(\d+)\}", source_text)
+            formula_count = len(fresh_item.get("fx") or [])
+            if markers != [str(index) for index in range(1, formula_count + 1)]:
+                raise _partial_render_error(f"marker/formula của {sid} không khớp")
+            verified_layout.append(dict(fresh_item, id=sid, page=page_number))
+            source_by_id[sid] = source_text
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise _partial_render_error("PDF source/output không đọc được") from exc
+    finally:
+        if "source_doc" in locals():
+            source_doc.close()
+        if "output_doc" in locals():
+            output_doc.close()
+
+    return {
+        "page": page_number,
+        "layout": verified_layout,
+        "report": report,
+        "page_segments": page_segments,
+        "selected": target,
+        "source_by_id": source_by_id,
+        "output_identity": current_output_identity,
+        "scale_cap": float(cap),
+    }
+
+
+def _render_partial_page(pdf, state, translations):
+    """Render exactly one clean source page; returned document stays open."""
+    source_doc = fitz.open(pdf)
+    rendered = fitz.open()
+    try:
+        pno = state["page"]
+        rendered.insert_pdf(
+            source_doc,
+            from_page=pno,
+            to_page=pno,
+            # Existing target-page navigation/annotations stay on its stable
+            # output page object; this temporary document only supplies content.
+            links=False,
+            annots=False,
+            widgets=False,
+        )
+    except BaseException:
+        rendered.close()
+        raise
+    finally:
+        source_doc.close()
+
+    local_layout = [dict(item, page=0) for item in state["layout"]]
+    partial_report = {}
+    try:
+        pdf_core.apply_translations(
+            rendered,
+            local_layout,
+            translations,
+            report=partial_report,
+            document_scale_cap=state["scale_cap"],
+        )
+    except BaseException:
+        rendered.close()
+        raise
+    return rendered, partial_report
+
+
+def _merge_partial_report(state, partial_report, translations):
+    """Replace target-page telemetry while preserving document-level truth."""
+    pno = state["page"]
+    old_report = state["report"]
+    old_page_by_id = {entry["id"]: entry for entry in state["page_segments"]}
+    new_page_by_id = {}
+    for entry in partial_report.get("segments", []):
+        sid = entry.get("id")
+        old = old_page_by_id.get(sid)
+        if old is None or sid in new_page_by_id:
+            raise _partial_render_error("telemetry trang mới không khớp baseline")
+        enriched = dict(entry)
+        enriched["page"] = pno
+        enriched["source"] = old["source"]
+        enriched["translation"] = translations[sid]
+        new_page_by_id[sid] = enriched
+    if set(new_page_by_id) != set(old_page_by_id):
+        raise _partial_render_error("số segment đã render trên trang bị thay đổi")
+
+    merged = dict(old_report)
+    merged["segments"] = [
+        new_page_by_id[entry["id"]] if entry.get("page") == pno else entry
+        for entry in old_report["segments"]
+    ]
+    merged["applied"] = len(merged["segments"])
+    merged["review_count"] = sum(
+        bool(entry.get("review_required")) for entry in merged["segments"]
+    )
+    return merged
+
+
+def _splice_page_contents_incrementally(current_pdf, staged_pdf, rendered_page, pno):
+    """Graft one rendered page without replacing its page-tree identity.
+
+    Keeping the target page xref preserves inbound links, outlines, named
+    destinations, labels, widgets and annotations. Only `/Contents` and
+    `/Resources` change; the temporary appended page merely imports their
+    referenced objects into the staged PDF. A normal/full save is deliberately
+    not used as a fallback.
+    """
+    shutil.copy2(current_pdf, staged_pdf)  # never hard-link: saveIncr mutates in place
+    doc = fitz.open(staged_pdf)
+    original_count = doc.page_count
+    original_xrefs = [page.xref for page in doc]
+    try:
+        if pno < 0 or pno >= original_count or rendered_page.page_count != 1:
+            raise _partial_render_error("trang ghép không hợp lệ")
+        if any(abs(a - b) > 0.05
+               for a, b in zip(doc[pno].rect, rendered_page[0].rect)):
+            raise _partial_render_error("kích thước trang ghép không khớp")
+        target_xref = doc.page_xref(pno)
+        doc.insert_pdf(
+            rendered_page,
+            from_page=0,
+            to_page=0,
+            start_at=original_count,
+            links=False,
+            annots=False,
+            widgets=False,
+        )
+        appended_xref = doc.page_xref(original_count)
+        for key in ("Contents", "Resources"):
+            kind, value = doc.xref_get_key(appended_xref, key)
+            if kind == "null" or not value:
+                raise _partial_render_error(f"trang render thiếu /{key}")
+            doc.xref_set_key(target_xref, key, value)
+        doc.delete_page(original_count)  # delete only the temporary tail page
+        if doc.page_count != original_count:
+            raise _partial_render_error("page count thay đổi khi ghép")
+        if not doc.can_save_incrementally():
+            raise _partial_render_error("PDF không hỗ trợ incremental save")
+        doc.saveIncr()
+    finally:
+        doc.close()
+
+    check_doc = fitz.open(staged_pdf)
+    try:
+        if (check_doc.page_count != original_count
+                or [page.xref for page in check_doc] != original_xrefs):
+            raise _partial_render_error("PDF ghép lại không giữ nguyên page tree")
+    finally:
+        check_doc.close()
+
+
+def _compact_partial_output(staged_pdf):
+    """Bound incremental growth without re-rendering or renumbering page objects.
+
+    `garbage=1` removes unreachable graft objects but preserves xrefs. Higher
+    garbage levels deliberately are not used because they can renumber pages,
+    links and annotations. Failure is non-fatal: the already valid incremental
+    staged PDF remains available for this edit.
+    """
+    compact_pdf = staged_pdf + ".compact.pdf"
+    try:
+        doc = fitz.open(staged_pdf)
+        try:
+            original_count = doc.page_count
+            original_xrefs = [page.xref for page in doc]
+            doc.save(compact_pdf, garbage=1, deflate=False)
+        finally:
+            doc.close()
+        with open(compact_pdf, "rb") as compacted:
+            os.fsync(compacted.fileno())
+        check = fitz.open(compact_pdf)
+        try:
+            if (check.page_count != original_count
+                    or [page.xref for page in check] != original_xrefs):
+                raise RuntimeError("compaction changed PDF page identity")
+        finally:
+            check.close()
+        os.replace(compact_pdf, staged_pdf)
+        _fsync_parent(staged_pdf)
+        print(f"  (partial PDF maintenance compacted to {os.path.getsize(staged_pdf)} bytes)")
+        return True
+    except _BlockUpdateInterrupted:
+        raise
+    except Exception as exc:
+        print(f"  (partial PDF maintenance deferred: {exc})", file=sys.stderr)
+        return False
+    finally:
+        _remove_quietly(compact_pdf)
+
+
+def _maintain_partial_output(state, staged_pdf):
+    """Compact occasionally; never turn one block edit into a document render."""
+    current_size = state["output_identity"]["size"]
+    raw = state["report"].get("partial_render_state")
+    if isinstance(raw, dict):
+        base_size = raw.get("base_size")
+        edits = raw.get("edits_since_compaction")
+    else:
+        base_size = edits = None
+    if (not isinstance(base_size, int) or isinstance(base_size, bool)
+            or base_size <= 0 or base_size > current_size
+            or not isinstance(edits, int) or isinstance(edits, bool) or edits < 0):
+        base_size = current_size
+        edits = 0
+
+    edits += 1
+    staged_size = os.path.getsize(staged_pdf)
+    due = (
+        edits >= PARTIAL_COMPACT_EDIT_THRESHOLD
+        or staged_size - base_size >= PARTIAL_COMPACT_GROWTH_THRESHOLD
+    )
+    if due and _compact_partial_output(staged_pdf):
+        return {
+            "base_size": os.path.getsize(staged_pdf),
+            "edits_since_compaction": 0,
+        }
+    return {"base_size": base_size, "edits_since_compaction": edits}
+
+
+def _clear_visual_artifacts(workdir, page=None, output=None):
+    """Invalidate review data for the changed page, not the whole volume."""
+    if page is None:
+        removed = _remove_generated(
+            workdir,
+            ("vis", "review"),
+            ("review_issues.json", "vis_todo.json", "state.json"),
+        )
+        ws = _load_workset(workdir)
+        ws.pop("vision_gen", None)
+        _write_json_atomic(_wd(workdir, "workset.json"), ws)
+        return removed
+
+    page = int(page)
+    removed = []
+    for path in (
+        _wd(workdir, "vis", f"page_{page:03d}.json"),
+        _wd(workdir, "review", f"pair_{page:03d}.png"),
+        _wd(workdir, "fix", f"page_{page:03d}.json"),
+        _wd(workdir, "fix", f"page_{page:03d}_issues.json"),
+        _wd(workdir, "fixout", f"page_{page:03d}.json"),
+    ):
+        if os.path.exists(path):
+            os.remove(path)
+            removed.append(os.path.relpath(path, workdir))
+
+    issues_path = _wd(workdir, "review_issues.json")
+    if os.path.exists(issues_path):
+        issues = _load_checkpoint(issues_path)
+        if isinstance(issues, list):
+            kept = [entry for entry in issues
+                    if not isinstance(entry, dict) or entry.get("page") != page]
+            if kept != issues:
+                _write_json_atomic(issues_path, kept)
+                removed.append("review_issues.json[target-page]")
+        else:
+            os.remove(issues_path)
+            removed.append("review_issues.json")
+
+    # Keep state.json: the daemon uses its vision denominator when the source
+    # path stored in layout.json is not resolvable from the daemon cwd. Removing
+    # it after deleting one pair can make N-1 cached pairs look like an N-1 page
+    # completed document. The per-page vis checkpoint below already makes the
+    # stage incomplete while preserving the true denominator.
+    for name in ("vis_todo.json", "defect_clusters.json"):
+        path = _wd(workdir, name)
+        if os.path.exists(path):
+            os.remove(path)
+            removed.append(name)
+
+    # A manual edit reopens this page: an older won't-fix decision must not hide
+    # a newly introduced defect when the page is reviewed again.
+    accepted_path = _wd(workdir, "accepted.json")
+    accepted = _load_checkpoint(accepted_path) if os.path.exists(accepted_path) else None
+    if isinstance(accepted, dict):
+        old_pages = accepted.get("pages") if isinstance(accepted.get("pages"), list) else []
+        old_notes = accepted.get("notes") if isinstance(accepted.get("notes"), dict) else {}
+        new_pages = [value for value in old_pages if value != page]
+        new_notes = {key: value for key, value in old_notes.items() if str(key) != str(page)}
+        if new_pages != old_pages or new_notes != old_notes:
+            accepted = dict(accepted)
+            accepted["pages"] = new_pages
+            accepted["notes"] = new_notes
+            _write_json_atomic(accepted_path, accepted)
+            removed.append("accepted.json[target-page]")
+
+    # `vis-pages` uses output mtime as a stale gate. The other pages are proven
+    # unchanged by the content-only splice, so advance only their cached pair
+    # mtimes; otherwise one block edit would queue the whole document again.
+    if output and os.path.exists(output):
+        stamp = os.path.getmtime(output)
+        target_name = f"pair_{page:03d}.png"
+        for path in glob.glob(_wd(workdir, "review", "pair_*.png")):
+            if os.path.basename(path) != target_name:
+                os.utime(path, (stamp, stamp))
     return removed
 
 
+BLOCK_UPDATE_LOCK_FILE = "block-update.lock.json"
+BLOCK_UPDATE_TXN_FILE = "block-update.txn.json"
+PARTIAL_COMPACT_EDIT_THRESHOLD = 32
+PARTIAL_COMPACT_GROWTH_THRESHOLD = 64 * 1024 * 1024
+
+
+class _BlockUpdateInterrupted(RuntimeError):
+    """SIGTERM that must pass through broad OSError/maintenance fallbacks."""
+
+
+def _block_transaction_paths(workdir, out, token):
+    report = _wd(workdir, "render_report.json")
+    fixes = _wd(workdir, "fixes.json")
+    return {
+        "out": out,
+        "report": report,
+        "fixes": fixes,
+        "staged_out": out + token,
+        "staged_report": report + token,
+        "staged_fixes": fixes + token,
+        "backup_out": out + token + ".bak",
+        "backup_report": report + token + ".bak",
+        "backup_fixes": fixes + token + ".bak",
+    }
+
+
+def _fsync_parent(path):
+    """Persist directory-entry changes where the platform supports it."""
+    fd = None
+    try:
+        fd = os.open(os.path.dirname(os.path.abspath(path)) or ".", os.O_RDONLY)
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _durable_copy(source, destination):
+    shutil.copy2(source, destination)
+    with open(destination, "rb") as copied:
+        os.fsync(copied.fileno())
+    _fsync_parent(destination)
+
+
+def _remove_quietly(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def _recover_block_update_transaction(workdir, out):
+    """Rollback an interrupted multi-file commit before exposing its state."""
+    journal_path = _wd(workdir, BLOCK_UPDATE_TXN_FILE)
+    if not os.path.exists(journal_path):
+        # A crash after removing the journal but before deleting backups leaves
+        # only harmless private files. Clean them while the writer flock is held.
+        for pattern in (
+            out + ".block-*",
+            _wd(workdir, "render_report.json.block-*"),
+            _wd(workdir, "fixes.json.block-*"),
+        ):
+            for path in glob.glob(pattern):
+                _remove_quietly(path)
+        return False
+    journal = _load_checkpoint(journal_path)
+    if not isinstance(journal, dict) or journal.get("version") != 1:
+        raise RuntimeError("block-update transaction journal không hợp lệ")
+    token = journal.get("token")
+    if not isinstance(token, str) or not re.fullmatch(r"\.block-\d+-\d+", token):
+        raise RuntimeError("block-update transaction token không hợp lệ")
+    if os.path.abspath(str(journal.get("out") or "")) != os.path.abspath(out):
+        raise RuntimeError("block-update transaction không thuộc output hiện tại")
+    paths = _block_transaction_paths(workdir, out, token)
+    had = journal.get("had")
+    if not isinstance(had, dict):
+        raise RuntimeError("block-update transaction thiếu trạng thái cũ")
+
+    def restore(name, identity=None, sha256=None):
+        live = paths[name]
+        backup = paths["backup_" + name]
+        existed = had.get(name)
+        if not isinstance(existed, bool):
+            raise RuntimeError("block-update transaction had flag không hợp lệ")
+        if not existed:
+            _remove_quietly(live)
+            return
+        if os.path.exists(backup):
+            os.replace(backup, live)
+            return
+        # Recovery itself may have died after restoring this one file. Accept
+        # the live artifact only when it proves to be the recorded old version.
+        if not os.path.exists(live):
+            raise RuntimeError(f"không thể recover {name}: thiếu backup")
+        if identity is not None and _pdf_identity(live) == identity:
+            return
+        if sha256 is not None and _sha256_file(live) == sha256:
+            return
+        raise RuntimeError(f"không thể recover {name}: live không khớp baseline")
+
+    restore("out", identity=journal.get("old_output_identity"))
+    restore("report", sha256=journal.get("old_report_sha256"))
+    restore("fixes", sha256=journal.get("old_fixes_sha256"))
+    for key in ("staged_out", "staged_report", "staged_fixes",
+                "backup_out", "backup_report", "backup_fixes"):
+        _remove_quietly(paths[key])
+    # Make every restored rename durable before deleting the recovery record.
+    # `out` normally lives outside workdir, so flushing only the journal parent
+    # could otherwise expose a mixed PDF/report state after a power loss.
+    _fsync_parent(out)
+    _fsync_parent(paths["report"])
+    _remove_quietly(journal_path)
+    _fsync_parent(journal_path)
+    print("  (recovered interrupted block-update transaction)")
+    return True
+
+
+def _process_alive(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _acquire_block_update_lock(workdir):
+    """Cross-process writer lock backed by a live advisory file lock.
+
+    The JSON PID remains useful to the daemon UI, while `flock` is the actual
+    concurrency primitive. A dead process releases the kernel lock even if its
+    path survives, avoiding stale-lock unlink races.
+    """
+    os.makedirs(workdir, exist_ok=True)
+    path = _wd(workdir, BLOCK_UPDATE_LOCK_FILE)
+    token = f"{os.getpid()}-{time.time_ns()}"
+    payload = json.dumps({
+        "pid": os.getpid(),
+        "token": token,
+        "started_at": time.time(),
+    }).encode("utf-8")
+    for _attempt in range(4):
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError("đang có một lần ghi PDF khác") from exc
+            # A previous owner may have unlinked this inode while we waited.
+            # Never claim an unlinked lock: retry against the current path.
+            try:
+                live = os.stat(path)
+            except FileNotFoundError:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+                continue
+            held = os.fstat(fd)
+            if (live.st_dev, live.st_ino) != (held.st_dev, held.st_ino):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+                continue
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, payload)
+            os.fsync(fd)
+            return {"token": token, "fd": fd, "path": path}
+        except BaseException:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
+            raise
+    raise RuntimeError("không lấy được khóa lưu block")
+
+
+def _release_block_update_lock(workdir, handle):
+    if not isinstance(handle, dict):
+        return
+    path = handle.get("path") or _wd(workdir, BLOCK_UPDATE_LOCK_FILE)
+    token = handle.get("token")
+    fd = handle.get("fd")
+    try:
+        if not isinstance(fd, int):
+            return
+        try:
+            held = os.fstat(fd)
+            live = os.stat(path)
+            os.lseek(fd, 0, os.SEEK_SET)
+            current = json.loads(os.read(fd, 4096).decode("utf-8"))
+            if ((live.st_dev, live.st_ino) == (held.st_dev, held.st_ino)
+                    and current.get("token") == token):
+                os.remove(path)
+        except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeDecodeError):
+            pass
+    finally:
+        if isinstance(fd, int):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
 def cmd_block_update(pdf, workdir, out, segment_id, translation):
-    """Persist one user override, re-render atomically, and emit its report."""
+    handle = _acquire_block_update_lock(workdir)
+    try:
+        _recover_block_update_transaction(workdir, out)
+        return _cmd_block_update(pdf, workdir, out, segment_id, translation)
+    finally:
+        _release_block_update_lock(workdir, handle)
+
+
+def cmd_recover_block_update(workdir, out):
+    """Daemon/startup hook for recovery after SIGKILL or power loss."""
+    handle = _acquire_block_update_lock(workdir)
+    try:
+        recovered = _recover_block_update_transaction(workdir, out)
+    finally:
+        _release_block_update_lock(workdir, handle)
+    result = {"recovered": bool(recovered)}
+    print(json.dumps(result))
+    return result
+
+
+def _cmd_block_update(pdf, workdir, out, segment_id, translation):
+    """Persist one override and atomically re-render only its containing page."""
     if not segment_id or not isinstance(translation, str) or not translation.strip():
         raise ValueError("segment_id/translation rỗng")
-    doc = fitz.open(pdf)
-    segs, layout = pdf_core.extract_segments(doc, "all")
-    source = None
-    for s, item in zip(segs, layout):
-        if item.get("id") == segment_id:
-            source = s["text"]
-            break
-    if source is None:
-        doc.close()
-        raise ValueError("segment không tồn tại trong PDF nguồn hiện tại")
+    state = _load_partial_page_state(pdf, workdir, out, segment_id)
+    source = state["source_by_id"][segment_id]
     fixed = pdf_core.check_markers(source, translation)
     if fixed is None:
-        doc.close()
         raise ValueError("bản dịch làm mất hoặc sai marker công thức/định dạng")
-    fixes = _load(_wd(workdir, "fixes.json"), {})
+    fixes_path = _wd(workdir, "fixes.json")
+    report_path = _wd(workdir, "render_report.json")
+    fixes = _load(fixes_path, {})
+    if not isinstance(fixes, dict):
+        raise ValueError("fixes.json không hợp lệ")
     fixes[segment_id] = {"en": source, "vi": fixed}
-    _write_json_atomic(_wd(workdir, "fixes.json"), fixes)
-    doc.close()
-    _clear_visual_artifacts(workdir)
-    cmd_apply(pdf, workdir, out)
-    report = _load(_wd(workdir, "render_report.json"), {})
+    translations = {
+        entry["id"]: (fixed if entry["id"] == segment_id else entry["translation"])
+        for entry in state["page_segments"]
+    }
+
+    # Build every replacement off to the side. The PDF is committed last, so a
+    # render timeout cannot expose a new PDF without its matching report/fixes.
+    token = f".block-{os.getpid()}-{time.time_ns()}"
+    tx_paths = _block_transaction_paths(workdir, out, token)
+    staged_out = tx_paths["staged_out"]
+    staged_report = tx_paths["staged_report"]
+    staged_fixes = tx_paths["staged_fixes"]
+    backup_report = tx_paths["backup_report"]
+    backup_fixes = tx_paths["backup_fixes"]
+    backup_out = tx_paths["backup_out"]
+    staged_paths = (staged_out, staged_report, staged_fixes)
+    backup_paths = (backup_out, backup_report, backup_fixes)
+    journal_path = _wd(workdir, BLOCK_UPDATE_TXN_FILE)
+    for path in staged_paths + backup_paths:
+        if os.path.exists(path):
+            os.remove(path)
+
+    report = None
+    had_out = os.path.exists(out)
+    had_report = os.path.exists(report_path)
+    had_fixes = os.path.exists(fixes_path)
+    previous_sigterm = None
+    sigterm_handler_installed = False
+    journal_written = False
+
+    def interrupt_block_update(_signum, _frame):
+        # execFile timeout uses SIGTERM. Convert it into a Python exception so
+        # the transaction below can restore every live artifact before exit.
+        raise _BlockUpdateInterrupted("block update interrupted")
+
+    try:
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, interrupt_block_update)
+        sigterm_handler_installed = True
+    except (AttributeError, ValueError):
+        # SIGTERM is available on the macOS product path. A non-main-thread
+        # library caller cannot install handlers, but still gets OSError rollback.
+        pass
+
+    try:
+        rendered_page, partial_report = _render_partial_page(pdf, state, translations)
+        try:
+            report = _merge_partial_report(state, partial_report, translations)
+            _splice_page_contents_incrementally(
+                out, staged_out, rendered_page, state["page"]
+            )
+            report["partial_render_state"] = _maintain_partial_output(state, staged_out)
+            # saveIncr closes the PDF correctly, but a directory fsync after the
+            # later rename cannot make unwritten file data durable. Flush this
+            # exact staged revision before its identity enters the journal/report.
+            with open(staged_out, "rb") as staged_pdf:
+                os.fsync(staged_pdf.fileno())
+            staged_identity = _pdf_identity(staged_out)
+            report["output_identity"] = staged_identity
+        finally:
+            rendered_page.close()
+        _write_json_atomic(staged_report, report)
+        _write_json_atomic(staged_fixes, fixes)
+
+        # Prepare durable old versions, then publish a write-ahead journal before
+        # the first live rename. A dead process is rolled back by the next writer
+        # (and by the daemon recovery hook) instead of leaking a partial commit.
+        if had_report:
+            _durable_copy(report_path, backup_report)
+        if had_fixes:
+            _durable_copy(fixes_path, backup_fixes)
+        if had_out:
+            try:
+                os.link(out, backup_out)
+                _fsync_parent(backup_out)
+            except OSError:
+                _durable_copy(out, backup_out)
+        journal = {
+            "version": 1,
+            "token": token,
+            "out": os.path.abspath(out),
+            "had": {"out": had_out, "report": had_report, "fixes": had_fixes},
+            "old_output_identity": state["output_identity"] if had_out else None,
+            "old_report_sha256": _sha256_file(report_path) if had_report else None,
+            "old_fixes_sha256": _sha256_file(fixes_path) if had_fixes else None,
+        }
+        _write_json_atomic(journal_path, journal)
+        _fsync_parent(journal_path)
+        journal_written = True
+        try:
+            os.replace(staged_fixes, fixes_path)
+            os.replace(staged_report, report_path)
+            os.replace(staged_out, out)
+            _fsync_parent(out)
+            _fsync_parent(report_path)
+            _clear_visual_artifacts(workdir, page=state["page"], output=out)
+            os.remove(journal_path)  # commit point: recovery now keeps new state
+            _fsync_parent(journal_path)
+            journal_written = False
+        except BaseException:
+            _recover_block_update_transaction(workdir, out)
+            journal_written = False
+            raise
+    finally:
+        # If recovery itself failed, retain journal/backups for a later retry.
+        if not journal_written and not os.path.exists(journal_path):
+            for path in staged_paths + backup_paths:
+                _remove_quietly(path)
+        if sigterm_handler_installed:
+            signal.signal(signal.SIGTERM, previous_sigterm)
+
+    report = report or {}
     selected = next((x for x in report.get("segments", []) if x.get("id") == segment_id), None)
     result = {"id": segment_id, "translation": fixed, "segment": selected}
+    print(
+        f"partial-render page={state['page']} blocks={len(state['page_segments'])} "
+        f"of document_pages={report.get('page_count')}"
+    )
     print(json.dumps(result, ensure_ascii=False))
     return result
 
@@ -1741,6 +2594,7 @@ if __name__ == "__main__":
         "merge-vr": lambda: cmd_merge_vr(a[0]),
         "apply": lambda: cmd_apply(a[0], a[1], a[2]),
         "block-update": lambda: cmd_block_update(a[0], a[1], a[2], a[3], a[4]),
+        "recover-block-update": lambda: cmd_recover_block_update(a[0], a[1]),
         "status": lambda: cmd_status(a[0]),
         "vis-pages": lambda: cmd_vis_pages(a[0], a[1], a[2], only=(a[3] if len(a) > 3 else None)),
         "merge-vis": lambda: cmd_merge_vis(a[0]),

@@ -6,7 +6,16 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { resolveEngine, shouldUsePipelineRunner } from "./runs.js";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  beginBlockUpdate,
+  endBlockUpdate,
+  isVolumeBusy,
+  resolveEngine,
+  shouldUsePipelineRunner,
+} from "./runs.js";
 
 describe("resolveEngine", () => {
   it("override wins over pref and global", () => {
@@ -61,6 +70,76 @@ describe("shouldUsePipelineRunner", () => {
     assert.equal(shouldUsePipelineRunner("codex", undefined, true), true);
     assert.equal(shouldUsePipelineRunner("grok", null, true), true);
     assert.equal(shouldUsePipelineRunner("claude", undefined, true), true);
+  });
+});
+
+describe("block update lock", () => {
+  it("prevents a pipeline or second save from starting for the same volume", () => {
+    const workdir = mkdtempSync(join(tmpdir(), "cfa-block-lock-"));
+    const vol = {
+      tag: "block-lock-test",
+      display: "Block lock test",
+      pdf: join(workdir, "source.pdf"),
+      out: join(workdir, "output.pdf"),
+      workdir,
+    };
+    try {
+      assert.equal(beginBlockUpdate(vol), true);
+      assert.equal(isVolumeBusy(vol), true);
+      assert.equal(beginBlockUpdate(vol), false);
+      endBlockUpdate(vol.tag);
+      assert.equal(isVolumeBusy(vol), false);
+    } finally {
+      endBlockUpdate(vol.tag);
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  });
+
+  it("honours a live Python renderer lock after a daemon restart", () => {
+    const workdir = mkdtempSync(join(tmpdir(), "cfa-block-persisted-lock-"));
+    const vol = {
+      tag: "persisted-block-lock-test",
+      display: "Persisted block lock test",
+      pdf: join(workdir, "source.pdf"),
+      out: join(workdir, "output.pdf"),
+      workdir,
+    };
+    try {
+      writeFileSync(
+        join(workdir, "block-update.lock.json"),
+        JSON.stringify({ pid: process.pid, token: "test" }),
+        "utf8"
+      );
+      assert.equal(isVolumeBusy(vol), true);
+      assert.equal(beginBlockUpdate(vol), false);
+    } finally {
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  });
+
+  it("stays busy when an interrupted transaction cannot be recovered", () => {
+    const workdir = mkdtempSync(join(tmpdir(), "cfa-block-recovery-failed-"));
+    const vol = {
+      tag: "failed-block-recovery-test",
+      display: "Failed block recovery test",
+      pdf: join(workdir, "source.pdf"),
+      out: join(workdir, "output.pdf"),
+      workdir,
+    };
+    const journal = join(workdir, "block-update.txn.json");
+    try {
+      writeFileSync(
+        join(workdir, "block-update.lock.json"),
+        JSON.stringify({ pid: 2_147_483_647, token: "stale" }),
+        "utf8"
+      );
+      writeFileSync(journal, "{bad", "utf8");
+      assert.equal(isVolumeBusy(vol), true);
+      assert.equal(existsSync(journal), true);
+      assert.equal(beginBlockUpdate(vol), false);
+    } finally {
+      rmSync(workdir, { recursive: true, force: true });
+    }
   });
 });
 

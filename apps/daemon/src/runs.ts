@@ -1,4 +1,12 @@
-import { mkdirSync, openSync, closeSync, writeSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  statSync,
+  writeSync,
+} from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
@@ -73,6 +81,9 @@ export interface RunInfo {
 
 const RUNS = new Map<string, RunInfo>();
 const starting = new Set<string>();
+const blockUpdates = new Set<string>();
+const BLOCK_UPDATE_LOCK_FILE = "block-update.lock.json";
+const BLOCK_UPDATE_TXN_FILE = "block-update.txn.json";
 
 const TRANSLATION_PROMPT_VERSION = "cfa-translate-v3";
 
@@ -162,6 +173,61 @@ export function isVolumeRunning(vol: VolumeRec): boolean {
   return !!(meta && meta.mode === "running" && pidAlive(meta.pid));
 }
 
+function hasPersistedBlockUpdate(vol: VolumeRec): boolean {
+  const lockPath = join(vol.workdir, BLOCK_UPDATE_LOCK_FILE);
+  const journalPath = join(vol.workdir, BLOCK_UPDATE_TXN_FILE);
+  const hasLock = existsSync(lockPath);
+  const hasJournal = existsSync(journalPath);
+  if (!hasLock && !hasJournal) return false;
+  if (hasLock) {
+    try {
+      const lock = JSON.parse(readFileSync(lockPath, "utf8")) as { pid?: unknown };
+      if (pidAlive(lock.pid)) return true;
+    } catch {
+      // Python truncates then rewrites this file while holding the flock. Treat a
+      // fresh partial payload as busy instead of racing that live writer.
+      try {
+        if (Date.now() - statSync(lockPath).mtimeMs < 30_000) return true;
+      } catch {
+        // The path disappeared between checks; the recovery helper below is the
+        // authoritative cross-process test if a journal is still present.
+      }
+    }
+  }
+  // Do not unlink a stale-looking path here. The Python helper acquires the real
+  // advisory flock before recovery / stale-file cleanup. Recovery failure is
+  // fail-closed: an unresolved journal must continue blocking every writer.
+  return !recoverInterruptedBlockUpdate(vol);
+}
+
+/** Roll back a journaled partial commit left by a killed Python writer. */
+export function recoverInterruptedBlockUpdate(vol: VolumeRec): boolean {
+  const journal = join(vol.workdir, BLOCK_UPDATE_TXN_FILE);
+  const lock = join(vol.workdir, BLOCK_UPDATE_LOCK_FILE);
+  if (!existsSync(journal) && !existsSync(lock)) return true;
+  const r = spawnSync(
+    pythonBin(),
+    [join(PYTHON_DIR, "agent_pipeline.py"), "recover-block-update", vol.workdir, vol.out],
+    { cwd: PYTHON_DIR, encoding: "utf8", timeout: 30_000 },
+  );
+  return r.status === 0 && !existsSync(journal) && !existsSync(lock);
+}
+
+export function isVolumeBusy(vol: VolumeRec): boolean {
+  return starting.has(vol.tag) || blockUpdates.has(vol.tag) ||
+    hasPersistedBlockUpdate(vol) || isVolumeRunning(vol);
+}
+
+export function beginBlockUpdate(vol: VolumeRec): boolean {
+  if (isVolumeBusy(vol)) return false;
+  blockUpdates.add(vol.tag);
+  return true;
+}
+
+export function endBlockUpdate(tag: string): void {
+  blockUpdates.delete(tag);
+}
+
 export function launchVolume(
   vol: VolumeRec,
   cfg: AppConfig,
@@ -169,7 +235,7 @@ export function launchVolume(
   runOpts?: RunOpts
 ): { ok: true; sid: string } | { ok: false; error: string } {
   if (vol.skip) return { ok: false, error: "volume này đánh skip" };
-  if (starting.has(vol.tag) || isVolumeRunning(vol)) {
+  if (isVolumeBusy(vol)) {
     return { ok: false, error: "đang chạy" };
   }
   starting.add(vol.tag);

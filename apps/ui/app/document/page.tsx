@@ -11,6 +11,7 @@ import {
   getReaderAnnotations,
   createReaderAnnotation,
   deleteReaderAnnotation,
+  getLog,
   getRepairRequests,
   pageImg,
   saveReadingBookmark,
@@ -20,7 +21,13 @@ import {
 } from "../../lib/api";
 import { useToast, useChat, useEngine } from "../../components/Providers";
 import { IconBookmark, IconChat } from "../../components/icons";
-import { validReaderPage } from "../../lib/reader-page";
+import {
+  clampReaderZoom,
+  READER_ZOOM_MAX,
+  READER_ZOOM_MIN,
+  readerZoomFromWheel,
+  validReaderPage,
+} from "../../lib/reader-page";
 import {
   buildAskAiDraft,
   MAX_SELECTED_TEXT_LENGTH,
@@ -137,8 +144,10 @@ function Reader() {
   const [mode, setMode] = React.useState<ViewMode>("split");
   const [blockReport, setBlockReport] = React.useState<BlockReport | null>(null);
   const [selectedBlock, setSelectedBlock] = React.useState<DocumentBlock | null>(null);
-  const [draft, setDraft] = React.useState("");
+  const [blockDrafts, setBlockDrafts] = React.useState<Record<string, string>>({});
+  const [blockSaveError, setBlockSaveError] = React.useState("");
   const [saving, setSaving] = React.useState(false);
+  const [savingSeconds, setSavingSeconds] = React.useState(0);
   const [renderVersion, setRenderVersion] = React.useState(0);
   const [repairOpen, setRepairOpen] = React.useState(false);
   const [repairKind, setRepairKind] = React.useState<RepairRequestKind>("translation");
@@ -154,12 +163,24 @@ function Reader() {
   const [selectionTranslation, setSelectionTranslation] = React.useState<SelectionTranslationState | null>(null);
   const [selectionMenuPosition, setSelectionMenuPosition] = React.useState<SelectionMenuPosition | null>(null);
   const [isFullscreen, setIsFullscreen] = React.useState(false);
+  const [viewerZoom, setViewerZoom] = React.useState(1);
   const repairStatuses = React.useRef<Map<string, RepairRequest["status"]>>(new Map());
   const localEnglishVoice = React.useRef<SpeechSynthesisVoice | null>(null);
   const selectionMenuRef = React.useRef<HTMLDivElement>(null);
   const translationRequest = React.useRef<AbortController | null>(null);
+  const zoomViewportRef = React.useRef<HTMLDivElement>(null);
+  const zoomContentRef = React.useRef<HTMLDivElement>(null);
+  const zoomAnchorRef = React.useRef<{
+    clientX: number;
+    clientY: number;
+    xRatio: number;
+    yRatio: number;
+  } | null>(null);
 
-  const volumeRunning = !!status?.volumes.find((volume) => volume.tag === tag)?.running;
+  const volumeStatus = status?.volumes.find((volume) => volume.tag === tag);
+  const volumeRunning = !!volumeStatus?.running;
+  const runningRepair = repairRequests.find((request) => request.status === "running") || null;
+  const documentBusy = volumeRunning || !!runningRepair || repairSubmitting || saving;
 
   const cancelSelectionTranslation = React.useCallback(() => {
     translationRequest.current?.abort();
@@ -238,6 +259,8 @@ function Reader() {
       setInfo(null);
       setPreflight(null);
       setBookmarkPage(null);
+      setBlockDrafts({});
+      setBlockSaveError("");
       setRepairRequests([]);
       repairStatuses.current = new Map();
       if (!t) {
@@ -272,12 +295,18 @@ function Reader() {
   React.useEffect(() => {
     if (!tag || !info?.out_exists) return;
     let alive = true;
+    let inFlight = false;
     const refresh = () => {
+      if (inFlight) return;
+      inFlight = true;
       getRepairRequests(tag)
         .then(({ requests }) => {
           if (alive) acceptRepairSnapshot(requests);
         })
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => {
+          inFlight = false;
+        });
     };
     refresh();
     const timer = setInterval(refresh, 3000);
@@ -298,18 +327,36 @@ function Reader() {
       .then((report) => {
         if (!alive) return;
         setBlockReport(report);
-        setSelectedBlock((old) =>
-          old ? report.blocks.find((b) => b.id === old.id) || null : null
-        );
+        setSelectedBlock((old) => (
+          (old && report.blocks.find((block) => block.id === old.id)) ||
+          report.blocks[0] ||
+          null
+        ));
+        setBlockSaveError("");
       })
       .catch(() => {
         // Older/incomplete runs have no report yet; the PDF reader remains useful.
-        if (alive) setBlockReport(null);
+        if (alive) {
+          setBlockReport(null);
+          setSelectedBlock(null);
+        }
       });
     return () => {
       alive = false;
     };
   }, [tag, cur, info?.out_exists, renderVersion]);
+
+  React.useEffect(() => {
+    if (!saving) {
+      setSavingSeconds(0);
+      return;
+    }
+    setSavingSeconds(0);
+    const timer = window.setInterval(() => {
+      setSavingSeconds((seconds) => seconds + 1);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [saving]);
 
   React.useEffect(() => {
     if (!tag || !info) {
@@ -410,6 +457,52 @@ function Reader() {
     setNoteOpen(false);
     clearBrowserSelection();
   }, [cancelSelectionTranslation, clearBrowserSelection]);
+
+  React.useEffect(() => {
+    const viewport = zoomViewportRef.current;
+    if (!viewport || !info) return;
+    const onWheel = (event: WheelEvent) => {
+      // Electron/Chromium reports a macOS trackpad pinch as ctrl+wheel.
+      if (!event.ctrlKey) return;
+      event.preventDefault();
+      dismissSelection();
+      const content = zoomContentRef.current;
+      if (content) {
+        const rect = content.getBoundingClientRect();
+        zoomAnchorRef.current = {
+          clientX: event.clientX,
+          clientY: event.clientY,
+          xRatio: rect.width > 0
+            ? Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width))
+            : 0.5,
+          yRatio: rect.height > 0
+            ? Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height))
+            : 0.5,
+        };
+      }
+      setViewerZoom((current) => {
+        return readerZoomFromWheel(current, event.deltaY);
+      });
+    };
+    viewport.addEventListener("wheel", onWheel, { passive: false });
+    return () => viewport.removeEventListener("wheel", onWheel);
+  }, [dismissSelection, info]);
+
+  React.useLayoutEffect(() => {
+    const anchor = zoomAnchorRef.current;
+    const viewport = zoomViewportRef.current;
+    const content = zoomContentRef.current;
+    if (!anchor || !viewport || !content) return;
+    const rect = content.getBoundingClientRect();
+    const pointX = rect.left + rect.width * anchor.xRatio;
+    viewport.scrollLeft += pointX - anchor.clientX;
+    const main = viewport.closest<HTMLElement>(".main");
+    if (main) {
+      const pointY = rect.top + rect.height * anchor.yRatio;
+      main.scrollTop += pointY - anchor.clientY;
+    }
+    zoomAnchorRef.current = null;
+  }, [viewerZoom]);
 
   React.useEffect(() => {
     dismissSelection();
@@ -597,6 +690,25 @@ function Reader() {
     }
   }, [toast]);
 
+  // Page navigation updates the image immediately; never leave the previous
+  // page's overlay/editor active while the next block report is loading.
+  const currentBlockReport = blockReport?.tag === tag && blockReport.page === cur - 1
+    ? blockReport
+    : null;
+  const blocks = currentBlockReport?.blocks || [];
+  const selectedBlockIndex = selectedBlock
+    ? blocks.findIndex((block) => block.id === selectedBlock.id)
+    : -1;
+  const draft = selectedBlock
+    ? blockDrafts[selectedBlock.id] ?? selectedBlock.translation
+    : "";
+  const blockDirty = !!selectedBlock && draft.trim() !== selectedBlock.translation.trim();
+  const selectBlock = (block: DocumentBlock) => {
+    if (saving) return;
+    setSelectedBlock(block);
+    setBlockSaveError("");
+  };
+
   if (!info || !tag) {
     return <div className="page">Đang tải…</div>;
   }
@@ -706,6 +818,49 @@ function Reader() {
             </button>
           </div>
           <div className="row wrap" style={{ gap: "var(--space-2)" }}>
+            <div className="reader-zoom-controls" role="group" aria-label="Thu phóng tài liệu">
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                disabled={viewerZoom <= READER_ZOOM_MIN}
+                onClick={() => {
+                  zoomAnchorRef.current = null;
+                  dismissSelection();
+                  setViewerZoom((current) => clampReaderZoom(current - 0.1));
+                }}
+                aria-label="Thu nhỏ tài liệu"
+                title="Thu nhỏ"
+              >
+                −
+              </button>
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm num"
+                onClick={() => {
+                  zoomAnchorRef.current = null;
+                  dismissSelection();
+                  setViewerZoom(1);
+                }}
+                aria-label={`Đặt lại mức thu phóng, hiện tại ${Math.round(viewerZoom * 100)}%`}
+                title="Đặt lại 100% · có thể pinch bằng trackpad trong tài liệu"
+              >
+                {Math.round(viewerZoom * 100)}%
+              </button>
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                disabled={viewerZoom >= READER_ZOOM_MAX}
+                onClick={() => {
+                  zoomAnchorRef.current = null;
+                  dismissSelection();
+                  setViewerZoom((current) => clampReaderZoom(current + 0.1));
+                }}
+                aria-label="Phóng to tài liệu"
+                title="Phóng to"
+              >
+                +
+              </button>
+            </div>
             {bookmarkPage && bookmarkPage !== cur && (
               <button
                 type="button"
@@ -752,47 +907,53 @@ function Reader() {
           </div>
         </div>
 
-        <div className={"reader reader-" + mode}>
-          {mode !== "translated" && (
-            <ReaderPageCanvas
-              cap={"English · trang " + cur}
-              side="source"
-              src={pageImg(tag, "source", cur - 1)}
-              textPage={textPages.source || null}
-              annotations={annotations}
-              onSelectionReset={dismissSelection}
-              onSelection={onPageSelection}
-            />
-          )}
-          {mode !== "original" &&
-            (info.out_exists ? (
+        <div ref={zoomViewportRef} className="reader-zoom-viewport">
+          <div
+            ref={zoomContentRef}
+            className={"reader reader-" + mode}
+            style={{
+              width: `${viewerZoom * 100}%`,
+              maxWidth: mode === "split" ? undefined : `${920 * viewerZoom}px`,
+            }}
+          >
+            {mode !== "translated" && (
               <ReaderPageCanvas
-                cap={"Tiếng Việt · trang " + cur}
-                side="translated"
-                accent
-                src={pageImg(tag, "out", cur - 1) + (renderVersion ? `&v=${renderVersion}` : "")}
-                textPage={textPages.translated || null}
+                cap={"English · trang " + cur}
+                side="source"
+                src={pageImg(tag, "source", cur - 1)}
+                textPage={textPages.source || null}
                 annotations={annotations}
-                report={blockReport}
-                selectedId={selectedBlock?.id || null}
-                onSelect={(block) => {
-                  setSelectedBlock(block);
-                  setDraft(block.translation);
-                }}
                 onSelectionReset={dismissSelection}
                 onSelection={onPageSelection}
               />
-            ) : (
-              <div className="page-sheet">
-                <div className="sheet-cap" style={{ color: "var(--accent)" }}>
-                  Tiếng Việt
+            )}
+            {mode !== "original" &&
+              (info.out_exists ? (
+                <ReaderPageCanvas
+                  cap={"Tiếng Việt · trang " + cur}
+                  side="translated"
+                  accent
+                  src={pageImg(tag, "out", cur - 1) + (renderVersion ? `&v=${renderVersion}` : "")}
+                  textPage={textPages.translated || null}
+                  annotations={annotations}
+                  report={currentBlockReport}
+                  selectedId={selectedBlock?.id || null}
+                  onSelect={selectBlock}
+                  onSelectionReset={dismissSelection}
+                  onSelection={onPageSelection}
+                />
+              ) : (
+                <div className="page-sheet">
+                  <div className="sheet-cap" style={{ color: "var(--accent)" }}>
+                    Tiếng Việt
+                  </div>
+                  <p className="muted">
+                    Chưa có bản dịch cho cuốn này. Dịch ở trang{" "}
+                    <Link href="/library">Thư viện</Link>.
+                  </p>
                 </div>
-                <p className="muted">
-                  Chưa có bản dịch cho cuốn này. Dịch ở trang{" "}
-                  <Link href="/library">Thư viện</Link>.
-                </p>
-              </div>
-            ))}
+              ))}
+          </div>
         </div>
 
         {annotations.length > 0 && (
@@ -931,7 +1092,7 @@ function Reader() {
                   Yêu cầu chỉ tác động đến trang này và được lưu trong lịch sử tài liệu.
                 </p>
               </div>
-              {volumeRunning && <span className="badge badge-accent">Đang có tiến trình</span>}
+              {documentBusy && <span className="badge badge-accent">Đang có tiến trình</span>}
             </div>
 
             <div className="row wrap" style={{ alignItems: "flex-end", gap: "var(--space-3)" }}>
@@ -950,7 +1111,7 @@ function Reader() {
               <button
                 type="button"
                 className="btn btn-primary"
-                disabled={repairSubmitting || volumeRunning}
+                disabled={repairSubmitting || documentBusy}
                 onClick={async () => {
                   setRepairSubmitting(true);
                   try {
@@ -974,7 +1135,7 @@ function Reader() {
                   }
                 }}
               >
-                {repairSubmitting ? "Đang gửi…" : volumeRunning ? "Đang có tiến trình…" : "Gửi và thực hiện lại"}
+                {repairSubmitting ? "Đang gửi…" : documentBusy ? "Đang có tiến trình…" : "Gửi và thực hiện lại"}
               </button>
             </div>
 
@@ -1045,6 +1206,13 @@ function Reader() {
                         {request.error}
                       </div>
                     )}
+                    {request.status === "running" && request.id === runningRepair?.id && (
+                      <RepairRunLog
+                        tag={tag}
+                        runSid={request.run_sid}
+                        active={!!request.run_sid}
+                      />
+                    )}
                   </div>
                 ))}
               </div>
@@ -1052,33 +1220,45 @@ function Reader() {
           </section>
         )}
 
-        {selectedBlock && (
+        {blocks.length > 0 && selectedBlock && (
           <section className="card stack-3" aria-label="Chỉnh block dịch">
             <div className="row-between wrap" style={{ gap: "var(--space-3)" }}>
               <div>
-                <h3>Chỉnh block {selectedBlock.id}</h3>
+                <h3>Chỉnh block</h3>
                 <div className="muted" style={{ fontSize: "var(--text-xs)" }}>
-                  Trang {selectedBlock.page + 1} · scale {Math.round((selectedBlock.actual_scale || 1) * 100)}%
+                  Block {selectedBlockIndex + 1}/{blocks.length} · {selectedBlock.id} · trang {selectedBlock.page + 1} · scale {Math.round((selectedBlock.actual_scale || 1) * 100)}%
                   {selectedBlock.review_required ? " · cần kiểm tra" : ""}
+                  {blockDirty ? " · chưa lưu" : ""}
                 </div>
               </div>
               <button
+                type="button"
                 className="btn btn-primary btn-sm"
-                disabled={saving || !draft.trim()}
+                disabled={saving || documentBusy || !draft.trim() || !blockDirty}
                 onClick={async () => {
                   if (!tag) return;
+                  const blockToSave = selectedBlock;
+                  const translationToSave = draft;
+                  setBlockSaveError("");
                   setSaving(true);
                   try {
-                    const result = await updateBlock(tag, selectedBlock.id, draft);
-                    const next = result.block || { ...selectedBlock, translation: draft };
-                    setSelectedBlock(next);
+                    const result = await updateBlock(tag, blockToSave.id, translationToSave);
+                    const next = result.block || { ...blockToSave, translation: translationToSave };
+                    setBlockDrafts((old) => {
+                      const updated = { ...old };
+                      delete updated[next.id];
+                      return updated;
+                    });
+                    setSelectedBlock((current) => current?.id === next.id ? next : current);
                     setBlockReport((old) => old
                       ? { ...old, blocks: old.blocks.map((b) => b.id === next.id ? next : b) }
                       : old);
                     setRenderVersion((v) => v + 1);
-                    toast("Đã lưu block và render lại trang");
+                    toast("Đã lưu block và render lại trang hiện tại");
                   } catch (e) {
-                    toast("Không lưu được: " + (e as Error).message);
+                    const message = (e as Error).message || "lỗi không xác định";
+                    setBlockSaveError(message);
+                    toast("Không lưu được: " + message);
                   } finally {
                     setSaving(false);
                   }
@@ -1087,6 +1267,63 @@ function Reader() {
                 {saving ? "Đang render…" : "Lưu block"}
               </button>
             </div>
+
+            <div className="reader-block-nav">
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                disabled={saving || selectedBlockIndex <= 0}
+                onClick={() => selectBlock(blocks[selectedBlockIndex - 1])}
+              >
+                ‹ Block trước
+              </button>
+              <label className="field reader-block-picker">
+                <span className="muted">Tất cả block trên trang</span>
+                <select
+                  className="input"
+                  value={selectedBlock.id}
+                  disabled={saving}
+                  onChange={(event) => {
+                    const block = blocks.find((item) => item.id === event.target.value);
+                    if (block) selectBlock(block);
+                  }}
+                >
+                  {blocks.map((block, index) => (
+                    <option key={block.id} value={block.id}>
+                      {index + 1}. {block.id} — {block.source.replace(/\s+/g, " ").slice(0, 90)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                disabled={saving || selectedBlockIndex < 0 || selectedBlockIndex >= blocks.length - 1}
+                onClick={() => selectBlock(blocks[selectedBlockIndex + 1])}
+              >
+                Block sau ›
+              </button>
+            </div>
+
+            {saving && (
+              <div className="reader-block-progress">
+                <span className="job-live" aria-hidden="true" />
+                <span role="status">Đang kiểm tra nội dung và render lại PDF</span>
+                <span aria-hidden="true">
+                  · {Math.floor(savingSeconds / 60)}:{String(savingSeconds % 60).padStart(2, "0")}
+                </span>
+              </div>
+            )}
+            {!saving && documentBusy && (
+              <div className="reader-block-notice">
+                Chờ yêu cầu đang chạy hoàn tất rồi mới có thể lưu block.
+              </div>
+            )}
+            {blockSaveError && (
+              <div className="reader-block-error" role="alert">
+                Không lưu được: {blockSaveError}
+              </div>
+            )}
             <label className="muted" style={{ fontSize: "var(--text-xs)" }}>
               Bản gốc
               <textarea className="input" value={selectedBlock.source} readOnly rows={3} />
@@ -1096,13 +1333,111 @@ function Reader() {
               <textarea
                 className="input"
                 value={draft}
-                onChange={(e) => setDraft(e.target.value)}
+                disabled={saving}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  setBlockDrafts((old) => ({ ...old, [selectedBlock.id]: value }));
+                  setBlockSaveError("");
+                }}
                 rows={4}
               />
             </label>
+            {/(?:\{v\d+\}|<\/?(?:b|i|sup)>)/i.test(selectedBlock.source) && (
+              <p className="muted" style={{ fontSize: "var(--text-xs)" }}>
+                Giữ nguyên các marker như {"{v1}"}, &lt;b&gt;, &lt;i&gt; hoặc &lt;sup&gt; trong bản dịch để công thức và định dạng không bị mất.
+              </p>
+            )}
           </section>
         )}
       </div>
+    </div>
+  );
+}
+
+function RepairRunLog({
+  tag,
+  runSid,
+  active,
+}: {
+  tag: string;
+  runSid?: string;
+  active: boolean;
+}) {
+  const [lines, setLines] = React.useState<string[]>([]);
+  const boxRef = React.useRef<HTMLPreElement>(null);
+  const followTailRef = React.useRef(true);
+
+  React.useEffect(() => {
+    if (!active || !runSid) {
+      setLines([]);
+      return;
+    }
+    let alive = true;
+    let inFlight = false;
+    const refresh = () => {
+      if (inFlight) return;
+      inFlight = true;
+      getLog(tag)
+        .then((result) => {
+          if (!alive) return;
+          const next = result.lines || [];
+          setLines((current) => (
+            current.length === next.length && current.every((line, index) => line === next[index])
+              ? current
+              : next
+          ));
+        })
+        .catch(() => {})
+        .finally(() => {
+          inFlight = false;
+        });
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 2000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [active, tag, runSid]);
+
+  React.useEffect(() => {
+    if (boxRef.current && followTailRef.current) {
+      boxRef.current.scrollTop = boxRef.current.scrollHeight;
+    }
+  }, [lines]);
+
+  let start = -1;
+  if (runSid) {
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      if (lines[index].includes(`sid=${runSid}`)) {
+        start = index;
+        break;
+      }
+    }
+  }
+  const visible = (start >= 0 ? lines.slice(start) : lines)
+    .filter((line) => line.trim())
+    .slice(-60);
+
+  return (
+    <div className="repair-run-log">
+      <div className="repair-run-log-title">
+        {active && <span className="job-live" aria-hidden="true" />}
+        {active ? "Log xử lý trực tiếp · tự cập nhật" : "Đang đồng bộ log tiến trình…"}
+      </div>
+      <pre
+        ref={boxRef}
+        tabIndex={0}
+        aria-label="Log xử lý trực tiếp"
+        onScroll={(event) => {
+          const target = event.currentTarget;
+          followTailRef.current = target.scrollHeight - target.scrollTop - target.clientHeight < 24;
+        }}
+      >
+        {active
+          ? visible.join("\n") || "Đang khởi động tiến trình…"
+          : "Đang chờ daemon xác nhận tiến trình hiện tại…"}
+      </pre>
     </div>
   );
 }

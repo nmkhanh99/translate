@@ -1914,11 +1914,15 @@ def _review_scale_floor(item):
     return 0.78
 
 
-def apply_translations(doc, layout, translations, fontfile=None, report=None):
+def apply_translations(doc, layout, translations, fontfile=None, report=None,
+                       document_scale_cap=None):
     """Ghi đè bản dịch giữ layout. translations: {id: vi_text}.
     Trả về (applied, missing_ids).
     LƯU Ý: `doc` phải còn NGUYÊN BẢN khi gọi (ảnh công thức inline được raster
-    từ chính các trang này TRƯỚC khi redact)."""
+    từ chính các trang này TRƯỚC khi redact).
+
+    `document_scale_cap` chỉ dùng khi render lại một trang: tái sử dụng cap
+    của lần apply toàn tài liệu, thay vì tính mode sai từ một subset."""
     fam = find_font_family(fontfile)
     css, ar = _font_css_archive(fam)
     fallback_font = fam["regular"]
@@ -1966,10 +1970,13 @@ def apply_translations(doc, layout, translations, fontfile=None, report=None):
             s = _fit_scale(item, vi, css, ar, _fx_prefix(item))
             fits[item["id"]] = s
             weights.append((s, len(vi)))
-    mode = _mode_scale(weights)
-    # mode >= 0.94: tài liệu về cơ bản vừa -> không ép nhỏ cả cuốn vì chênh nhẹ.
-    # Sàn chuẩn hoá 0.85: không bao giờ ÉP đoạn đã-vừa co quá 15% chỉ để đều.
-    cap = 1.0 if mode >= 0.94 else max(mode, 0.85)
+    if document_scale_cap is None:
+        mode = _mode_scale(weights)
+        # mode >= 0.94: tài liệu về cơ bản vừa -> không ép nhỏ cả cuốn vì chênh nhẹ.
+        # Sàn chuẩn hoá 0.85: không bao giờ ÉP đoạn đã-vừa co quá 15% chỉ để đều.
+        cap = 1.0 if mode >= 0.94 else max(mode, 0.85)
+    else:
+        cap = max(0.3, min(1.0, float(document_scale_cap)))
     if report is not None:
         report["document_scale_cap"] = round(cap, 4)
 

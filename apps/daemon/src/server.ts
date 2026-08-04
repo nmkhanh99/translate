@@ -88,11 +88,17 @@ import {
   BATCH,
   batchStart,
   batchStop,
+  beginBlockUpdate,
+  endBlockUpdate,
+  isVolumeBusy,
   isVolumeRunning,
   launchVolume,
+  recoverInterruptedBlockUpdate,
   resetAutoResume,
   stopVolume,
 } from "./runs.js";
+
+const BLOCK_UPDATE_TIMEOUT_MS = 10 * 60_000;
 
 // "5-10, 12, 15" (SỐ TRANG người dùng, 1-based) -> mảng CHỈ SỐ 0-based, clamp
 // trong [0, total). Dùng cho redo vision theo trang cụ thể.
@@ -124,6 +130,7 @@ function parsePageList(spec: unknown, total: number): number[] {
 
 export function createApp() {
   ensureDirs();
+  for (const volume of loadVolumes()) recoverInterruptedBlockUpdate(volume);
   const app = express();
   let CFG = loadCfg();
 
@@ -305,10 +312,10 @@ export function createApp() {
       if (stage !== "translate" && stage !== "verify" && stage !== "vision") {
         return res.status(400).json({ error: "redo.stage không hợp lệ" });
       }
-      // KHÔNG reset khi cuốn đang chạy — resetStage xoá output, sẽ hỏng tiến trình
+      // KHÔNG reset khi cuốn đang chạy/lưu block — resetStage xoá output, sẽ hỏng tiến trình
       // đang dở. Chặn TRƯỚC khi xoá (launchVolume cũng chặn nhưng quá muộn).
-      if (isVolumeRunning(vol)) {
-        return res.status(409).json({ error: "cuốn đang chạy — không thể chạy lại" });
+      if (isVolumeBusy(vol)) {
+        return res.status(409).json({ error: "cuốn đang có tiến trình — không thể chạy lại" });
       }
       let pages: number[] | undefined;
       if (stage === "vision" && redo.pages != null && String(redo.pages).trim() !== "") {
@@ -462,8 +469,8 @@ export function createApp() {
     if (!existsSync(vol.out)) {
       return res.status(409).json({ error: "chưa có bản dịch để xử lý lại" });
     }
-    if (isVolumeRunning(vol)) {
-      return res.status(409).json({ error: "cuốn đang chạy — hãy gửi yêu cầu sau khi tiến trình dừng" });
+    if (isVolumeBusy(vol)) {
+      return res.status(409).json({ error: "cuốn đang có tiến trình — hãy gửi yêu cầu sau khi tiến trình dừng" });
     }
 
     const totalPages = pdfPageCount(vol.pdf);
@@ -677,9 +684,6 @@ export function createApp() {
   app.post("/api/blocks/update", (req, res) => {
     const vol = findVolume(String(req.body?.tag || ""));
     if (!vol) return res.status(404).json({ error: "tag không tồn tại" });
-    if (isVolumeRunning(vol)) {
-      return res.status(409).json({ error: "cuốn đang chạy — hãy sửa sau khi pipeline dừng" });
-    }
     const id = String(req.body?.id || "").trim();
     const translation = typeof req.body?.translation === "string"
       ? req.body.translation.trim()
@@ -687,32 +691,52 @@ export function createApp() {
     if (!/^s\d+$/.test(id) || !translation || translation.length > 50_000) {
       return res.status(400).json({ error: "block hoặc bản dịch không hợp lệ" });
     }
-    execFile(
-      pythonBin(),
-      [
-        join(PYTHON_DIR, "agent_pipeline.py"),
-        "block-update",
-        vol.pdf,
-        vol.workdir,
-        vol.out,
-        id,
-        translation,
-      ],
-      { cwd: PYTHON_DIR, timeout: 120_000, maxBuffer: 16 * 1024 * 1024 },
-      (err, stdout, stderr) => {
-        if (err) {
-          const detail = String(stderr || stdout || err.message).trim().split("\n").pop();
-          return res.status(400).json({ error: detail || "block update failed" });
+    if (!beginBlockUpdate(vol)) {
+      return res.status(409).json({ error: "cuốn đang chạy hoặc đang lưu block khác" });
+    }
+    try {
+      execFile(
+        pythonBin(),
+        [
+          join(PYTHON_DIR, "agent_pipeline.py"),
+          "block-update",
+          vol.pdf,
+          vol.workdir,
+          vol.out,
+          id,
+          translation,
+        ],
+        { cwd: PYTHON_DIR, timeout: BLOCK_UPDATE_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 },
+        (err, stdout, stderr) => {
+          if (err) {
+            recoverInterruptedBlockUpdate(vol);
+            endBlockUpdate(vol.tag);
+            const childError = err as Error & { killed?: boolean; code?: string | number | null };
+            const timedOut = childError.killed === true &&
+              childError.code !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+            if (timedOut) {
+              return res.status(504).json({
+                error: "render block quá 10 phút; hãy tải lại tài liệu trước khi thử lại",
+              });
+            }
+            const detail = String(stderr || stdout || err.message).trim().split("\n").pop();
+            return res.status(400).json({ error: detail || "block update failed" });
+          }
+          endBlockUpdate(vol.tag);
+          try {
+            const lines = String(stdout || "").trim().split("\n");
+            const result = JSON.parse(lines[lines.length - 1]);
+            return res.json({ ok: true, block: result.segment, translation: result.translation });
+          } catch {
+            return res.status(500).json({ error: "block update: output không hợp lệ" });
+          }
         }
-        try {
-          const lines = String(stdout || "").trim().split("\n");
-          const result = JSON.parse(lines[lines.length - 1]);
-          return res.json({ ok: true, block: result.segment, translation: result.translation });
-        } catch {
-          return res.status(500).json({ error: "block update: output không hợp lệ" });
-        }
-      }
-    );
+      );
+    } catch (error) {
+      endBlockUpdate(vol.tag);
+      const message = error instanceof Error ? error.message : String(error);
+      return res.status(500).json({ error: `không khởi động được render block: ${message}` });
+    }
   });
 
   app.get("/api/pageinfo", (req, res) => {
