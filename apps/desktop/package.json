@@ -27,6 +27,10 @@
         "to": "daemon/cli.mjs"
       },
       {
+        "from": "../daemon/dist/status-worker.mjs",
+        "to": "daemon/status-worker.mjs"
+      },
+      {
         "from": "../../python",
         "to": "python",
         "filter": ["**/*", "!**/__pycache__/**"]

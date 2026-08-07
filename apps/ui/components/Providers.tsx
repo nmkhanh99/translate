@@ -3,7 +3,9 @@
 // per-document chat drawer.
 import * as React from "react";
 import { ChatDrawer } from "./ChatDrawer";
-import { getStatus, getAgents, saveConfig } from "../lib/api";
+import { getAgents, saveConfig } from "../lib/api";
+import type { AgentScanResponse } from "../lib/api";
+import { useStatus } from "../lib/useStatus";
 import type { AgentDetection, Engine } from "../lib/types";
 
 /* ---------------- Toast ---------------- */
@@ -17,14 +19,14 @@ interface EngineCtxValue {
   /** id → available on PATH (from /api/agents) */
   available: Partial<Record<Engine, boolean>>;
   agents: AgentDetection[];
-  rescanAgents: () => Promise<void>;
+  rescanAgents: () => Promise<AgentScanResponse | null>;
 }
 const EngineCtx = React.createContext<EngineCtxValue>({
   engine: "claude",
   setEngine: () => {},
   available: {},
   agents: [],
-  rescanAgents: async () => {},
+  rescanAgents: async () => null,
 });
 export const useEngine = () => React.useContext(EngineCtx);
 
@@ -70,6 +72,7 @@ function mapAvailable(list: AgentDetection[]): Partial<Record<Engine, boolean>> 
 }
 
 export function Providers({ children }: { children: React.ReactNode }) {
+  const status = useStatus();
   const [toastMsg, setToastMsg] = React.useState("");
   const [show, setShow] = React.useState(false);
   const timer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -87,28 +90,21 @@ export function Providers({ children }: { children: React.ReactNode }) {
   >({});
 
   const rescanAgents = React.useCallback(async () => {
-    try {
-      const a = await getAgents();
-      setAgents(a.agents || []);
-      setAvailable(mapAvailable(a.agents || []));
-    } catch {
-      /* ignore */
-    }
+    const result = await getAgents();
+    setAgents(result.agents || []);
+    setAvailable(mapAvailable(result.agents || []));
+    return result;
   }, []);
 
   React.useEffect(() => {
-    getStatus()
-      .then((s) => {
-        const e = s.config?.engine as Engine | undefined;
-        if (e === "claude" || e === "codex" || e === "grok") setEngineState(e);
-        if (s.agents?.length) {
-          setAgents(s.agents);
-          setAvailable(mapAvailable(s.agents));
-        }
-      })
-      .catch(() => {});
-    void rescanAgents();
-  }, [rescanAgents]);
+    if (!status) return;
+    const e = status.config?.engine as Engine | undefined;
+    if (e === "claude" || e === "codex" || e === "grok") setEngineState(e);
+    if (status.agents) {
+      setAgents(status.agents);
+      setAvailable(mapAvailable(status.agents));
+    }
+  }, [status]);
 
   const setEngine = React.useCallback(
     (e: Engine) => {

@@ -52,8 +52,8 @@ Kết quả trong `apps/desktop/dist/`.
 Bản đóng gói bundle vào `Resources/` (macOS) / `resources/` (Windows):
 
 - `ui-out/` — renderer tĩnh (từ apps/ui)
-- `daemon/cli.mjs` — daemon gộp 1 file ESM (esbuild), chạy bằng Node của Electron
-  (`ELECTRON_RUN_AS_NODE=1`)
+- `daemon/cli.mjs` + `daemon/status-worker.mjs` — daemon và worker quét status,
+  chạy bằng Node của Electron (`ELECTRON_RUN_AS_NODE=1`)
 - `python/` — engine PDF + MCP
 
 Khi đóng gói, các thư mục cần ghi (input/output/tool/work, config) chuyển sang

@@ -1,26 +1,78 @@
 "use client";
 import * as React from "react";
-import { getStatus } from "./api";
+import { requestStatus } from "./status-request";
 import type { StatusResponse } from "./types";
 
-// Poll /api/status on an interval (default 4s), matching the old dashboard's
-// live-refresh behavior. Returns the latest snapshot (or null before first load).
-export function useStatus(intervalMs = 4000): StatusResponse | null {
+export const STATUS_POLL_INTERVAL_MS = 2000;
+
+interface StatusContextValue {
+  data: StatusResponse | null;
+  refresh: (afterInflight?: boolean) => Promise<StatusResponse>;
+}
+
+const StatusContext = React.createContext<StatusContextValue | null>(null);
+
+export function StatusProvider({
+  children,
+  intervalMs = STATUS_POLL_INTERVAL_MS,
+}: {
+  children: React.ReactNode;
+  intervalMs?: number;
+}) {
   const [data, setData] = React.useState<StatusResponse | null>(null);
-  React.useEffect(() => {
-    let alive = true;
-    const tick = () =>
-      getStatus()
-        .then((s) => {
-          if (alive) setData(s);
-        })
-        .catch(() => {});
-    tick();
-    const id = setInterval(tick, intervalMs);
-    return () => {
-      alive = false;
-      clearInterval(id);
+  const inFlight = React.useRef<Promise<StatusResponse> | null>(null);
+  const mounted = React.useRef(false);
+
+  const refresh = React.useCallback((afterInflight = false) => {
+    const start = () => {
+      const request = requestStatus().then((status) => {
+        if (mounted.current) setData(status);
+        return status;
+      });
+      inFlight.current = request;
+      const clear = () => {
+        if (inFlight.current === request) inFlight.current = null;
+      };
+      void request.then(clear, clear);
+      return request;
     };
-  }, [intervalMs]);
-  return data;
+
+    const current = inFlight.current;
+    if (!current) return start();
+    if (!afterInflight) return current;
+    return current.then(start, start);
+  }, []);
+
+  React.useEffect(() => {
+    mounted.current = true;
+    void refresh().catch(() => {});
+    const timer = setInterval(() => {
+      void refresh().catch(() => {});
+    }, intervalMs);
+    return () => {
+      mounted.current = false;
+      clearInterval(timer);
+    };
+  }, [intervalMs, refresh]);
+
+  const value = React.useMemo(() => ({ data, refresh }), [data, refresh]);
+  return React.createElement(StatusContext.Provider, { value }, children);
+}
+
+function useStatusContext(): StatusContextValue {
+  const value = React.useContext(StatusContext);
+  if (!value) throw new Error("useStatus must be used inside StatusProvider");
+  return value;
+}
+
+// intervalMs is retained for source compatibility. Polling cadence is owned by
+// the app-level provider so mounting a route never creates another timer.
+export function useStatus(_intervalMs = 4000): StatusResponse | null {
+  return useStatusContext().data;
+}
+
+export function useRefreshStatus(): (
+  afterInflight?: boolean
+) => Promise<StatusResponse> {
+  return useStatusContext().refresh;
 }

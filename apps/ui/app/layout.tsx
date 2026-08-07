@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 import { Providers } from "../components/Providers";
 import { AppShell } from "../components/AppShell";
+import { StatusProvider } from "../lib/useStatus";
 
 export const metadata: Metadata = {
   title: "CFA Translate Studio",
@@ -16,9 +17,11 @@ export default function RootLayout({
   return (
     <html lang="vi">
       <body>
-        <Providers>
-          <AppShell>{children}</AppShell>
-        </Providers>
+        <StatusProvider>
+          <Providers>
+            <AppShell>{children}</AppShell>
+          </Providers>
+        </StatusProvider>
       </body>
     </html>
   );

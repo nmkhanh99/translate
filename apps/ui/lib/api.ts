@@ -36,14 +36,18 @@ async function req<T>(path: string, opts?: RequestInit): Promise<T> {
   return d as T;
 }
 
-export function getStatus(): Promise<StatusResponse> {
-  return req<StatusResponse>("/api/status");
+export function getStatus(signal?: AbortSignal): Promise<StatusResponse> {
+  return req<StatusResponse>("/api/status", { signal });
 }
 
-export function getAgents(): Promise<{
+export interface AgentScanResponse {
   agents: AgentDetection[];
   capabilities: Record<Engine, AgentCapabilities>;
-}> {
+  models_discovered?: StatusResponse["models_discovered"];
+  models_by_engine?: StatusResponse["models_by_engine"];
+}
+
+export function getAgents(): Promise<AgentScanResponse> {
   return req("/api/agents");
 }
 

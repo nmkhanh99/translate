@@ -7,9 +7,10 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
-import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import type { AppConfig, ReaderTextSpan, Volume } from "@cfa-translate/shared";
 import {
   INPUT_DIR,
@@ -604,9 +605,143 @@ export function effectiveStage(
   return raw || "translate";
 }
 
-export function pdfPageCount(path: string): number {
-  if (!existsSync(path)) return 0;
-  const script = `
+type ReaderTextPageData = {
+  page_size: [number, number];
+  spans: ReaderTextSpan[];
+};
+
+export type PdfJobPriority = "interactive" | "thumbnail";
+
+// PyMuPDF imports are CPU/memory-heavy. Keep the daemon responsive by running
+// them asynchronously with a small global bound; reader work jumps ahead of
+// thumbnail backlog when a slot becomes available.
+const PDF_WORKER_LIMIT = 2;
+let activePdfWorkers = 0;
+const interactivePdfJobs: Array<() => void> = [];
+const thumbnailPdfJobs: Array<() => void> = [];
+
+function schedulePdfJob<T>(
+  run: () => Promise<T>,
+  priority: PdfJobPriority = "interactive"
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const start = () => {
+      activePdfWorkers++;
+      Promise.resolve()
+        .then(run)
+        .then(resolve, reject)
+        .finally(() => {
+          activePdfWorkers--;
+          const next = interactivePdfJobs.shift() || thumbnailPdfJobs.shift();
+          next?.();
+        });
+    };
+    if (activePdfWorkers < PDF_WORKER_LIMIT) start();
+    else if (priority === "thumbnail") thumbnailPdfJobs.push(start);
+    else interactivePdfJobs.push(start);
+  });
+}
+
+function execPdfText(
+  args: string[],
+  timeout: number,
+  maxBuffer: number
+): Promise<string | null> {
+  return schedulePdfJob(
+    () =>
+      new Promise((resolve) => {
+        execFile(
+          pythonBin(),
+          args,
+          { encoding: "utf8", timeout, maxBuffer },
+          (error, stdout) => resolve(error || !stdout ? null : String(stdout))
+        );
+      })
+  );
+}
+
+function execPdfBuffer(
+  args: string[],
+  timeout: number,
+  maxBuffer: number,
+  priority: PdfJobPriority
+): Promise<Buffer | null> {
+  return schedulePdfJob(
+    () =>
+      new Promise((resolve) => {
+        execFile(
+          pythonBin(),
+          args,
+          { encoding: "buffer", timeout, maxBuffer },
+          (error, stdout) => {
+            if (error || !stdout) resolve(null);
+            else resolve(Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout));
+          }
+        );
+      }),
+    priority
+  );
+}
+
+function fileRevision(path: string): string | null {
+  try {
+    const st = statSync(path);
+    return `${path}|${st.dev}:${st.ino}:${st.size}:${st.mtimeMs}`;
+  } catch {
+    return null;
+  }
+}
+
+function cachePath(kind: string, revision: string, suffix: string): string {
+  const key = createHash("sha1").update(`${kind}|${revision}`).digest("hex");
+  return join(TOOL_DIR, "pagecache", key + suffix);
+}
+
+async function writeCacheAtomic(path: string, data: string | Buffer): Promise<void> {
+  const temp = `${path}.${randomUUID()}.tmp`;
+  try {
+    mkdirSync(join(path, ".."), { recursive: true });
+    await writeFile(temp, data);
+    await rename(temp, path);
+  } catch {
+    await unlink(temp).catch(() => {});
+  }
+}
+
+function remember<K, V>(map: Map<K, V>, key: K, value: V, limit: number): V {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > limit) {
+    const oldest = map.keys().next().value as K | undefined;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
+  return value;
+}
+
+const pageCountCache = new Map<string, number>();
+const pageCountInflight = new Map<string, Promise<number>>();
+
+export async function pdfPageCount(path: string): Promise<number> {
+  const revision = fileRevision(path);
+  if (!revision) return 0;
+  const cached = pageCountCache.get(revision);
+  if (cached !== undefined) return remember(pageCountCache, revision, cached, 64);
+  const inflight = pageCountInflight.get(revision);
+  if (inflight) return inflight;
+
+  const promise = (async () => {
+    const diskPath = cachePath("page-count-v1", revision, ".txt");
+    try {
+      const diskValue = parseInt(await readFile(diskPath, "utf8"), 10);
+      if (Number.isSafeInteger(diskValue) && diskValue > 0) {
+        return remember(pageCountCache, revision, diskValue, 64);
+      }
+    } catch {
+      /* cache miss */
+    }
+
+    const script = `
 import sys
 try:
   import fitz
@@ -614,19 +749,84 @@ try:
 except Exception:
   print(0)
 `;
-  const r = spawnSync(pythonBin(), ["-c", script, path], {
-    encoding: "utf8",
-    timeout: 15000,
-  });
-  return parseInt((r.stdout || "0").trim(), 10) || 0;
+    const stdout = await execPdfText(
+      ["-c", script, path],
+      15_000,
+      1024 * 1024
+    );
+    const pages = parseInt((stdout || "0").trim(), 10) || 0;
+    if (pages > 0) {
+      remember(pageCountCache, revision, pages, 64);
+      await writeCacheAtomic(diskPath, String(pages));
+    }
+    return pages;
+  })().finally(() => pageCountInflight.delete(revision));
+  pageCountInflight.set(revision, promise);
+  return promise;
 }
 
-export function extractPageText(
+function parseReaderTextPage(value: unknown): ReaderTextPageData | null {
+  if (!value || typeof value !== "object") return null;
+  const parsed = value as { page_size?: unknown; spans?: unknown };
+  if (
+    !Array.isArray(parsed.page_size) ||
+    parsed.page_size.length !== 2 ||
+    !parsed.page_size.every(
+      (part) => typeof part === "number" && Number.isFinite(part) && part > 0
+    ) ||
+    !Array.isArray(parsed.spans)
+  ) {
+    return null;
+  }
+  const spans = parsed.spans.filter((value): value is ReaderTextSpan => {
+    if (!value || typeof value !== "object") return false;
+    const span = value as Partial<ReaderTextSpan>;
+    return (
+      typeof span.id === "string" &&
+      typeof span.text === "string" &&
+      typeof span.font_size === "number" &&
+      Number.isFinite(span.font_size) &&
+      Array.isArray(span.box) &&
+      span.box.length === 4 &&
+      span.box.every(
+        (part) => typeof part === "number" && Number.isFinite(part)
+      )
+    );
+  });
+  return {
+    page_size: [parsed.page_size[0] as number, parsed.page_size[1] as number],
+    spans,
+  };
+}
+
+const pageTextCache = new Map<string, ReaderTextPageData>();
+const pageTextInflight = new Map<string, Promise<ReaderTextPageData | null>>();
+
+export async function extractPageText(
   path: string,
   page: number
-): { page_size: [number, number]; spans: ReaderTextSpan[] } | null {
-  if (!existsSync(path) || !Number.isSafeInteger(page) || page < 0) return null;
-  const script = `
+): Promise<ReaderTextPageData | null> {
+  if (!Number.isSafeInteger(page) || page < 0) return null;
+  const revision = fileRevision(path);
+  if (!revision) return null;
+  const key = `${revision}|${page}`;
+  const cached = pageTextCache.get(key);
+  if (cached) return remember(pageTextCache, key, cached, 128);
+  const inflight = pageTextInflight.get(key);
+  if (inflight) return inflight;
+
+  const promise = (async () => {
+    const diskPath = cachePath("reader-text-v1", key, ".json");
+    try {
+      const parsed = parseReaderTextPage(
+        JSON.parse(await readFile(diskPath, "utf8"))
+      );
+      if (parsed) return remember(pageTextCache, key, parsed, 128);
+    } catch {
+      /* cache miss */
+    }
+
+    const script = `
 import json, math, sys, fitz
 doc = fitz.open(sys.argv[1])
 page_no = int(sys.argv[2])
@@ -662,66 +862,72 @@ print(json.dumps({
   "spans": spans,
 }, ensure_ascii=False))
 `;
-  const result = spawnSync(pythonBin(), ["-c", script, path, String(page)], {
-    encoding: "utf8",
-    maxBuffer: 16 * 1024 * 1024,
-    timeout: 15_000,
-  });
-  if (result.status !== 0 || !result.stdout) return null;
-  try {
-    const parsed = JSON.parse(result.stdout) as {
-      page_size?: unknown;
-      spans?: unknown;
-    };
-    if (
-      !Array.isArray(parsed.page_size) || parsed.page_size.length !== 2 ||
-      !parsed.page_size.every((value) => typeof value === "number" && Number.isFinite(value) && value > 0) ||
-      !Array.isArray(parsed.spans)
-    ) {
+    const stdout = await execPdfText(
+      ["-c", script, path, String(page)],
+      15_000,
+      16 * 1024 * 1024
+    );
+    if (!stdout) return null;
+    try {
+      const parsed = parseReaderTextPage(JSON.parse(stdout));
+      if (!parsed) return null;
+      remember(pageTextCache, key, parsed, 128);
+      await writeCacheAtomic(diskPath, JSON.stringify(parsed));
+      return parsed;
+    } catch {
       return null;
     }
-    const spans = parsed.spans.filter((value): value is ReaderTextSpan => {
-      if (!value || typeof value !== "object") return false;
-      const span = value as Partial<ReaderTextSpan>;
-      return typeof span.id === "string" && typeof span.text === "string" &&
-        typeof span.font_size === "number" && Number.isFinite(span.font_size) &&
-        Array.isArray(span.box) && span.box.length === 4 &&
-        span.box.every((part) => typeof part === "number" && Number.isFinite(part));
-    });
-    return {
-      page_size: [parsed.page_size[0] as number, parsed.page_size[1] as number],
-      spans,
-    };
-  } catch {
-    return null;
-  }
+  })().finally(() => pageTextInflight.delete(key));
+  pageTextInflight.set(key, promise);
+  return promise;
 }
 
-export function renderPagePng(
+const rasterMemoryCache = new Map<string, Buffer>();
+const rasterInflight = new Map<string, Promise<Buffer | null>>();
+const RASTER_MEMORY_LIMIT = 24 * 1024 * 1024;
+let rasterMemoryBytes = 0;
+
+function rememberRaster(key: string, png: Buffer): Buffer {
+  const previous = rasterMemoryCache.get(key);
+  if (previous) rasterMemoryBytes -= previous.byteLength;
+  rasterMemoryCache.delete(key);
+  if (png.byteLength > RASTER_MEMORY_LIMIT) return png;
+  rasterMemoryCache.set(key, png);
+  rasterMemoryBytes += png.byteLength;
+  while (rasterMemoryBytes > RASTER_MEMORY_LIMIT) {
+    const oldest = rasterMemoryCache.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    const removed = rasterMemoryCache.get(oldest);
+    rasterMemoryCache.delete(oldest);
+    rasterMemoryBytes -= removed?.byteLength || 0;
+  }
+  return png;
+}
+
+export async function renderPagePng(
   path: string,
   page: number,
-  dpi: number
-): Buffer | null {
-  // Disk cache keyed by (source path, mtime, page, dpi). /api/page renders one
-  // page per spawnSync on the daemon's single thread; a library grid of covers
-  // would otherwise serialize dozens of ~1s Python spawns and stall status/log/
-  // run/stop. Rendering the SAME page again (invariant until the file changes)
-  // is served from cache — no spawn.
-  let cacheFile: string | null = null;
-  try {
-    const mtime = Math.floor(statSync(path).mtimeMs);
-    const key = createHash("sha1")
-      .update(`raster-v2|${path}|${mtime}|${page}|${dpi}`)
-      .digest("hex");
-    const dir = join(TOOL_DIR, "pagecache");
-    cacheFile = join(dir, key + ".png");
-    if (existsSync(cacheFile)) return readFileSync(cacheFile);
-    mkdirSync(dir, { recursive: true });
-  } catch {
-    cacheFile = null;
-  }
+  dpi: number,
+  priority: PdfJobPriority = "interactive"
+): Promise<Buffer | null> {
+  const revision = fileRevision(path);
+  if (!revision) return null;
+  const key = `${revision}|${page}|${dpi}`;
+  const memory = rasterMemoryCache.get(key);
+  if (memory) return rememberRaster(key, memory);
+  const inflight = rasterInflight.get(key);
+  if (inflight) return inflight;
 
-  const script = `
+  const promise = (async () => {
+    const diskPath = cachePath("raster-v3", key, ".png");
+    try {
+      const png = await readFile(diskPath);
+      if (png.length) return rememberRaster(key, png);
+    } catch {
+      /* cache miss */
+    }
+
+    const script = `
 import sys, fitz
 doc=fitz.open(sys.argv[1])
 page=int(sys.argv[2]); dpi=int(sys.argv[3])
@@ -735,21 +941,78 @@ if requested > max_pixels:
   scale *= (max_pixels/requested) ** 0.5
 sys.stdout.buffer.write(p.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False).tobytes("png"))
 `;
-  const r = spawnSync(pythonBin(), ["-c", script, path, String(page), String(dpi)], {
-    encoding: "buffer",
-    maxBuffer: 40 * 1024 * 1024,
-    timeout: 30000,
-  });
-  if (r.status !== 0 || !r.stdout) return null;
-  const png = r.stdout as Buffer;
-  if (cacheFile) {
-    try {
-      writeFileSync(cacheFile, png);
-    } catch {
-      /* cache best-effort */
+    const png = await execPdfBuffer(
+      ["-c", script, path, String(page), String(dpi)],
+      30_000,
+      40 * 1024 * 1024,
+      priority
+    );
+    if (!png) return null;
+    rememberRaster(key, png);
+    await writeCacheAtomic(diskPath, png);
+    return png;
+  })().finally(() => rasterInflight.delete(key));
+  rasterInflight.set(key, promise);
+  return promise;
+}
+
+interface RenderReportCacheEntry {
+  revision: string;
+  pages: Map<number, Record<string, unknown>[]>;
+  pageSizes: unknown[];
+  reviewCount: number;
+  generatedAt?: string;
+}
+
+const renderReportCache = new Map<string, RenderReportCacheEntry>();
+
+export function loadRenderReportPage(
+  workdir: string,
+  page: number
+): {
+  page_size: [number, number] | null;
+  blocks: Record<string, unknown>[];
+  review_count: number;
+  generated_at?: string;
+} | null {
+  const path = join(workdir, "render_report.json");
+  const revision = fileRevision(path);
+  if (!revision) return null;
+  let entry = renderReportCache.get(path);
+  if (!entry || entry.revision !== revision) {
+    const raw = readJson(path);
+    if (!raw || !Array.isArray(raw.segments)) return null;
+    const pages = new Map<number, Record<string, unknown>[]>();
+    for (const value of raw.segments) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      const segment = value as Record<string, unknown>;
+      const pageNumber = Number(segment.page);
+      if (!Number.isInteger(pageNumber) || typeof segment.id !== "string") continue;
+      const list = pages.get(pageNumber) || [];
+      list.push(segment);
+      pages.set(pageNumber, list);
     }
+    entry = {
+      revision,
+      pages,
+      pageSizes: Array.isArray(raw.page_sizes) ? raw.page_sizes : [],
+      reviewCount: Number(raw.review_count || 0),
+      generatedAt:
+        typeof raw.generated_at === "string" ? raw.generated_at : undefined,
+    };
   }
-  return png;
+  remember(renderReportCache, path, entry, 3);
+  const rawSize = entry.pageSizes[page];
+  const pageSize =
+    Array.isArray(rawSize) && rawSize.length >= 2
+      ? ([Number(rawSize[0]), Number(rawSize[1])] as [number, number])
+      : null;
+  return {
+    page_size: pageSize,
+    blocks: entry.pages.get(page) || [],
+    review_count: entry.reviewCount,
+    ...(entry.generatedAt ? { generated_at: entry.generatedAt } : {}),
+  };
 }
 
 export function volumeToApi(

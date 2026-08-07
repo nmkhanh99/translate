@@ -3,7 +3,6 @@ import * as React from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import {
-  getStatus,
   getPageInfo,
   getPreflight,
   getBlocks,
@@ -182,6 +181,15 @@ function Reader() {
   const readerRef = React.useRef<HTMLDivElement>(null);
   const translationRequest = React.useRef<AbortController | null>(null);
 
+  const requestedTag = sp.get("tag");
+  const fallbackTag = requestedTag
+    ? requestedTag
+    : (
+        status?.volumes.find((volume) => !volume.skip && volume.stage === "done") ||
+        status?.volumes.find((volume) => !volume.skip)
+      )?.tag || null;
+  const waitingForFallback = !requestedTag && !status;
+
   const volumeStatus = status?.volumes.find((volume) => volume.tag === tag);
   const volumeRunning = !!volumeStatus?.running;
   const runningRepair = repairRequests.find((request) => request.status === "running") || null;
@@ -245,20 +253,10 @@ function Reader() {
 
   // Resolve a tag (fall back to first done/available volume) then load info.
   React.useEffect(() => {
+    if (waitingForFallback) return;
     let alive = true;
     (async () => {
-      let t = sp.get("tag");
-      if (!t) {
-        try {
-          const s = await getStatus();
-          const done =
-            s.volumes.filter((v) => !v.skip && v.stage === "done")[0] ||
-            s.volumes.filter((v) => !v.skip)[0];
-          t = done?.tag || null;
-        } catch {
-          /* ignore */
-        }
-      }
+      const t = fallbackTag;
       if (!alive) return;
       setTag(t);
       setInfo(null);
@@ -297,7 +295,7 @@ function Reader() {
     return () => {
       alive = false;
     };
-  }, [sp, toast]);
+  }, [fallbackTag, toast, waitingForFallback]);
 
   React.useEffect(() => {
     if (!tag || !info?.out_exists) return;

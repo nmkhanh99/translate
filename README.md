@@ -75,8 +75,8 @@ Mở chat từ một volume → daemon spawn CLI headless (`POST /api/chat` SSE)
 
 ```bash
 pnpm daemon         # chỉ backend (debug API), không phải luồng chính
-pnpm test           # unit test stream parsers
-pnpm build          # UI + daemon (daemon gộp 1 file ESM bằng esbuild)
+pnpm test           # toàn bộ unit/regression tests (adapters + daemon + renderer)
+pnpm build          # UI + daemon (ESM bundles bằng esbuild)
 pnpm dist           # đóng gói cho HĐH hiện tại: macOS universal (.dmg/.zip) HOẶC Windows (.exe)
 ```
 

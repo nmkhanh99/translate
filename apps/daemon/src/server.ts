@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { join, basename } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { Worker } from "node:worker_threads";
 import {
   ADAPTERS,
   detectAgents,
@@ -22,7 +23,12 @@ import {
   ENGINE_IDS,
   type EngineId,
 } from "@cfa-translate/agent-adapters";
-import { agentEventToChatSse, type RepairRequest } from "@cfa-translate/shared";
+import {
+  agentEventToChatSse,
+  type AppConfig,
+  type RepairRequest,
+  type Volume,
+} from "@cfa-translate/shared";
 import {
   ENGINES,
   MODELS,
@@ -66,6 +72,7 @@ import {
   findVolume,
   extractPageText,
   loadEnginePref,
+  loadRenderReportPage,
   loadVolumes,
   pdfPageCount,
   readJson,
@@ -97,8 +104,28 @@ import {
   resetAutoResume,
   stopVolume,
 } from "./runs.js";
+import { createStatusVolumeCache } from "./status-cache.js";
 
 const BLOCK_UPDATE_TIMEOUT_MS = 10 * 60_000;
+
+function scanStatusVolumesInWorker(config: AppConfig): Promise<Volume[]> {
+  const workerUrl = new URL(
+    import.meta.url.endsWith(".ts") ? "./status-worker.ts" : "./status-worker.mjs",
+    import.meta.url
+  );
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(workerUrl, { workerData: { config } });
+    let received = false;
+    worker.once("message", (message: { volumes: Volume[] }) => {
+      received = true;
+      resolve(message.volumes);
+    });
+    worker.once("error", reject);
+    worker.once("exit", (code) => {
+      if (!received) reject(new Error(`status worker exited with code ${code}`));
+    });
+  });
+}
 
 // "5-10, 12, 15" (SỐ TRANG người dùng, 1-based) -> mảng CHỈ SỐ 0-based, clamp
 // trong [0, total). Dùng cho redo vision theo trang cụ thể.
@@ -130,9 +157,18 @@ function parsePageList(spec: unknown, total: number): number[] {
 
 export function createApp() {
   ensureDirs();
-  for (const volume of loadVolumes()) recoverInterruptedBlockUpdate(volume);
+  const initialVolumeRecords = loadVolumes();
+  for (const volume of initialVolumeRecords) {
+    void recoverInterruptedBlockUpdate(volume);
+  }
   const app = express();
   let CFG = loadCfg();
+  const statusVolumes = createStatusVolumeCache(
+    initialVolumeRecords.map((volume) =>
+      volumeToApi(volume, CFG, isVolumeRunning(volume))
+    ),
+    scanStatusVolumesInWorker
+  );
 
   app.use(express.json({ limit: "2mb" }));
 
@@ -156,51 +192,73 @@ export function createApp() {
     res.json({ ok: true, service: "cfa-translate-daemon" });
   });
 
-  // Model discovery (grok models etc.) is slow — NEVER await on every status poll.
-  // Cache + background refresh; queue list stays sub-second filesystem-only.
+  // CLI/version detection is slow. Status always returns the latest cached value
+  // and shares one background refresh for the 45-second cache window.
+  type DetectedAgents = Awaited<ReturnType<typeof detectAgents>>;
+  let agentsCache: { at: number; data: DetectedAgents } | null = null;
+  let agentsInflight: Promise<DetectedAgents> | null = null;
+  const AGENTS_TTL_MS = 45_000;
+
+  function refreshAgents(force = false): Promise<DetectedAgents> {
+    if (
+      !force &&
+      agentsCache &&
+      Date.now() - agentsCache.at < AGENTS_TTL_MS
+    ) {
+      return Promise.resolve(agentsCache.data);
+    }
+    if (agentsInflight) return agentsInflight;
+    agentsInflight = detectAgents()
+      .then((agents) => {
+        agentsCache = { at: Date.now(), data: agents };
+        return agents;
+      })
+      .catch(() => agentsCache?.data || [])
+      .finally(() => {
+        agentsInflight = null;
+      });
+    return agentsInflight;
+  }
+
+  function getAgentsCached(): DetectedAgents {
+    if (!agentsCache || Date.now() - agentsCache.at >= AGENTS_TTL_MS) {
+      void refreshAgents();
+    }
+    return agentsCache?.data || [];
+  }
+
+  // Model discovery can invoke a CLI command (`grok models`). It is refreshed
+  // only by the explicit /api/agents rescan endpoint, never by status polling.
   type DiscoveredMap = Awaited<ReturnType<typeof listModelsForEngines>>;
-  let modelsCache: { at: number; data: DiscoveredMap } | null = null;
+  let modelsCache: DiscoveredMap | null = null;
   let modelsInflight: Promise<DiscoveredMap> | null = null;
-  const MODELS_TTL_MS = 5 * 60 * 1000;
 
   function emptyDiscovered(): DiscoveredMap {
     return { claude: [], codex: [], grok: [] };
   }
 
   function getDiscoveredModelsCached(): DiscoveredMap {
-    const now = Date.now();
-    if (modelsCache && now - modelsCache.at < MODELS_TTL_MS) {
-      return modelsCache.data;
-    }
-    // Stale or missing: return last good (or empty) immediately; refresh in bg.
-    if (!modelsInflight) {
-      modelsInflight = listModelsForEngines()
-        .then((data) => {
-          modelsCache = { at: Date.now(), data };
-          return data;
-        })
-        .catch(() => modelsCache?.data || emptyDiscovered())
-        .finally(() => {
-          modelsInflight = null;
-        });
-    }
-    return modelsCache?.data || emptyDiscovered();
+    return modelsCache || emptyDiscovered();
   }
 
-  async function refreshDiscoveredModels(): Promise<DiscoveredMap> {
-    try {
-      const data = await listModelsForEngines();
-      modelsCache = { at: Date.now(), data };
-      return data;
-    } catch {
-      return modelsCache?.data || emptyDiscovered();
-    }
+  function refreshDiscoveredModels(): Promise<DiscoveredMap> {
+    if (modelsInflight) return modelsInflight;
+    modelsInflight = listModelsForEngines()
+      .then((data) => {
+        modelsCache = data;
+        return data;
+      })
+      .catch(() => modelsCache || emptyDiscovered())
+      .finally(() => {
+        modelsInflight = null;
+      });
+    return modelsInflight;
   }
 
   app.get("/api/agents", async (_req, res) => {
     // Explicit rescan path — refresh models too (Settings "Quét lại CLI")
     const [agents, discovered] = await Promise.all([
-      detectAgents(),
+      refreshAgents(true),
       refreshDiscoveredModels(),
     ]);
     res.json({
@@ -213,24 +271,12 @@ export function createApp() {
     });
   });
 
-  app.get("/api/status", async (_req, res) => {
-    // Hot path for queue poll (~2s): filesystem volume status only.
-    // detectAgents + listModels are cached / fire-and-forget so list stays fast.
+  app.get("/api/status", (_req, res) => {
+    // Hot path: return the last complete snapshot, then refresh in a worker.
     const discovered = getDiscoveredModelsCached();
-    // Kick agent detect in background if never done; use empty agents first paint.
-    let agents: Awaited<ReturnType<typeof detectAgents>> = [];
-    try {
-      // detectAgents is usually <100ms (which); still avoid blocking if hung
-      agents = await Promise.race([
-        detectAgents(),
-        new Promise<typeof agents>((r) => setTimeout(() => r([]), 400)),
-      ]);
-    } catch {
-      agents = [];
-    }
-    const volumes = loadVolumes().map((v) =>
-      volumeToApi(v, CFG, isVolumeRunning(v))
-    );
+    const agents = getAgentsCached();
+    const volumes = statusVolumes.get();
+    void statusVolumes.refresh(CFG);
     const done = volumes.filter((v) => v.stage === "done" || v.skip).length;
     const running = volumes.filter((v) => v.running).length;
     res.json({
@@ -279,10 +325,11 @@ export function createApp() {
     CFG = applyConfigPatch(CFG, patch);
     saveCfg(CFG);
     CFG = loadCfg();
+    void statusVolumes.refresh(CFG, true);
     res.json({ ok: true, config: CFG });
   });
 
-  app.post("/api/run", (req, res) => {
+  app.post("/api/run", async (req, res) => {
     const vol = findVolume(String(req.body?.tag || ""));
     if (!vol) return res.status(404).json({ error: "tag không tồn tại" });
     if (vol.skip) return res.status(400).json({ error: "volume này đánh skip" });
@@ -318,7 +365,12 @@ export function createApp() {
       }
       let pages: number[] | undefined;
       if (stage === "vision" && redo.pages != null && String(redo.pages).trim() !== "") {
-        pages = parsePageList(redo.pages, pdfPageCount(vol.pdf));
+        const totalPages = await pdfPageCount(vol.pdf);
+        // Another request may have started while page count was loading.
+        if (isVolumeBusy(vol)) {
+          return res.status(409).json({ error: "cuốn đang có tiến trình — không thể chạy lại" });
+        }
+        pages = parsePageList(redo.pages, totalPages);
         // Người dùng CÓ nhập trang nhưng parse ra rỗng (gõ sai/ngoài phạm vi):
         // từ chối thay vì rơi xuống nhánh xoá TOÀN BỘ vision (mất mọi verdict).
         if (!pages.length) {
@@ -347,10 +399,11 @@ export function createApp() {
     }
 
     resetAutoResume(vol.tag); // chạy thủ công: cấp lại quota watchdog tự-chạy-tiếp
-    const r = launchVolume(vol, CFG, engine, runOpts);
+    const r = await launchVolume(vol, CFG, engine, runOpts);
     if (!r.ok) return res.status(409).json({ error: r.error });
     // Chỉ ghi pref khi user CHỌN engine trên request — không ép Claude vì redo.
     if (engine) saveEnginePref(vol.workdir, engine);
+    void statusVolumes.refresh(CFG, true);
     res.json({
       ok: true,
       sid: r.sid,
@@ -368,13 +421,16 @@ export function createApp() {
       return res.status(400).json({ error: "engine không hợp lệ" });
     }
     saveEnginePref(vol.workdir, engine);
+    void statusVolumes.refresh(CFG, true);
     res.json({ ok: true, engine });
   });
 
   app.post("/api/stop", (req, res) => {
     const vol = findVolume(String(req.body?.tag || ""));
     if (!vol) return res.status(404).json({ error: "tag không tồn tại" });
-    res.json({ ok: stopVolume(vol) });
+    const ok = stopVolume(vol);
+    if (ok) void statusVolumes.refresh(CFG, true);
+    res.json({ ok });
   });
 
   app.post("/api/batch", (req, res) => {
@@ -384,10 +440,12 @@ export function createApp() {
       const limit = Number.isFinite(n) ? Math.floor(n) : 1; // batchStart clamp 1..8
       const ok = batchStart(CFG, limit);
       if (!ok) return res.status(409).json({ error: "batch đang chạy" });
+      void statusVolumes.refresh(CFG, true);
       return res.json({ ok: true, queue: BATCH.queue, limit: BATCH.limit });
     }
     if (action === "stop") {
       batchStop();
+      void statusVolumes.refresh(CFG, true);
       return res.json({ ok: true });
     }
     res.status(400).json({ error: "action không hợp lệ" });
@@ -461,7 +519,7 @@ export function createApp() {
     res.json({ requests: listRepairRequests(vol.workdir).slice(0, 20) });
   });
 
-  app.post("/api/repair-request", (req, res) => {
+  app.post("/api/repair-request", async (req, res) => {
     const vol = findVolume(String(req.body?.tag || ""));
     if (!vol) return res.status(404).json({ error: "tag không tồn tại" });
     if (vol.skip) return res.status(400).json({ error: "volume này đánh skip" });
@@ -472,7 +530,10 @@ export function createApp() {
       return res.status(409).json({ error: "cuốn đang có tiến trình — hãy gửi yêu cầu sau khi tiến trình dừng" });
     }
 
-    const totalPages = pdfPageCount(vol.pdf);
+    const totalPages = await pdfPageCount(vol.pdf);
+    if (isVolumeBusy(vol)) {
+      return res.status(409).json({ error: "cuốn đang có tiến trình — hãy gửi yêu cầu sau khi tiến trình dừng" });
+    }
     const parsed = validateRepairRequestInput(req.body, totalPages);
     if (!parsed.ok) return res.status(400).json({ error: parsed.error });
 
@@ -512,13 +573,14 @@ export function createApp() {
       repairRequestId: request.id,
     };
     resetAutoResume(vol.tag);
-    const launched = launchVolume(vol, CFG, engine, runOpts);
+    const launched = await launchVolume(vol, CFG, engine, runOpts);
     if (!launched.ok) {
       const failed = finishRepairRequest(vol.workdir, request.id, "failed", launched.error);
       return res.status(409).json({ error: launched.error, request: failed || request });
     }
     const saved = attachRepairRun(vol.workdir, request.id, launched.sid) || request;
     if (engine) saveEnginePref(vol.workdir, engine);
+    void statusVolumes.refresh(CFG, true);
     res.json({
       ok: true,
       sid: launched.sid,
@@ -567,28 +629,18 @@ export function createApp() {
   app.get("/api/blocks", (req, res) => {
     const vol = findVolume(String(req.query.tag || ""));
     if (!vol) return res.status(404).json({ error: "tag không tồn tại" });
-    const raw = readJson(join(vol.workdir, "render_report.json"));
-    if (!raw || !Array.isArray(raw.segments)) {
-      return res.status(404).json({ error: "chưa có render report; hãy chạy apply trước" });
-    }
     const page = Number.parseInt(String(req.query.page ?? "0"), 10);
     if (!Number.isInteger(page) || page < 0) {
       return res.status(400).json({ error: "page không hợp lệ" });
     }
-    const sizes = Array.isArray(raw.page_sizes) ? raw.page_sizes : [];
-    const size = Array.isArray(sizes[page]) && sizes[page].length >= 2
-      ? [Number(sizes[page][0]), Number(sizes[page][1])]
-      : null;
-    const blocks = raw.segments.filter(
-      (x: Record<string, unknown>) => Number(x.page) === page && typeof x.id === "string"
-    );
+    const report = loadRenderReportPage(vol.workdir, page);
+    if (!report) {
+      return res.status(404).json({ error: "chưa có render report; hãy chạy apply trước" });
+    }
     res.json({
       tag: vol.tag,
       page,
-      page_size: size,
-      blocks,
-      review_count: Number(raw.review_count || 0),
-      generated_at: typeof raw.generated_at === "string" ? raw.generated_at : undefined,
+      ...report,
     });
   });
 
@@ -602,7 +654,7 @@ export function createApp() {
 
   // Selectable text layer for the raster reader. Keep the public page number
   // 1-based; only this boundary converts to PyMuPDF's 0-based index.
-  app.get("/api/page-text", (req, res) => {
+  app.get("/api/page-text", async (req, res) => {
     const vol = findVolume(String(req.query.tag || ""));
     if (!vol) return res.status(404).json({ error: "tag không tồn tại" });
     const side = String(req.query.side || "source");
@@ -612,11 +664,12 @@ export function createApp() {
     const path = side === "translated" ? vol.out : vol.pdf;
     if (!existsSync(path)) return res.status(404).json({ error: "file chưa có" });
     const page = Number(req.query.page);
-    const total = pdfPageCount(path);
+    // Source/output are page-for-page; use one cached source count for both.
+    const total = await pdfPageCount(vol.pdf);
     if (!Number.isSafeInteger(page) || page < 1 || page > total) {
       return res.status(400).json({ error: `trang phải từ 1 đến ${total}` });
     }
-    const textPage = extractPageText(path, page - 1);
+    const textPage = await extractPageText(path, page - 1);
     if (!textPage) return res.status(500).json({ error: "không đọc được lớp chữ PDF" });
     res.json({ tag: vol.tag, page, side, ...textPage });
   });
@@ -638,11 +691,11 @@ export function createApp() {
     }
   });
 
-  app.get("/api/reader-annotations", (req, res) => {
+  app.get("/api/reader-annotations", async (req, res) => {
     const vol = findVolume(String(req.query.tag || ""));
     if (!vol) return res.status(404).json({ error: "tag không tồn tại" });
     const page = Number(req.query.page);
-    const total = pdfPageCount(vol.pdf);
+    const total = await pdfPageCount(vol.pdf);
     if (!Number.isSafeInteger(page) || page < 1 || page > total) {
       return res.status(400).json({ error: `trang phải từ 1 đến ${total}` });
     }
@@ -653,10 +706,10 @@ export function createApp() {
     });
   });
 
-  app.post("/api/reader-annotations", (req, res) => {
+  app.post("/api/reader-annotations", async (req, res) => {
     const vol = findVolume(String(req.body?.tag || ""));
     if (!vol) return res.status(404).json({ error: "tag không tồn tại" });
-    const parsed = validateReaderAnnotationInput(req.body, pdfPageCount(vol.pdf));
+    const parsed = validateReaderAnnotationInput(req.body, await pdfPageCount(vol.pdf));
     if (!parsed.ok) return res.status(400).json({ error: parsed.error });
     if (parsed.value.side === "translated" && !existsSync(vol.out)) {
       return res.status(409).json({ error: "chưa có bản dịch để ghi chú" });
@@ -708,8 +761,9 @@ export function createApp() {
         { cwd: PYTHON_DIR, timeout: BLOCK_UPDATE_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 },
         (err, stdout, stderr) => {
           if (err) {
-            recoverInterruptedBlockUpdate(vol);
-            endBlockUpdate(vol.tag);
+            void recoverInterruptedBlockUpdate(vol).finally(() => {
+              endBlockUpdate(vol.tag);
+            });
             const childError = err as Error & { killed?: boolean; code?: string | number | null };
             const timedOut = childError.killed === true &&
               childError.code !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
@@ -738,10 +792,10 @@ export function createApp() {
     }
   });
 
-  app.get("/api/pageinfo", (req, res) => {
+  app.get("/api/pageinfo", async (req, res) => {
     const vol = findVolume(String(req.query.tag || ""));
     if (!vol) return res.status(404).json({ error: "tag không tồn tại" });
-    const pages = pdfPageCount(vol.pdf);
+    const pages = await pdfPageCount(vol.pdf);
     const savedPage = getReadingBookmark(vol.tag);
     res.json({
       tag: vol.tag,
@@ -752,11 +806,11 @@ export function createApp() {
     });
   });
 
-  app.post("/api/reading-bookmark", (req, res) => {
+  app.post("/api/reading-bookmark", async (req, res) => {
     const vol = findVolume(String(req.body?.tag || ""));
     if (!vol) return res.status(404).json({ error: "tag không tồn tại" });
     const page = req.body?.page;
-    const pages = pdfPageCount(vol.pdf);
+    const pages = await pdfPageCount(vol.pdf);
     if (!Number.isSafeInteger(page) || page < 1 || page > pages) {
       return res.status(400).json({ error: `trang phải từ 1 đến ${pages}` });
     }
@@ -769,7 +823,7 @@ export function createApp() {
     }
   });
 
-  app.get("/api/page", (req, res) => {
+  app.get("/api/page", async (req, res) => {
     const vol = findVolume(String(req.query.tag || ""));
     if (!vol) return res.status(404).json({ error: "tag không tồn tại" });
     const which = String(req.query.which || "source");
@@ -780,7 +834,10 @@ export function createApp() {
       60,
       Math.min(220, parseInt(String(req.query.dpi || "150"), 10) || 150)
     );
-    const png = renderPagePng(path, page, dpi);
+    const priority = which !== "out" && page === 0 && dpi <= 90
+      ? "thumbnail"
+      : "interactive";
+    const png = await renderPagePng(path, page, dpi, priority);
     if (!png) return res.status(500).json({ error: "render failed" });
     res.setHeader("Content-Type", "image/png");
     res.setHeader("Cache-Control", "no-cache");
@@ -829,6 +886,7 @@ export function createApp() {
       stored_name: storedName,
     };
     writeFileSync(storedPath + ".cfa.json", JSON.stringify(meta, null, 1), "utf8");
+    void statusVolumes.refresh(CFG, true);
     res.json({
       ok: true,
       name,
@@ -836,6 +894,8 @@ export function createApp() {
       document_id: sourceSha256,
       tag: userDocumentTag(name, sourceSha256),
     });
+    // Import creates the single canonical cover in the low-priority queue.
+    void renderPagePng(storedPath, 0, 90, "thumbnail").catch(() => {});
   });
 
   // ── Per-document chat conversations (SQLite-persisted) ──────────────────

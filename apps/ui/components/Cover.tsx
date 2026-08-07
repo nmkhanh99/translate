@@ -28,11 +28,14 @@ export function Cover({
   if (!tag || failed) {
     return <div className={cls} style={style} aria-hidden="true" />;
   }
+  // All current cover call sites request 60–90 DPI. Normalize them to one
+  // artifact per document so Library/Queue/Home share the same daemon cache.
+  const coverDpi = Math.max(90, dpi);
   return (
     // eslint-disable-next-line @next/next/no-img-element
     <img
       className={cls}
-      src={pageImg(tag, "source", 0, dpi)}
+      src={pageImg(tag, "source", 0, coverDpi)}
       alt={alt || "Ảnh bìa tài liệu"}
       loading="lazy"
       decoding="async"

@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { getAdapter, ENGINE_IDS, type EngineId } from "@cfa-translate/agent-adapters";
 import type { AppConfig } from "@cfa-translate/shared";
 import { cliModelArg, normalizeModel } from "@cfa-translate/shared";
@@ -82,10 +82,74 @@ export interface RunInfo {
 const RUNS = new Map<string, RunInfo>();
 const starting = new Set<string>();
 const blockUpdates = new Set<string>();
+const blockRecoveries = new Map<string, Promise<boolean>>();
 const BLOCK_UPDATE_LOCK_FILE = "block-update.lock.json";
 const BLOCK_UPDATE_TXN_FILE = "block-update.txn.json";
 
 const TRANSLATION_PROMPT_VERSION = "cfa-translate-v3";
+
+type PythonJobPriority = "recovery" | "prepare";
+const PYTHON_JOB_LIMIT = 2;
+let activePythonJobs = 0;
+const recoveryJobs: Array<() => void> = [];
+const prepareJobs: Array<() => void> = [];
+
+function schedulePythonJob<T>(
+  run: () => Promise<T>,
+  priority: PythonJobPriority
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const start = () => {
+      activePythonJobs++;
+      Promise.resolve()
+        .then(run)
+        .then(resolve, reject)
+        .finally(() => {
+          activePythonJobs--;
+          const next = recoveryJobs.shift() || prepareJobs.shift();
+          next?.();
+        });
+    };
+    if (activePythonJobs < PYTHON_JOB_LIMIT) start();
+    else if (priority === "recovery") recoveryJobs.push(start);
+    else prepareJobs.push(start);
+  });
+}
+
+function execPythonJob(
+  args: string[],
+  timeout: number,
+  maxBuffer: number,
+  priority: PythonJobPriority,
+  cancelled?: () => boolean
+): Promise<{ error: Error | null; stdout: string; stderr: string }> {
+  return schedulePythonJob(
+    () => {
+      if (cancelled?.()) {
+        return Promise.resolve({
+          error: new Error("cancelled"),
+          stdout: "",
+          stderr: "",
+        });
+      }
+      return new Promise((resolve) => {
+        execFile(
+          pythonBin(),
+          args,
+          { cwd: PYTHON_DIR, encoding: "utf8", timeout, maxBuffer },
+          (error, stdout, stderr) => {
+            resolve({
+              error,
+              stdout: String(stdout || ""),
+              stderr: String(stderr || ""),
+            });
+          }
+        );
+      });
+    },
+    priority
+  );
+}
 
 export interface ArtifactPrepareResult {
   invalidation: "source" | "translation" | null;
@@ -94,7 +158,7 @@ export interface ArtifactPrepareResult {
 }
 
 /** Run the Python provenance gate before looking at resumable stage state. */
-export function prepareVolumeArtifacts(
+export async function prepareVolumeArtifacts(
   vol: VolumeRec,
   context?: {
     target_language: string;
@@ -102,10 +166,12 @@ export function prepareVolumeArtifacts(
     model: string;
     prompt_version: string;
     profile?: string;
-  }
-): { ok: true; result: ArtifactPrepareResult } | { ok: false; error: string } {
-  const r = spawnSync(
-    pythonBin(),
+  },
+  cancelled?: () => boolean
+): Promise<
+  { ok: true; result: ArtifactPrepareResult } | { ok: false; error: string }
+> {
+  const result = await execPythonJob(
     [
       join(PYTHON_DIR, "agent_pipeline.py"),
       "prepare",
@@ -113,20 +179,20 @@ export function prepareVolumeArtifacts(
       vol.workdir,
       JSON.stringify(context ?? null),
     ],
-    {
-      cwd: PYTHON_DIR,
-      encoding: "utf8",
-      timeout: 120_000,
-      maxBuffer: 4 * 1024 * 1024,
-    }
+    120_000,
+    4 * 1024 * 1024,
+    "prepare",
+    cancelled
   );
-  if (r.status !== 0) {
+  if (result.error) {
     return {
       ok: false,
-      error: (r.stderr || r.stdout || `prepare rc=${r.status}`).trim(),
+      error: (
+        result.stderr || result.stdout || result.error.message || "prepare failed"
+      ).trim(),
     };
   }
-  const lines = String(r.stdout || "").trim().split("\n").reverse();
+  const lines = result.stdout.trim().split("\n").reverse();
   for (const line of lines) {
     try {
       const parsed = JSON.parse(line) as ArtifactPrepareResult;
@@ -197,20 +263,31 @@ function hasPersistedBlockUpdate(vol: VolumeRec): boolean {
   // Do not unlink a stale-looking path here. The Python helper acquires the real
   // advisory flock before recovery / stale-file cleanup. Recovery failure is
   // fail-closed: an unresolved journal must continue blocking every writer.
-  return !recoverInterruptedBlockUpdate(vol);
+  void recoverInterruptedBlockUpdate(vol);
+  return true;
 }
 
 /** Roll back a journaled partial commit left by a killed Python writer. */
-export function recoverInterruptedBlockUpdate(vol: VolumeRec): boolean {
+export function recoverInterruptedBlockUpdate(vol: VolumeRec): Promise<boolean> {
   const journal = join(vol.workdir, BLOCK_UPDATE_TXN_FILE);
   const lock = join(vol.workdir, BLOCK_UPDATE_LOCK_FILE);
-  if (!existsSync(journal) && !existsSync(lock)) return true;
-  const r = spawnSync(
-    pythonBin(),
+  if (!existsSync(journal) && !existsSync(lock)) return Promise.resolve(true);
+  const existing = blockRecoveries.get(vol.workdir);
+  if (existing) return existing;
+  const recovery = execPythonJob(
     [join(PYTHON_DIR, "agent_pipeline.py"), "recover-block-update", vol.workdir, vol.out],
-    { cwd: PYTHON_DIR, encoding: "utf8", timeout: 30_000 },
-  );
-  return r.status === 0 && !existsSync(journal) && !existsSync(lock);
+    30_000,
+    1024 * 1024,
+    "recovery"
+  )
+    .then(
+      ({ error }) =>
+        !error && !existsSync(journal) && !existsSync(lock),
+      () => false
+    )
+    .finally(() => blockRecoveries.delete(vol.workdir));
+  blockRecoveries.set(vol.workdir, recovery);
+  return recovery;
 }
 
 export function isVolumeBusy(vol: VolumeRec): boolean {
@@ -228,17 +305,47 @@ export function endBlockUpdate(tag: string): void {
   blockUpdates.delete(tag);
 }
 
-export function launchVolume(
+export interface LaunchControl {
+  cancelled?: () => boolean;
+}
+
+type LaunchResult =
+  | { ok: true; sid: string }
+  | { ok: false; error: string };
+
+export async function launchVolume(
   vol: VolumeRec,
   cfg: AppConfig,
   engineOverride?: string,
-  runOpts?: RunOpts
-): { ok: true; sid: string } | { ok: false; error: string } {
+  runOpts?: RunOpts,
+  control?: LaunchControl
+): Promise<LaunchResult> {
   if (vol.skip) return { ok: false, error: "volume này đánh skip" };
   if (isVolumeBusy(vol)) {
     return { ok: false, error: "đang chạy" };
   }
   starting.add(vol.tag);
+  try {
+    return await launchStartedVolume(vol, cfg, engineOverride, runOpts, control);
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    starting.delete(vol.tag);
+  }
+}
+
+async function launchStartedVolume(
+  vol: VolumeRec,
+  cfg: AppConfig,
+  engineOverride?: string,
+  runOpts?: RunOpts,
+  control?: LaunchControl
+): Promise<LaunchResult> {
+  const cancelled = (): LaunchResult | null =>
+    control?.cancelled?.() ? { ok: false, error: "đã hủy" } : null;
 
   // Ưu tiên: override lúc gọi > pref cuốn > global (resolveEngine).
   const engine = resolveEngine(
@@ -248,7 +355,6 @@ export function launchVolume(
   );
   const adapter = getAdapter(engine);
   if (!adapter) {
-    starting.delete(vol.tag);
     return { ok: false, error: `engine không hợp lệ: ${engine}` };
   }
 
@@ -261,9 +367,14 @@ export function launchVolume(
   // Validate source provenance before trusting stage=review/done. Source-only
   // prepare preserves the translation context until we know this run actually
   // translates (verify/vision/fix may use another reviewing CLI).
-  const sourcePrepared = prepareVolumeArtifacts(vol);
+  const sourcePrepared = await prepareVolumeArtifacts(
+    vol,
+    undefined,
+    control?.cancelled
+  );
+  const cancelledAfterSource = cancelled();
+  if (cancelledAfterSource) return cancelledAfterSource;
   if (!sourcePrepared.ok) {
-    starting.delete(vol.tag);
     return { ok: false, error: `artifact preflight: ${sourcePrepared.error}` };
   }
 
@@ -281,15 +392,20 @@ export function launchVolume(
     (effectiveOpts == null || effectiveOpts.redoStage === "translate");
   let contextPrepared: ArtifactPrepareResult | null = null;
   if (translates) {
-    const prepared = prepareVolumeArtifacts(vol, {
-      target_language: "vi",
-      translator: engine,
-      model: modelForEngine || "default",
-      prompt_version: TRANSLATION_PROMPT_VERSION,
-      profile: process.env.CFA_PDF_PROFILE || "native",
-    });
+    const prepared = await prepareVolumeArtifacts(
+      vol,
+      {
+        target_language: "vi",
+        translator: engine,
+        model: modelForEngine || "default",
+        prompt_version: TRANSLATION_PROMPT_VERSION,
+        profile: process.env.CFA_PDF_PROFILE || "native",
+      },
+      control?.cancelled
+    );
+    const cancelledAfterContext = cancelled();
+    if (cancelledAfterContext) return cancelledAfterContext;
     if (!prepared.ok) {
-      starting.delete(vol.tag);
       return { ok: false, error: `translation cache preflight: ${prepared.error}` };
     }
     contextPrepared = prepared.result;
@@ -341,7 +457,6 @@ export function launchVolume(
     fd = openSync(logPath, "a");
     writeSync(fd, header);
   } catch (e) {
-    starting.delete(vol.tag);
     return {
       ok: false,
       error: e instanceof Error ? e.message : String(e),
@@ -358,7 +473,6 @@ export function launchVolume(
     });
   } catch (e) {
     closeSync(fd);
-    starting.delete(vol.tag);
     return {
       ok: false,
       error: e instanceof Error ? e.message : String(e),
@@ -376,11 +490,8 @@ export function launchVolume(
     engine,
   };
   RUNS.set(vol.tag, { proc, sid, mode: "running", pid: proc.pid, engine });
-  // Clear `starting` and attach lifecycle listeners BEFORE the (best-effort)
-  // meta write — so a failing saveRunMeta can't leak `starting`, skip the
-  // exit/error listeners, or throw out of launchVolume (which would reject the
-  // batch scheduler's promise and wedge BATCH.active).
-  starting.delete(vol.tag);
+  // Attach lifecycle listeners before the best-effort metadata write. The
+  // launch wrapper releases `starting` in finally on every success/failure path.
 
   proc.on("exit", (code) => {
     const m = loadRunMeta(vol.workdir) || {};
@@ -485,7 +596,9 @@ function maybeAutoResume(
   const t = setTimeout(() => {
     autoResumeTimers.delete(vol.tag);
     if (!isVolumeRunning(vol) && !starting.has(vol.tag)) {
-      launchVolume(vol, cfg, engine, runOpts);
+      void launchVolume(vol, cfg, engine, runOpts).catch((error) => {
+        console.error(`[watchdog] không thể tự chạy lại ${vol.tag}`, error);
+      });
     }
   }, 5000);
   autoResumeTimers.set(vol.tag, t);
@@ -552,7 +665,14 @@ export function batchStart(cfg: AppConfig, limit = 1): boolean {
   BATCH.stop = false;
   BATCH.current = null;
   BATCH.running.clear();
-  void runBatch(cfg, gen);
+  void runBatch(cfg, gen).catch((error) => {
+    console.error("[batch] scheduler failed", error);
+    if (BATCH.gen === gen) {
+      BATCH.active = false;
+      BATCH.current = null;
+      BATCH.running.clear();
+    }
+  });
   return true;
 }
 
@@ -589,9 +709,25 @@ async function runBatch(cfg: AppConfig, gen: number) {
         BATCH.running.add(tag);
         continue;
       }
-      const res = launchVolume(vol, cfg);
-      if (res.ok) BATCH.running.add(tag);
-      else console.error(`[batch] không chạy được ${tag}: ${res.error}`);
+      const res = await launchVolume(vol, cfg, undefined, undefined, {
+        cancelled: () => !alive(),
+      });
+      if (!alive()) {
+        // Cancellation is checked after every async prepare. This fallback also
+        // closes the tiny post-spawn race if launch behavior changes later.
+        if (res.ok) stopVolume(vol);
+        return;
+      }
+      if (res.ok) {
+        BATCH.running.add(tag);
+      } else if (starting.has(tag)) {
+        // A previous generation may still be finishing its cancelled prepare.
+        // Keep this tag for the new batch instead of silently dropping it.
+        BATCH.queue.push(tag);
+        break;
+      } else {
+        console.error(`[batch] không chạy được ${tag}: ${res.error}`);
+      }
     }
     BATCH.current = BATCH.running.values().next().value ?? null;
     await new Promise<void>((resolve) => setTimeout(resolve, 1500));

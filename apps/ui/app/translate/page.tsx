@@ -1,8 +1,9 @@
 "use client";
 import * as React from "react";
 import Link from "next/link";
-import { getStatus, uploadPdf, runVolume, pagesLabel } from "../../lib/api";
+import { uploadPdf, runVolume, pagesLabel } from "../../lib/api";
 import { useToast, useEngine } from "../../components/Providers";
+import { useStatus } from "../../lib/useStatus";
 import { EngineSwitch } from "../../components/EngineSwitch";
 import { Cover } from "../../components/Cover";
 import { IconUpload } from "../../components/icons";
@@ -10,10 +11,17 @@ import type { Volume } from "../../lib/types";
 
 export default function Translate() {
   const toast = useToast();
+  const status = useStatus();
   const { engine, setEngine, available } = useEngine();
   const [drag, setDrag] = React.useState(false);
   const [selected, setSelected] = React.useState<Volume | null>(null);
   const inputRef = React.useRef<HTMLInputElement>(null);
+
+  React.useEffect(() => {
+    if (!selected?.tag || !status) return;
+    const refreshed = status.volumes.find((volume) => volume.tag === selected.tag);
+    if (refreshed) setSelected(refreshed);
+  }, [selected?.tag, status]);
 
   async function upload(f: File) {
     if (!/\.pdf$/i.test(f.name)) {
@@ -23,13 +31,16 @@ export default function Translate() {
     toast("Đang tải “" + f.name + "”…");
     try {
       const uploaded = await uploadPdf(f);
-      const st = await getStatus();
       const name = f.name.replace(/\.pdf$/i, "");
-      const v = st.volumes.find((x) => x.tag === uploaded.tag);
-      if (v) {
-        setSelected(v);
-        toast("Đã thêm “" + name + "” — bấm Bắt đầu dịch");
-      }
+      const cached = status?.volumes.find((volume) => volume.tag === uploaded.tag);
+      setSelected(cached || {
+        tag: uploaded.tag,
+        display: name,
+        stage: "translate",
+        user: true,
+        out_exists: false,
+      });
+      toast("Đã thêm “" + name + "” — bấm Bắt đầu dịch");
     } catch (e) {
       toast("Lỗi tải: " + (e as Error).message);
     }

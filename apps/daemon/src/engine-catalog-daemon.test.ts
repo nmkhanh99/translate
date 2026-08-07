@@ -225,21 +225,36 @@ describe("engine resolve still works", () => {
   });
 });
 
-describe("status path does not await listModels on hot poll (structural)", () => {
-  it("server caches models and races detectAgents", () => {
+describe("status path uses background caches (structural)", () => {
+  it("does not scan volumes or CLIs on the request path", () => {
     const src = readFileSync(join(__dirname, "server.ts"), "utf8");
-    assert.match(src, /getDiscoveredModelsCached|modelsCache/);
-    assert.match(src, /MODELS_TTL_MS/);
-    // Must not bare await listModelsForEngines() inside /api/status without cache
+    assert.match(src, /createStatusVolumeCache/);
+    assert.match(src, /scanStatusVolumesInWorker/);
+    assert.match(src, /AGENTS_TTL_MS\s*=\s*45_000/);
     const statusBlock = src.slice(
       src.indexOf('app.get("/api/status"'),
       src.indexOf('app.post("/api/config"')
     );
-    assert.ok(
-      !statusBlock.includes("await listModelsForEngines()"),
-      "/api/status still awaits listModelsForEngines uncached"
-    );
     assert.match(statusBlock, /getDiscoveredModelsCached/);
+    assert.match(statusBlock, /getAgentsCached/);
+    assert.match(statusBlock, /statusVolumes\.get\(\)/);
+    assert.match(statusBlock, /statusVolumes\.refresh\(CFG\)/);
+    assert.ok(!statusBlock.includes("loadVolumes()"));
+    assert.ok(!statusBlock.includes("volumeToApi("));
+    assert.ok(!statusBlock.includes("detectAgents()"));
+    assert.ok(!statusBlock.includes("listModelsForEngines()"));
+  });
+  it("ships the status worker with the desktop app", () => {
+    const daemonPackage = readFileSync(
+      join(__dirname, "../package.json"),
+      "utf8"
+    );
+    const desktopPackage = readFileSync(
+      join(__dirname, "../../desktop/package.json"),
+      "utf8"
+    );
+    assert.match(daemonPackage, /src\/status-worker\.ts/);
+    assert.match(desktopPackage, /daemon\/status-worker\.mjs/);
   });
   it("launchVolume forces runner when stage=review", () => {
     const src = readFileSync(join(__dirname, "runs.ts"), "utf8");

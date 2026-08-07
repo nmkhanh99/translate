@@ -1,8 +1,14 @@
 "use client";
 import * as React from "react";
-import { getStatus, getAgents, saveConfig } from "../../lib/api";
-import { useToast } from "../../components/Providers";
-import type { AppConfig, AgentDetection, Engine } from "../../lib/types";
+import { saveConfig } from "../../lib/api";
+import { useEngine, useToast } from "../../components/Providers";
+import { useRefreshStatus, useStatus } from "../../lib/useStatus";
+import {
+  discoveredModelsFromStatus,
+  settingsStateFromStatus,
+  type SettingsModelMode,
+} from "../../lib/settings-status";
+import type { AppConfig, Engine } from "../../lib/types";
 import {
   normalizeModel,
   fieldVisibleForEngine,
@@ -10,52 +16,36 @@ import {
   isCliDefault,
   modelOptionsForEngine,
   CLI_DEFAULT_MODEL,
-  type ModelOption,
 } from "@cfa-translate/shared";
 
 export default function Settings() {
   const toast = useToast();
-  const [cfg, setCfg] = React.useState<AppConfig | null>(null);
-  const [agents, setAgents] = React.useState<AgentDetection[]>([]);
+  const status = useStatus();
+  const refreshStatus = useRefreshStatus();
+  const { agents, rescanAgents } = useEngine();
+  const [initial] = React.useState(() =>
+    status ? settingsStateFromStatus(status) : null
+  );
+  const initialized = React.useRef(initial !== null);
+  const [cfg, setCfg] = React.useState<AppConfig | null>(
+    initial?.config || null
+  );
   /** Discovered model ids per engine from /api/status (runtime CLI, not git). */
   const [discovered, setDiscovered] = React.useState<
     Partial<Record<Engine, string[]>>
-  >({});
-  const [modelMode, setModelMode] = React.useState<"default" | "pick" | "custom">(
-    "default"
+  >(initial?.discovered || {});
+  const [modelMode, setModelMode] = React.useState<SettingsModelMode>(
+    initial?.modelMode || "default"
   );
 
   React.useEffect(() => {
-    Promise.all([getStatus(), getAgents()])
-      .then(([s, a]) => {
-        const raw = s.config || {};
-        const engine = (raw.engine as Engine) || "claude";
-        const model = normalizeModel(engine, raw.model);
-        setCfg({ ...raw, engine, model });
-        setAgents(a.agents || []);
-        const byEng =
-          (s as { models_discovered?: Partial<Record<Engine, string[]>> })
-            .models_discovered || {};
-        // Prefer discovered ids; also merge labels from models_by_engine if present
-        const fromApi = (s as { models_by_engine?: Partial<Record<Engine, ModelOption[]>> })
-          .models_by_engine;
-        const d: Partial<Record<Engine, string[]>> = { ...byEng };
-        if (fromApi) {
-          for (const e of ["claude", "codex", "grok"] as Engine[]) {
-            const ids = (fromApi[e] || [])
-              .map((m) => m.id)
-              .filter((id) => id && id !== CLI_DEFAULT_MODEL);
-            if (ids.length) d[e] = ids;
-          }
-        }
-        setDiscovered(d);
-        const disc = d[engine] || [];
-        if (isCliDefault(model)) setModelMode("default");
-        else if (disc.includes(model)) setModelMode("pick");
-        else setModelMode("custom");
-      })
-      .catch((e) => toast("Lỗi tải cài đặt: " + e.message));
-  }, [toast]);
+    if (initialized.current || !status) return;
+    const next = settingsStateFromStatus(status);
+    setCfg(next.config);
+    setDiscovered(next.discovered);
+    setModelMode(next.modelMode);
+    initialized.current = true;
+  }, [status]);
 
   function setEngine(engine: string) {
     // Match UI "Mặc định CLI": always reset model to CLI default on engine
@@ -102,12 +92,12 @@ export default function Settings() {
 
   async function rescan() {
     try {
-      const [a, s] = await Promise.all([getAgents(), getStatus()]);
-      setAgents(a.agents || []);
-      const byEng =
-        (s as { models_discovered?: Partial<Record<Engine, string[]>> })
-          .models_discovered || {};
-      setDiscovered(byEng);
+      const scan = await rescanAgents();
+      if (!scan) throw new Error("không nhận được kết quả quét CLI");
+      setDiscovered(discoveredModelsFromStatus(scan));
+      // Also update the app-wide engine/config snapshot. The model list above
+      // comes directly from /api/agents so an overlapping poll cannot stale it.
+      await refreshStatus(true);
       toast("Đã quét lại CLI + model trên máy");
     } catch (e) {
       toast("Lỗi quét: " + (e as Error).message);
